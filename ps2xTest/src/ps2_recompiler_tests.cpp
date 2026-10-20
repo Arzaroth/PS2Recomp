@@ -1471,6 +1471,49 @@ void register_ps2_recompiler_tests()
             std::filesystem::remove_all(tempRoot, removeError);
         });
 
+        tc.Run("stub binding synthesizes a wrapper at an address with no known function", [](TestCase &t) {
+            const std::string uniqueSuffix =
+                std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+            const std::filesystem::path tempRoot =
+                std::filesystem::temp_directory_path() / ("ps2recomp-stub-synthesis-" + uniqueSuffix);
+            const std::filesystem::path elfPath = tempRoot / "stub-binding.elf";
+            const std::filesystem::path configPath = tempRoot / "stub-binding.toml";
+            const std::filesystem::path outputPath = tempRoot / "output";
+            std::filesystem::create_directories(tempRoot);
+
+            // 0x100010 is executable but no symbol or map entry starts a function there.
+            const bool elfWritten = writeMinimalMipsElfWithUnmappedEntryHint(elfPath);
+            const bool configWritten = writeRecompilerTestConfig(
+                configPath, elfPath, outputPath, {}, {"sceCdGetReadPos@0x00100010"});
+            t.IsTrue(elfWritten && configWritten, "stub binding regression inputs should be generated");
+
+            if (elfWritten && configWritten)
+            {
+                PS2Recompiler recompiler(configPath.string());
+                t.IsTrue(recompiler.initialize(), "stub binding config should initialize");
+                t.IsTrue(recompiler.recompile(), "stub binding should recompile");
+                recompiler.generateOutput();
+
+                std::ifstream registrationFile(outputPath / "register_functions.cpp");
+                const std::string registration{
+                    std::istreambuf_iterator<char>(registrationFile), std::istreambuf_iterator<char>()};
+                t.IsTrue(registration.find("// 0x100010") != std::string::npos,
+                         "the bound address should be registered for guest dispatch");
+
+                bool callsHandler = false;
+                for (const auto &entry : std::filesystem::directory_iterator(outputPath))
+                {
+                    std::ifstream source(entry.path());
+                    const std::string text{std::istreambuf_iterator<char>(source), std::istreambuf_iterator<char>()};
+                    callsHandler = callsHandler || text.find("sceCdGetReadPos(rdram, ctx, runtime)") != std::string::npos;
+                }
+                t.IsTrue(callsHandler, "the synthesized wrapper should call the runtime handler");
+            }
+
+            std::error_code removeError;
+            std::filesystem::remove_all(tempRoot, removeError);
+        });
+
         tc.Run("standalone entry_ blocks register resume points for their JAL return addresses", [](TestCase &t) {
             const std::string uniqueSuffix =
                 std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
