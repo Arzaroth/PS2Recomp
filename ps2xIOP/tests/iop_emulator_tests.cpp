@@ -911,6 +911,20 @@ int main()
     if (!expect(stopResult == 0, "Emulated module stop result mismatch")) return 1;
     if (!expect(iop.debugSnapshot().emulatorLoadedModules == 0u, "Module was not released")) return 1;
 
+    // sceSifLoadModuleBuffer path: the image sits in IOP RAM (SIF DMA target), not in EE memory.
+    {
+        constexpr uint32_t imageSize = 0x200u;
+        const uint32_t iopBuffer = iop.allocateMemory(imageSize, 64u);
+        if (!expect(iopBuffer != 0u, "IOP buffer allocation failed")) return 1;
+        if (!expect(iop.writeMemory(iopBuffer, host.guest.data() + 0x100u, imageSize), "IOP buffer write failed")) return 1;
+        std::memset(host.guest.data() + 0x100u, 0, imageSize);
+        const ModuleLoadResult fromIop = iop.loadModuleBufferFromIop(iopBuffer);
+        if (!expect(fromIop.handled && fromIop.moduleId > 0, "IRX image in IOP RAM must load")) return 1;
+        if (!expect(fromIop.startResult == 7, "IRX loaded from IOP RAM must run its entry")) return 1;
+        if (!expect(iop.stopModule(fromIop.moduleId, &stopResult), "IOP RAM module stop failed")) return 1;
+        if (!expect(iop.loadModuleBufferFromIop(iopBuffer + 0x40u).moduleId <= 0, "Non-ELF IOP RAM must not load")) return 1;
+    }
+
     constexpr uint32_t rpcSid = 0xF00DCAFEu;
     writeRpcServerIrx(host, 0x100u);
     const ModuleLoadResult rpcModule = iop.loadModuleBuffer(0x100u);

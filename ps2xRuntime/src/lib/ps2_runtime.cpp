@@ -587,6 +587,12 @@ ps2x::iop::ModuleLoadResult PS2Runtime::loadIopModuleBuffer(uint32_t guestAddres
     return m_iopSubsystem->loadModuleBuffer(guestAddress, arguments, argumentSize);
 }
 
+ps2x::iop::ModuleLoadResult PS2Runtime::loadIopModuleBufferFromIop(uint32_t iopAddress, const void *arguments, uint32_t argumentSize)
+{
+    auto scope = m_iopHost->enterCall(nullptr, m_memory.getRDRAM());
+    return m_iopSubsystem->loadModuleBufferFromIop(iopAddress, arguments, argumentSize);
+}
+
 bool PS2Runtime::stopIopModule(int32_t moduleId, int32_t *result)
 {
     auto scope = m_iopHost->enterCall(nullptr, m_memory.getRDRAM());
