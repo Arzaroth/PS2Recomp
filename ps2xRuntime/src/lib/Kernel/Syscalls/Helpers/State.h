@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ps2_runtime.h"
+
 #include <cstddef>
 #include <cstdint>
 
@@ -242,22 +244,31 @@ inline std::filesystem::path g_host_cwd;
 inline std::filesystem::path g_cdrom_cwd;
 inline std::string g_ps2_cwd_device = "host0";
 
+// HLE pools sit at fixed offsets in the runtime-reserved guest region
+// (PS2Runtime::reservedMemoryBase(), 0x01F00000 by default).
 static constexpr uint32_t kRpcPacketSize = 64;
-static constexpr uint32_t kRpcPacketPoolBase = 0x01F00000;
+static constexpr uint32_t kRpcPacketPoolOffset = 0x00000000;
 static constexpr uint32_t kRpcPacketPoolBytes = 0x00010000;
 static constexpr uint32_t kRpcPacketPoolCount = kRpcPacketPoolBytes / kRpcPacketSize;
-static constexpr uint32_t kRpcServerPoolBase = 0x01F10000;
+static constexpr uint32_t kRpcServerPoolOffset = 0x00010000;
 static constexpr uint32_t kRpcServerPoolBytes = 0x00010000;
 static constexpr uint32_t kRpcServerStride = 0x80;
 static constexpr uint32_t kRpcServerPoolCount = kRpcServerPoolBytes / kRpcServerStride;
 
-static constexpr uint32_t kTlsPoolBase = 0x01F20000;
+static constexpr uint32_t kTlsPoolOffset = 0x00020000;
 static constexpr uint32_t kTlsPoolBytes = 0x00010000;
 static constexpr uint32_t kTlsBlockSize = 0x100;
 static constexpr uint32_t kTlsPoolCount = kTlsPoolBytes / kTlsBlockSize;
 
-static constexpr uint32_t kBootModePoolBase = 0x01F30000;
+static constexpr uint32_t kBootModePoolOffset = 0x00030000;
 static constexpr uint32_t kBootModePoolBytes = 0x00001000;
+static_assert(kBootModePoolOffset + kBootModePoolBytes <= PS2Runtime::kReservedPoolBytes,
+              "HLE pools must fit in the runtime-reserved pool area");
+
+inline uint32_t reservedPoolAddress(uint32_t offset)
+{
+    return PS2Runtime::reservedMemoryBase() + offset;
+}
 
 static constexpr uint32_t kSifRpcModeNowait = 0x01;
 static constexpr uint32_t kSifRpcModeNoWbDc = 0x02;

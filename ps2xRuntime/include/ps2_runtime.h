@@ -383,7 +383,17 @@ public:
     uint32_t guestHeapBase() const;
     uint32_t guestHeapEnd() const;
     uint32_t guestHeapLimit() const;
+    uint32_t guestHeapHardLimit() const;
     uint32_t reserveAsyncCallbackStack(uint32_t size, uint32_t alignment = 16u);
+
+    // Guest RAM kept by the runtime: HLE pools (SIF RPC packets and servers, TLS, boot mode)
+    // in [base, base + kReservedPoolBytes) and invocation stacks growing down from top.
+    // Default: pools at 0x01F00000, stacks below 32 MiB, guest heap ending at 0x01F00000.
+    // Games that use all user RAM can move the region (e.g. into kernel memory below the
+    // ELF) and raise the heap limit. Call from a game override, before the guest runs.
+    static constexpr uint32_t kReservedPoolBytes = 0x40000u;
+    void configureReservedMemory(uint32_t base, uint32_t top, uint32_t guestHeapHardLimit);
+    static uint32_t reservedMemoryBase();
 
     void drainCompletedDmacHandlers(uint8_t *rdram);
 
@@ -512,6 +522,7 @@ private:
     uint32_t m_guestHeapEnd = 0x00100000u;
     uint32_t m_guestHeapLimit = PS2_RAM_SIZE;
     uint32_t m_guestHeapSuggestedBase = 0x00100000u;
+    uint32_t m_guestHeapHardLimit = 0x01F00000u;
     bool m_guestHeapConfigured = false;
     uint32_t m_asyncCallbackStackFloor = 0x01F00000u;
     uint32_t m_asyncCallbackStackTop = PS2_RAM_SIZE;
