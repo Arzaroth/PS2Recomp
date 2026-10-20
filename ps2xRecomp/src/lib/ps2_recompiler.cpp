@@ -1088,6 +1088,31 @@ namespace ps2recomp
                 }
             }
 
+            // A name@address binding to a runtime handler still needs a function at that
+            // address: Ghidra can miss SDK routines that are only reached from other code.
+            {
+                std::unordered_set<uint32_t> knownStarts;
+                for (const auto &function : m_functions)
+                {
+                    knownStarts.insert(function.start);
+                }
+                for (const auto &[start, handler] : m_stubHandlerBindingsByStart)
+                {
+                    if (knownStarts.contains(start) || resolveStubTarget(handler) == StubTarget::Unknown)
+                    {
+                        continue;
+                    }
+                    Function bound{};
+                    bound.name = handler;
+                    bound.start = start;
+                    bound.end = start + 4u;
+                    m_functions.push_back(std::move(bound));
+                    std::ostringstream msg;
+                    msg << "Synthesized entry 0x" << std::hex << start << " for stub binding '" << handler << "'";
+                    m_reporter.info("stub", msg.str());
+                }
+            }
+
             for (auto &function : m_functions)
             {
                 m_reporter.recordFunctionProcessed();

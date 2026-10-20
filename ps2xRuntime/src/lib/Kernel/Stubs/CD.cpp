@@ -204,6 +204,31 @@ namespace ps2_stubs
         return snapshot;
     }
 
+    namespace
+    {
+        // libcdvd N-command callback set by sceCdCallback: called with the finished command,
+        // in interrupt context, once an asynchronous command such as sceCdRead completes.
+        uint32_t g_cdCallbackFunction = 0u;
+        uint32_t g_cdCallbackGp = 0u;
+        constexpr uint32_t kCdFuncRead = 1u;
+
+        void queueCdCallback(PS2Runtime *runtime, uint32_t command)
+        {
+            if (!runtime || g_cdCallbackFunction == 0u || !runtime->hasFunction(g_cdCallbackFunction))
+            {
+                return;
+            }
+            GuestInvocation invocation{};
+            invocation.kind = GuestInvocationKind::Interrupt;
+            invocation.context.pc = g_cdCallbackFunction;
+            SET_GPR_U32(&invocation.context, 4, command);
+            SET_GPR_U32(&invocation.context, 28, g_cdCallbackGp);
+            SET_GPR_U32(&invocation.context, 29, 0u);
+            SET_GPR_U32(&invocation.context, 31, 0u);
+            runtime->eeScheduler().queueInvocation(std::move(invocation));
+        }
+    }
+
     void sceCdRead(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t a0 = getRegU32(ctx, 4); // usually lbn
@@ -317,6 +342,8 @@ namespace ps2_stubs
         {
             g_cdStreamingLbn = selected.lbn + selected.sectors;
             setReturnS32(ctx, 1); // command accepted/success
+            // The read completes immediately here; report it like the drive interrupt would.
+            queueCdCallback(runtime, kCdFuncRead);
             return;
         }
 
@@ -355,7 +382,11 @@ namespace ps2_stubs
 
     void sceCdCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        setReturnS32(ctx, 0);
+        // Returns the previous callback, like libcdvd.
+        const uint32_t previous = g_cdCallbackFunction;
+        g_cdCallbackFunction = getRegU32(ctx, 4);
+        g_cdCallbackGp = getRegU32(ctx, 28);
+        setReturnU32(ctx, previous);
     }
 
     void sceCdChangeThreadPriority(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

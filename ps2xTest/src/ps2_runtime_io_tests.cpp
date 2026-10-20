@@ -2,6 +2,7 @@
 #include "ps2_runtime.h"
 #include "ps2_syscalls.h"
 #include "ps2_stubs.h"
+#include "runtime/ee_scheduler.h"
 
 #include <filesystem>
 #include <fstream>
@@ -741,6 +742,51 @@ void register_ps2_runtime_io_tests()
             t.Equals(getRegS32(&test.ctx, 2), 1, "sceCdRead should succeed when cdImage is configured");
             t.Equals(std::memcmp(test.rdram.data() + bufAddr, "cd-image", 8), 0,
                      "sceCdRead should copy sector data from the configured image");
+        });
+
+        tc.Run("sceCdCallback is reported as an interrupt after a completed sceCdRead", [](TestCase &t)
+        {
+            TestContext test;
+            PS2Runtime runtime;
+
+            constexpr uint32_t kCallback = 0x00210000u;
+            constexpr uint32_t bufAddr = GUEST_BUFFER_AREA_START + 0x1C80;
+            const std::filesystem::path imagePath = test.paths.base / "disc.iso";
+            {
+                std::vector<uint8_t> sector(2048u, 0x5Au);
+                std::ofstream out(imagePath, std::ios::binary);
+                out.write(reinterpret_cast<const char *>(sector.data()), static_cast<std::streamsize>(sector.size()));
+            }
+            PS2Runtime::IoPaths ioPaths;
+            ioPaths.elfDirectory = test.paths.cdRoot;
+            ioPaths.hostRoot = test.paths.cdRoot;
+            ioPaths.cdRoot = test.paths.cdRoot;
+            ioPaths.mcRoot = test.paths.mcRoot;
+            ioPaths.cdImage = imagePath;
+            PS2Runtime::setIoPaths(ioPaths);
+            runtime.registerFunction(kCallback, [](uint8_t *, R5900Context *, PS2Runtime *) {});
+
+            clearContext(test.ctx);
+            setRegU32(test.ctx, 4, kCallback);
+            ps2_stubs::sceCdCallback(test.rdram.data(), &test.ctx, &runtime);
+            t.Equals(getRegS32(&test.ctx, 2), 0, "the first sceCdCallback should return no previous callback");
+
+            const size_t pendingBefore = runtime.eeScheduler().pendingInvocationCount();
+            clearContext(test.ctx);
+            setRegU32(test.ctx, 4, 0u);
+            setRegU32(test.ctx, 5, 1u);
+            setRegU32(test.ctx, 6, bufAddr);
+            ps2_stubs::sceCdRead(test.rdram.data(), &test.ctx, &runtime);
+            t.Equals(getRegS32(&test.ctx, 2), 1, "sceCdRead should succeed");
+            t.Equals(runtime.eeScheduler().pendingInvocationCount(), pendingBefore + 1u,
+                     "a completed read should queue the CD callback");
+
+            clearContext(test.ctx);
+            setRegU32(test.ctx, 4, 0u);
+            ps2_stubs::sceCdCallback(test.rdram.data(), &test.ctx, &runtime);
+            t.Equals(static_cast<uint32_t>(getRegS32(&test.ctx, 2)), kCallback,
+                     "sceCdCallback should return the previous callback");
+            runtime.registerFunction(kCallback, nullptr);
         });
     });
 }
