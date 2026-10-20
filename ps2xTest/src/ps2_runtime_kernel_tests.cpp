@@ -889,6 +889,46 @@ void register_ps2_runtime_kernel_tests()
             t.Equals(ee.semaphore(gSchedulerSemaphoreId)->count, 0, "direct handoff must not increment count");
         });
 
+        tc.Run("reserved memory defaults keep the heap and HLE pools at 0x01F00000", [](TestCase &t)
+        {
+            TestEnv env;
+            t.Equals(PS2Runtime::reservedMemoryBase(), 0x01F00000u, "default reserved base");
+            t.Equals(env.runtime.guestHeapHardLimit(), 0x01F00000u, "default heap hard limit");
+
+            setRegU32(env.ctx, 4, 0x00549100u);
+            setRegU32(env.ctx, 5, 0xFFFFFFFFu);
+            t.IsTrue(callSyscall(0x3Du, env.rdram.data(), &env.ctx, &env.runtime), "SetupHeap syscall should dispatch");
+            t.IsTrue(callSyscall(0x3Eu, env.rdram.data(), &env.ctx, &env.runtime), "EndOfHeap syscall should dispatch");
+            t.Equals(static_cast<uint32_t>(getRegS32(env.ctx, 2)), 0x01F00000u,
+                     "a rest-of-RAM heap should end at the default hard limit");
+        });
+
+        tc.Run("configureReservedMemory moves pools and stacks and raises the heap limit", [](TestCase &t)
+        {
+            TestEnv env;
+            env.runtime.configureReservedMemory(0x00080000u, 0x00100000u, 0x01FF0000u);
+            t.Equals(PS2Runtime::reservedMemoryBase(), 0x00080000u, "pools should follow the reserved base");
+
+            setRegU32(env.ctx, 4, 0x00549100u);
+            setRegU32(env.ctx, 5, 0xFFFFFFFFu);
+            t.IsTrue(callSyscall(0x3Du, env.rdram.data(), &env.ctx, &env.runtime), "SetupHeap syscall should dispatch");
+            t.IsTrue(callSyscall(0x3Eu, env.rdram.data(), &env.ctx, &env.runtime), "EndOfHeap syscall should dispatch");
+            t.Equals(static_cast<uint32_t>(getRegS32(env.ctx, 2)), 0x01FF0000u,
+                     "a rest-of-RAM heap should reach the configured hard limit");
+
+            const uint32_t firstStack = env.runtime.reserveAsyncCallbackStack(0x4000u);
+            t.Equals(firstStack, 0x00100000u - 0x10u, "invocation stacks should grow down from the reserved top");
+            uint32_t stacks = 1u;
+            while (env.runtime.reserveAsyncCallbackStack(0x4000u) != 0u)
+            {
+                ++stacks;
+            }
+            t.Equals(stacks, (0x00100000u - (0x00080000u + PS2Runtime::kReservedPoolBytes)) / 0x4000u,
+                     "invocation stacks must stop above the HLE pools");
+
+            env.runtime.configureReservedMemory(0x01F00000u, PS2_RAM_SIZE, 0x01F00000u);
+        });
+
         tc.Run("setup heap and allocator primitives track end-of-heap", [](TestCase &t)
         {
             TestEnv env;

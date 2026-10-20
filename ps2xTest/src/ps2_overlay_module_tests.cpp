@@ -201,12 +201,14 @@ void register_ps2_overlay_module_tests()
                      "registration should include the overlay registry");
             t.IsTrue(registration.find("g_ps2RecompiledFunctionTable") == std::string::npos,
                      "modules must not define the main ELF table");
-            t.IsTrue(registration.find("g_moduleFunctionTable[0] = mod7_FUN_00001080_0x1080;") != std::string::npos,
+            t.IsTrue(registration.find("mod7_FunctionTable[0] = mod7_FUN_00001080_0x1080;") != std::string::npos,
                      "the module table should hold the scoped function");
             t.IsTrue(registration.find("module.loadAddress = 0x1000u;") != std::string::npos,
                      "registration should carry the load address");
-            t.IsTrue(registration.find("g_moduleGuard[4u] = {\n    0x0, 0x7, 0xab, 0xcd,") != std::string::npos,
+            t.IsTrue(registration.find("mod7_Guard[4u] = {\n    0x0, 0x7, 0xab, 0xcd,") != std::string::npos,
                      "registration should embed the guard bytes");
+            t.IsTrue(registration.find("g_module") == std::string::npos,
+                     "registration names must be module-prefixed so unity builds can merge modules");
             t.IsTrue(registration.find("ps2_overlays::registerModule(module);") != std::string::npos,
                      "registration should register the module");
         });

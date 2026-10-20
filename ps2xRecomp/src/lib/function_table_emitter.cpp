@@ -189,23 +189,27 @@ namespace ps2recomp
                                                       uint32_t tableBase, uint32_t tableEnd, uint32_t slotCount)
     {
         const CodeGenerator::ModuleInfo &module = m_codeGenerator.m_moduleInfo;
+        // Module-prefixed names keep several registration files apart in one unity-build batch.
+        const std::string table = module.name + "_FunctionTable";
+        const std::string guard = module.name + "_Guard";
+        const std::string registration = module.name + "_Registration";
 
         ss << "// Overlay module " << module.name << ": table and guard are private to this module.\n";
         ss << "namespace {\n";
-        ss << "PS2Runtime::RecompiledFunction g_moduleFunctionTable[" << std::dec << (slotCount == 0u ? 1u : slotCount) << "u] = {};\n\n";
-        ss << "const uint8_t g_moduleGuard[" << std::dec << module.guard.size() << "u] = {";
+        ss << "PS2Runtime::RecompiledFunction " << table << "[" << std::dec << (slotCount == 0u ? 1u : slotCount) << "u] = {};\n\n";
+        ss << "const uint8_t " << guard << "[" << std::dec << module.guard.size() << "u] = {";
         for (size_t i = 0; i < module.guard.size(); ++i)
         {
             ss << (i % 16 == 0 ? "\n    " : " ") << "0x" << std::hex << static_cast<unsigned>(module.guard[i]) << std::dec << ",";
         }
         ss << "\n};\n\n";
 
-        ss << "struct ModuleRegistration {\n";
-        ss << "    ModuleRegistration() {\n";
+        ss << "struct " << registration << " {\n";
+        ss << "    " << registration << "() {\n";
         for (const auto &[address, name] : entries)
         {
             const uint32_t slot = (address - tableBase) >> 2;
-            ss << "        g_moduleFunctionTable[" << std::dec << slot << "] = " << name
+            ss << "        " << table << "[" << std::dec << slot << "] = " << name
                << "; // 0x" << std::hex << address << std::dec << "\n";
         }
         ss << "        ps2_overlays::Module module;\n";
@@ -214,13 +218,13 @@ namespace ps2recomp
         ss << "        module.tableBase = 0x" << std::hex << tableBase << "u;\n";
         ss << "        module.tableEnd = 0x" << std::hex << tableEnd << "u;\n";
         ss << "        module.slotCount = " << std::dec << slotCount << "u;\n";
-        ss << "        module.table = g_moduleFunctionTable;\n";
-        ss << "        module.guard = g_moduleGuard;\n";
+        ss << "        module.table = " << table << ";\n";
+        ss << "        module.guard = " << guard << ";\n";
         ss << "        module.guardSize = " << std::dec << module.guard.size() << "u;\n";
         ss << "        ps2_overlays::registerModule(module);\n";
         ss << "    }\n";
         ss << "};\n";
-        ss << "static const ModuleRegistration g_moduleRegistration;\n";
+        ss << "static const " << registration << " " << module.name << "_registration;\n";
         ss << "}\n";
     }
 }
