@@ -1053,6 +1053,9 @@ namespace ps2recomp
             size_t processedCount = 0;
             size_t failedCount = 0;
             size_t correctnessCriticalFailureCount = 0;
+            // Initializers only known as configured entry points are synthesized by
+            // discoverAdditionalEntryPoints(); they are checked again after it.
+            std::vector<uint32_t> initializersFromEntryHints;
 
             for (uint32_t initializerStart : m_correctnessCriticalFunctionStarts)
             {
@@ -1075,6 +1078,11 @@ namespace ps2recomp
                             "correctness-critical",
                             "Synthesized initializer entry for resolved handler '" +
                                 bindingIt->second + "'");
+                        continue;
+                    }
+                    if (m_entryPointHintStarts.contains(initializerStart))
+                    {
+                        initializersFromEntryHints.push_back(initializerStart);
                         continue;
                     }
 
@@ -1198,6 +1206,30 @@ namespace ps2recomp
             }
 
             discoverAdditionalEntryPoints();
+
+            for (uint32_t initializerStart : initializersFromEntryHints)
+            {
+                // Either a function of its own, or an entry inside a recompiled function
+                // (Ghidra can merge adjacent initializers) dispatched through its owner.
+                bool covered = std::any_of(
+                    m_functions.begin(), m_functions.end(),
+                    [initializerStart](const Function &function)
+                    { return function.start == initializerStart && function.isRecompiled; });
+                for (const auto &[owner, targets] : m_resumeEntryTargetsByOwner)
+                {
+                    covered = covered || std::find(targets.begin(), targets.end(), initializerStart) != targets.end();
+                }
+                if (!covered)
+                {
+                    ++correctnessCriticalFailureCount;
+                    m_reporter.recordCorrectnessCriticalFailure();
+                    m_reporter.errorAt(
+                        "correctness-critical",
+                        ".ctors/.init_array",
+                        initializerStart,
+                        "Initializer configured as an entry point could not be recompiled");
+                }
+            }
 
             if (failedCount > 0)
             {
