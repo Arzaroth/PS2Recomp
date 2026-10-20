@@ -451,6 +451,12 @@ namespace ps2x::iop::detail
         if (relocate)
         {
             base = alignUp(moduleCursor, 0x100u);
+            // Skip heap blocks the allocator may have placed above the modules.
+            while (base + span < IopMemory::HeapBase && memory.overlapsAllocation(base, span))
+            {
+                const auto block = memory.allocationContaining(base);
+                base = alignUp(block ? block->address + block->size : base + 0x100u, 0x100u);
+            }
             if (base + span >= IopMemory::HeapBase)
             {
                 result.error = IopImageLoadError::ArenaExhausted;
@@ -458,6 +464,7 @@ namespace ps2x::iop::detail
             }
             delta = static_cast<int64_t>(base) - minVaddr;
             result.nextModuleCursor = base + span;
+            memory.setModuleWatermark(result.nextModuleCursor);
         }
         else
         {

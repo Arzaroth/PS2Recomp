@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <vector>
@@ -21,6 +22,7 @@ namespace ps2x::iop::detail
     void IopRpcBridge::reset()
     {
         m_servers.clear();
+        m_cmdHandlers.clear();
         m_nextDmaId = 1u;
         m_sifInitialized = false;
     }
@@ -131,6 +133,14 @@ namespace ps2x::iop::detail
         }
     }
 
+    std::optional<IopRpcBridge::CmdHandler> IopRpcBridge::cmdHandler(uint32_t cid) const
+    {
+        const auto it = m_cmdHandlers.find(cid);
+        if (it == m_cmdHandlers.end() || it->second.function == 0u)
+            return std::nullopt;
+        return it->second;
+    }
+
     bool IopRpcBridge::dispatchSifCmdImport(uint16_t ordinal, IopCpuState &cpu)
     {
         const auto setV0 = [&](uint32_t value)
@@ -139,14 +149,26 @@ namespace ps2x::iop::detail
         };
         switch (ordinal)
         {
+        case 10: // sceSifAddCmdHandler(cid, function, data)
+        {
+            m_cmdHandlers[cpu.gpr[4]] = CmdHandler{cpu.gpr[5], cpu.gpr[6], cpu.gpr[28]};
+            char message[96];
+            std::snprintf(message, sizeof(message), "[IOP] SIF command handler cid=0x%x function=0x%x",
+                          cpu.gpr[4], cpu.gpr[5]);
+            m_host.log(LogLevel::Info, message);
+            setV0(0);
+            return true;
+        }
+        case 11: // sceSifRemoveCmdHandler(cid)
+            m_cmdHandlers.erase(cpu.gpr[4]);
+            setV0(0);
+            return true;
         case 4: // InitCmd
         case 5:
         case 6:
         case 7:
         case 8:
         case 9:
-        case 10:
-        case 11:
         case 14: // InitRpc
         case 15:
         case 16:
@@ -338,6 +360,15 @@ namespace ps2x::iop::detail
                 server = m_servers.erase(server);
             else
                 ++server;
+        }
+        // SIF command handlers of the unloaded module go with its servers.
+        for (auto handler = m_cmdHandlers.begin(); handler != m_cmdHandlers.end();)
+        {
+            const uint32_t function = IopMemory::physicalAddress(handler->second.function);
+            if (function >= base && function < base + size)
+                handler = m_cmdHandlers.erase(handler);
+            else
+                ++handler;
         }
     }
 

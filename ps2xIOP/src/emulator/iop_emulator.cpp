@@ -18,7 +18,10 @@
 #include "iop_emulator_const.h"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
+#include <cstring>
+#include <deque>
 #include <map>
 #include <optional>
 #include <span>
@@ -37,6 +40,8 @@ namespace ps2x::iop::detail
         constexpr uint32_t kCallStackSize = 0x2000u;
         constexpr uint32_t kCallStackCapacity = (kCallStackLimit - kCallStackBase) / kCallStackSize;
         constexpr uint64_t kCdvdCompletionCycles = 128u;
+        constexpr uint32_t kMaxSifCommandPacket = 112u;
+        constexpr uint32_t kSifCommandHandlerBudget = 100000u;
 
         uint32_t physicalAddress(uint32_t address)
         {
@@ -93,6 +98,14 @@ namespace ps2x::iop::detail
             uint32_t argument = 0u;
         };
 
+        // EE -> IOP SIF command waiting for its IOP handler (sceSifAddCmdHandler).
+        struct PendingSifCommand
+        {
+            IopRpcBridge::CmdHandler handler;
+            std::array<uint8_t, kMaxSifCommandPacket> packet{};
+            uint32_t size = 0u;
+        };
+
         explicit Impl(IopHost &hostRef)
             : host(hostRef),
               sysmem(host, memory),
@@ -126,6 +139,8 @@ namespace ps2x::iop::detail
             ioman.reset();
             pendingDmaInterrupts.clear();
             pendingGuestCallbacks.clear();
+            pendingSifCommands.clear();
+            sifCommandBuffer = 0u;
             nextModuleId = 1;
             moduleCursor = kModuleLoadBase;
             totalCycles = 0;
@@ -553,6 +568,55 @@ namespace ps2x::iop::detail
             servicingGuestCallbacks = false;
         }
 
+        bool queueSifCommand(uint32_t cid, const void *packet, uint32_t size)
+        {
+            if (!packet || size < 16u || size > kMaxSifCommandPacket)
+                return false;
+            const auto handler = rpc.cmdHandler(cid);
+            if (!handler)
+                return false;
+            PendingSifCommand command{*handler, {}, size};
+            std::memcpy(command.packet.data(), packet, size);
+            pendingSifCommands.push_back(command);
+            return true;
+        }
+
+        // Runs the handlers like the SIF command interrupt does: in order, outside any thread,
+        // with the packet copied to an IOP receive buffer.
+        void servicePendingSifCommands()
+        {
+            if (servicingSifCommands || pendingSifCommands.empty())
+                return;
+            if (sifCommandBuffer == 0u)
+                sifCommandBuffer = memory.allocate(kMaxSifCommandPacket, 16u);
+            if (sifCommandBuffer == 0u)
+            {
+                log(LogLevel::Error, "[IOP] no memory for the SIF command receive buffer");
+                pendingSifCommands.clear();
+                return;
+            }
+            servicingSifCommands = true;
+            try
+            {
+                while (!pendingSifCommands.empty())
+                {
+                    const PendingSifCommand command = pendingSifCommands.front();
+                    pendingSifCommands.pop_front();
+                    if (memory.writeRam(sifCommandBuffer, command.packet.data(), command.size))
+                    {
+                        (void)callFunction(command.handler.function, sifCommandBuffer, command.handler.data, 0u, 0u,
+                                           command.handler.gp, kSifCommandHandlerBudget);
+                    }
+                }
+            }
+            catch (...)
+            {
+                servicingSifCommands = false;
+                throw;
+            }
+            servicingSifCommands = false;
+        }
+
         void runCycles(uint64_t cycles) noexcept
         {
             try
@@ -561,6 +625,7 @@ namespace ps2x::iop::detail
                 while (totalCycles < target)
                 {
                     servicePendingDmaInterrupts();
+                    servicePendingSifCommands();
                     servicePendingGuestCallbacks();
                     timrman.serviceDue(totalCycles, *this);
                     IopThread *next = kernel.beginNextReady(totalCycles);
@@ -707,6 +772,9 @@ namespace ps2x::iop::detail
         std::map<int, Module> modules;
         std::map<int, uint64_t> pendingDmaInterrupts;
         std::multimap<uint64_t, ScheduledGuestCallback> pendingGuestCallbacks;
+        std::deque<PendingSifCommand> pendingSifCommands;
+        uint32_t sifCommandBuffer = 0u;
+        bool servicingSifCommands = false;
         uint32_t nextModuleId = 1;
         uint32_t moduleCursor = kModuleLoadBase;
         uint64_t totalCycles = 0;
@@ -747,6 +815,11 @@ namespace ps2x::iop::detail
     ModuleLoadResult IopEmulator::loadModuleBufferFromIop(uint32_t iopAddress, const void *arguments, uint32_t argumentSize)
     {
         return m_impl->loadModuleBufferFromIop(iopAddress, arguments, argumentSize);
+    }
+
+    bool IopEmulator::sendSifCommand(uint32_t cid, const void *packet, uint32_t size)
+    {
+        return m_impl->queueSifCommand(cid, packet, size);
     }
 
     bool IopEmulator::stopModule(int32_t moduleId, int32_t *result)

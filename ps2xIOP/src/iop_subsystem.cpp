@@ -155,6 +155,11 @@ namespace ps2x::iop
         return m_impl->emulator.loadModuleBufferFromIop(iopAddress, arguments, argumentSize);
     }
 
+    bool IopSubsystem::sendSifCommand(uint32_t cid, const void *packet, uint32_t size)
+    {
+        return m_impl->emulator.sendSifCommand(cid, packet, size);
+    }
+
     bool IopSubsystem::stopModule(int32_t moduleId, int32_t *result)
     {
         if (m_impl->moduleManager.stopHle(moduleId, result))
