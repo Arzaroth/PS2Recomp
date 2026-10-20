@@ -115,6 +115,21 @@ namespace ps2recomp
         m_bootstrapInfo = info;
     }
 
+    void CodeGenerator::setModuleInfo(const ModuleInfo &info)
+    {
+        m_moduleInfo = info;
+    }
+
+    std::string CodeGenerator::functionsHeaderName() const
+    {
+        return isModule() ? m_moduleInfo.name + "_functions.h" : "ps2_recompiled_functions.h";
+    }
+
+    std::string CodeGenerator::stubsHeaderName() const
+    {
+        return isModule() ? m_moduleInfo.name + "_stubs.h" : "ps2_recompiled_stubs.h";
+    }
+
     void CodeGenerator::setRelocationCallNames(const std::unordered_map<uint32_t, std::string> &callNames)
     {
         m_relocationCallNames = callNames;

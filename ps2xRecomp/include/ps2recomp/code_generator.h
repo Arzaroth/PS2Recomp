@@ -38,6 +38,15 @@ namespace ps2recomp
             std::string entryName;
         };
 
+        // Overlay module mode: names, headers and the function table are scoped to
+        // `name`, and the registration file registers the module with ps2_overlays.
+        struct ModuleInfo
+        {
+            std::string name;
+            uint32_t loadAddress = 0;
+            std::vector<uint8_t> guard; // bytes at loadAddress identifying the resident module
+        };
+
         using AnalysisResult = ControlFlowAnalysisResult;
 
         std::string generateFunction(const Function &function, const std::vector<Instruction> &instructions, const bool &useHeaders);
@@ -50,6 +59,10 @@ namespace ps2recomp
 
         void setRenamedFunctions(const std::unordered_map<uint32_t, std::string> &renames);
         void setBootstrapInfo(const BootstrapInfo &info);
+        void setModuleInfo(const ModuleInfo &info);
+        bool isModule() const { return !m_moduleInfo.name.empty(); }
+        std::string functionsHeaderName() const;
+        std::string stubsHeaderName() const;
         void setRelocationCallNames(const std::unordered_map<uint32_t, std::string> &callNames);
         void setConfiguredJumpTables(const std::vector<JumpTable> &jumpTables);
         void setResumeEntryTargets(const std::unordered_map<uint32_t, std::vector<uint32_t>> &resumeTargetsByOwner);
@@ -68,6 +81,7 @@ namespace ps2recomp
         std::unordered_map<uint32_t, std::vector<uint32_t>> m_resumeEntryTargetsByOwner;
         const std::vector<Section>& m_sections;
         BootstrapInfo m_bootstrapInfo;
+        ModuleInfo m_moduleInfo;
         bool m_emitInstructionComments = true;
         RecompilerReporter *m_reporter = nullptr;
         std::string m_currentFunctionName;

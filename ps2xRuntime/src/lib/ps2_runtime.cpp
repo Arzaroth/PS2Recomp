@@ -3,6 +3,7 @@
 #include "ps2_stubs.h"
 #include "ps2_syscalls.h"
 #include "game_overrides.h"
+#include "ps2_overlay_modules.h"
 #include "ps2_runtime_macros.h"
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/ee_scheduler.h"
@@ -1086,13 +1087,38 @@ namespace
         slot = offset >> 2;
         return slot < g_ps2RecompiledFunctionTableSlotCount;
     }
+
+    // Main ELF table first; an empty main slot falls back to the resident overlay
+    // module covering the address.
+    PS2Runtime::RecompiledFunction *functionTableEntry(const uint8_t *rdram, uint32_t address)
+    {
+        uint32_t slot = 0u;
+        PS2Runtime::RecompiledFunction *mainEntry =
+            generatedFunctionTableSlot(address, slot) ? &g_ps2RecompiledFunctionTable[slot] : nullptr;
+        if (mainEntry != nullptr && *mainEntry != nullptr)
+        {
+            return mainEntry;
+        }
+        if (PS2Runtime::RecompiledFunction *overlayEntry = ps2_overlays::residentEntry(rdram, address))
+        {
+            return overlayEntry;
+        }
+        return mainEntry;
+    }
 }
 
 bool PS2Runtime::replaceFunction(uint32_t address, RecompiledFunction func)
 {
-    uint32_t slot = 0u;
-    if (!generatedFunctionTableSlot(address, slot))
+    RecompiledFunction *entry = functionTableEntry(m_memory.getRDRAM(), address);
+    if (entry == nullptr)
     {
+        if (ps2_overlays::coversAddress(address))
+        {
+            std::cerr << "[function-table] cannot replace guest PC 0x" << std::hex << address
+                      << ": no overlay module resident there; use ps2_overlays::replaceModuleFunction"
+                      << std::dec << std::endl;
+            return false;
+        }
         std::cerr << "[function-table] cannot replace guest PC 0x" << std::hex << address
                   << ": outside generated dense table [0x" << g_ps2RecompiledFunctionTableBase
                   << ", 0x" << g_ps2RecompiledFunctionTableEnd << ")"
@@ -1100,7 +1126,7 @@ bool PS2Runtime::replaceFunction(uint32_t address, RecompiledFunction func)
         return false;
     }
 
-    g_ps2RecompiledFunctionTable[slot] = func;
+    *entry = func;
     return true;
 }
 
@@ -1111,8 +1137,8 @@ bool PS2Runtime::registerFunction(uint32_t address, RecompiledFunction func)
 
 bool PS2Runtime::hasFunction(uint32_t address) const
 {
-    uint32_t slot = 0u;
-    return generatedFunctionTableSlot(address, slot) && g_ps2RecompiledFunctionTable[slot] != nullptr;
+    const RecompiledFunction *entry = functionTableEntry(m_memory.getRDRAM(), address);
+    return entry != nullptr && *entry != nullptr;
 }
 
 const char *describeGuestBranchKind(PS2Runtime::GuestBranchKind kind)
@@ -1138,19 +1164,17 @@ PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
 {
     pushDispatchPc(address);
 
-    uint32_t slot = 0u;
-    if (generatedFunctionTableSlot(address, slot))
+    const uint8_t *rdram = m_memory.getRDRAM();
+    if (RecompiledFunction *entry = functionTableEntry(rdram, address); entry != nullptr && *entry != nullptr)
     {
-        RecompiledFunction fn = g_ps2RecompiledFunctionTable[slot];
-        if (fn != nullptr)
-        {
-            return fn;
-        }
+        return *entry;
     }
 
+    const ps2_overlays::Module *overlay = ps2_overlays::residentModuleFor(rdram, address);
     std::cerr << "Error: No exact recompiled function for guest PC 0x" << std::hex << address
               << " tableBase=0x" << g_ps2RecompiledFunctionTableBase
               << " tableEnd=0x" << g_ps2RecompiledFunctionTableEnd
+              << " overlay=" << (overlay ? overlay->name : (ps2_overlays::coversAddress(address) ? "<none resident>" : "-"))
               << " codeRegion=" << (m_memory.isCodeAddress(address) ? "yes" : "no")
               << " trace=" << formatDispatchHistory()
               << std::dec << std::endl;

@@ -147,10 +147,20 @@ namespace ps2recomp
 
         std::stringstream ss;
         ss << "#include \"ps2_runtime.h\"\n";
-        ss << "#include <ps2_recompiled_functions.h>\n";
+        if (cg.isModule())
+        {
+            ss << "#include \"ps2_overlay_modules.h\"\n";
+        }
+        ss << "#include <" << cg.functionsHeaderName() << ">\n";
         ss << "#include \"ps2_stubs.h\"\n";
-        ss << "#include <ps2_recompiled_stubs.h>\n";
+        ss << "#include <" << cg.stubsHeaderName() << ">\n";
         ss << "#include \"ps2_syscalls.h\"\n\n";
+
+        if (cg.isModule())
+        {
+            emitModuleRegistration(ss, entries, tableBase, tableEnd, slotCount);
+            return ss.str();
+        }
 
         ss << "extern const uint32_t g_ps2RecompiledFunctionTableBase = 0x" << std::hex << tableBase << "u;\n";
         ss << "extern const uint32_t g_ps2RecompiledFunctionTableEnd = 0x" << std::hex << tableEnd << "u;\n";
@@ -172,5 +182,45 @@ namespace ps2recomp
         ss << "}\n";
 
         return ss.str();
+    }
+
+    void FunctionTableEmitter::emitModuleRegistration(std::stringstream &ss,
+                                                      const std::vector<std::pair<uint32_t, std::string>> &entries,
+                                                      uint32_t tableBase, uint32_t tableEnd, uint32_t slotCount)
+    {
+        const CodeGenerator::ModuleInfo &module = m_codeGenerator.m_moduleInfo;
+
+        ss << "// Overlay module " << module.name << ": table and guard are private to this module.\n";
+        ss << "namespace {\n";
+        ss << "PS2Runtime::RecompiledFunction g_moduleFunctionTable[" << std::dec << (slotCount == 0u ? 1u : slotCount) << "u] = {};\n\n";
+        ss << "const uint8_t g_moduleGuard[" << std::dec << module.guard.size() << "u] = {";
+        for (size_t i = 0; i < module.guard.size(); ++i)
+        {
+            ss << (i % 16 == 0 ? "\n    " : " ") << "0x" << std::hex << static_cast<unsigned>(module.guard[i]) << std::dec << ",";
+        }
+        ss << "\n};\n\n";
+
+        ss << "struct ModuleRegistration {\n";
+        ss << "    ModuleRegistration() {\n";
+        for (const auto &[address, name] : entries)
+        {
+            const uint32_t slot = (address - tableBase) >> 2;
+            ss << "        g_moduleFunctionTable[" << std::dec << slot << "] = " << name
+               << "; // 0x" << std::hex << address << std::dec << "\n";
+        }
+        ss << "        ps2_overlays::Module module;\n";
+        ss << "        module.name = \"" << module.name << "\";\n";
+        ss << "        module.loadAddress = 0x" << std::hex << module.loadAddress << "u;\n";
+        ss << "        module.tableBase = 0x" << std::hex << tableBase << "u;\n";
+        ss << "        module.tableEnd = 0x" << std::hex << tableEnd << "u;\n";
+        ss << "        module.slotCount = " << std::dec << slotCount << "u;\n";
+        ss << "        module.table = g_moduleFunctionTable;\n";
+        ss << "        module.guard = g_moduleGuard;\n";
+        ss << "        module.guardSize = " << std::dec << module.guard.size() << "u;\n";
+        ss << "        ps2_overlays::registerModule(module);\n";
+        ss << "    }\n";
+        ss << "};\n";
+        ss << "static const ModuleRegistration g_moduleRegistration;\n";
+        ss << "}\n";
     }
 }

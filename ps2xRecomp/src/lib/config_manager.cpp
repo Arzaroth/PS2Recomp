@@ -6,6 +6,7 @@
 #include <stdexcept>
 #include <sstream>
 #include <algorithm>
+#include <cctype>
 #include <limits>
 #include <thread>
 
@@ -64,6 +65,28 @@ namespace ps2recomp
             config.patchSyscalls = toml::find_or<bool>(general, "patch_syscalls", config.patchSyscalls);
             config.patchCop0 = toml::find_or<bool>(general, "patch_cop0", config.patchCop0);
             config.patchCache = toml::find_or<bool>(general, "patch_cache", config.patchCache);
+
+            config.moduleName = toml::find_or<std::string>(general, "module_name", "");
+            if (!config.moduleName.empty())
+            {
+                const bool validIdentifier =
+                    (std::isalpha(static_cast<unsigned char>(config.moduleName[0])) || config.moduleName[0] == '_') &&
+                    std::all_of(config.moduleName.begin(), config.moduleName.end(), [](char c)
+                                { return std::isalnum(static_cast<unsigned char>(c)) || c == '_'; });
+                if (!validIdentifier)
+                {
+                    throw std::runtime_error("module_name must be a C identifier: " + config.moduleName);
+                }
+            }
+            if (general.contains("module_load"))
+            {
+                const auto &loadValue = general.at("module_load");
+                config.moduleLoadAddress = loadValue.is_string()
+                                               ? static_cast<uint32_t>(std::stoul(loadValue.as_string(), nullptr, 0))
+                                               : static_cast<uint32_t>(toml::find<int64_t>(general, "module_load"));
+            }
+            config.moduleGuardSize = static_cast<uint32_t>(
+                toml::find_or<int64_t>(general, "module_guard_size", config.moduleGuardSize));
 
             if (general.contains("stubs") && general.at("stubs").is_array())
             {
@@ -298,6 +321,17 @@ namespace ps2recomp
         general["skip"] = config.skipFunctions;
         general["stubs"] = config.stubImplementations;
         general["entry_points"] = config.entryPointHints;
+        if (!config.moduleName.empty())
+        {
+            general["module_name"] = config.moduleName;
+            if (config.moduleLoadAddress != 0u)
+            {
+                std::ostringstream loadStream;
+                loadStream << "0x" << std::hex << config.moduleLoadAddress;
+                general["module_load"] = loadStream.str();
+            }
+            general["module_guard_size"] = static_cast<int64_t>(config.moduleGuardSize);
+        }
         data["general"] = general;
 
         if (!config.mmioByInstructionAddress.empty())
