@@ -630,6 +630,30 @@ void register_ps2_runtime_kernel_tests()
             t.Equals(semaphore->option, semaParam.option, "semaphore option must be decoded from offset 0x14");
         });
 
+        tc.Run("CreateSema accepts max_count 0 as an unbounded semaphore", [](TestCase &t)
+        {
+            TestEnv env;
+            EeSemaStatus semaParam{};
+            semaParam.max_count = 0;
+            semaParam.init_count = 0;
+            std::memcpy(env.rdram.data() + K_PARAM_ADDR, &semaParam, sizeof(semaParam));
+            setRegU32(env.ctx, 4, K_PARAM_ADDR);
+            CreateSema(env.rdram.data(), &env.ctx, &env.runtime);
+            const int semaId = getRegS32(env.ctx, 2);
+            t.IsTrue(semaId > 0, "the EE kernel does not validate max_count, so max_count 0 must create a semaphore");
+
+            EeScheduler &ee = env.runtime.eeScheduler();
+            ee.bindMainContextForSyscall(env.ctx, env.rdram.data());
+            t.Equals(ee.signalSemaphore(semaId, false), semaId, "a max_count 0 semaphore must accept signals");
+            t.Equals(ee.signalSemaphore(semaId, false), semaId, "a max_count 0 semaphore has no upper bound");
+            t.Equals(ee.semaphore(semaId)->count, 2, "signals without waiters must accumulate");
+
+            semaParam.init_count = -1;
+            std::memcpy(env.rdram.data() + K_PARAM_ADDR, &semaParam, sizeof(semaParam));
+            CreateSema(env.rdram.data(), &env.ctx, &env.runtime);
+            t.Equals(getRegS32(env.ctx, 2), KE_ERROR, "a negative init_count must still be rejected");
+        });
+
         tc.Run("EE scheduler selects absolute priority then FIFO", [](TestCase &t)
         {
             TestEnv env;
