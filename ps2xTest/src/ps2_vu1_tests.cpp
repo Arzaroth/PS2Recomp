@@ -250,6 +250,36 @@ void register_ps2_vu1_tests()
             t.Equals(vu1.state().vf[3][3], -4.0f, "ADD.xz should preserve w");
         });
 
+        tc.Run("FMAC addition drops the small operand bits below the large one (VP2 VU0 key)", [](TestCase &t)
+        {
+            Vu1Fixture fx;
+            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
+
+            // Valkyrie Profile 2's VU0 key microprogram: vf3 = vf1 * I + I' per lane, with
+            // vf1 the four words its IOP sound driver returns. Only the PS2 addition (operand
+            // alignment by truncation, then round toward zero) yields the key the game uses.
+            const uint32_t program[][2] = {
+                {0x42fecccdu, 0x800002ffu}, {0x42546666u, 0x8100089eu}, {0x43d80d3eu, 0x810010e2u},
+                {0xc7f079b3u, 0x8080089eu}, {0x43a0da10u, 0x808010e2u}, {0x43a02666u, 0x8040089eu},
+                {0x43546e14u, 0x804010e2u}, {0x42f23333u, 0x8020089eu}, {0x3dd3dd98u, 0x802010e2u},
+                {0x8000033cu, 0x400002ffu}, {0x8000033cu, 0x000002ffu},
+            };
+            for (uint32_t pair = 0; pair < std::size(program); ++pair)
+                writeVuInstructionPair(fx.code, pair * 8u, program[pair][0], program[pair][1]);
+
+            VU1Interpreter vu;
+            const uint32_t input[4] = {0xb063b75bu, 0x8701ce82u, 0x46fcc888u, 0x793cc535u};
+            std::memcpy(vu.state().vf[1], input, sizeof(input));
+            vu.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem, 0u, 0u, 0u, 64u);
+
+            uint32_t key[4]{};
+            std::memcpy(key, vu.state().vf[3], sizeof(key));
+            t.Equals(key[0], 0x42546666u, "x: 53.1 plus a tiny negative product stays 53.1");
+            t.Equals(key[1], 0xc7f079b3u, "y: key word 1");
+            t.Equals(key[2], 0x4b1ed5e7u, "z: truncated product plus truncated addend");
+            t.Equals(key[3], 0x7d1ca47bu, "w: key word 3");
+        });
+
         tc.Run("LOI commits the lower immediate after the upper instruction", [](TestCase &t)
         {
             Vu1Fixture fx;
