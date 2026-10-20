@@ -190,6 +190,11 @@ namespace ps2recomp
         std::vector<std::string> entryPointHints;
         std::unordered_map<uint32_t, uint32_t> mmioByInstructionAddress;
         std::vector<JumpTable> jumpTables;
+
+        // Overlay module mode (enabled by a non-empty name): see CodeGenerator::ModuleInfo.
+        std::string moduleName;
+        uint32_t moduleLoadAddress = 0; // 0: lowest section address of the input
+        uint32_t moduleGuardSize = 64;
     };
 
 } // namespace ps2recomp

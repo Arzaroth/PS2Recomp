@@ -99,13 +99,13 @@ namespace ps2recomp
             return 1;
         }
 
-        void writeCombinedOutputPreamble(std::ostream &output)
+        void writeCombinedOutputPreamble(std::ostream &output, const CodeGenerator &codeGenerator)
         {
             output << "#include <stdexcept>\n";
-            output << "#include <ps2_recompiled_functions.h>\n\n";
+            output << "#include <" << codeGenerator.functionsHeaderName() << ">\n\n";
             output << "#include \"ps2_runtime_macros.h\"\n";
             output << "#include \"ps2_runtime.h\"\n";
-            output << "#include <ps2_recompiled_stubs.h>\n";
+            output << "#include <" << codeGenerator.stubsHeaderName() << ">\n";
             output << "#include \"ps2_syscalls.h\"\n";
             output << "#include \"ps2_stubs.h\"\n";
             output << "#ifdef _DEBUG\n";
@@ -1024,6 +1024,11 @@ namespace ps2recomp
             m_codeGenerator->setConfiguredJumpTables(m_config.jumpTables);
             m_codeGenerator->setEmitInstructionComments(true);
 
+            if (!m_config.moduleName.empty())
+            {
+                m_codeGenerator->setModuleInfo(buildModuleInfo());
+            }
+
             fs::create_directories(m_config.outputPath);
 
             return true;
@@ -1216,13 +1221,20 @@ namespace ps2recomp
                 ss << sanitized << "_0x" << std::hex << function.start;
                 return ss.str();
             };
+            // Overlay modules may share addresses with other modules: scope every
+            // generated symbol to the module.
+            auto scopedName = [&](const Function &function) -> std::string
+            {
+                const std::string name = makeName(function);
+                return m_config.moduleName.empty() ? name : m_config.moduleName + "_" + name;
+            };
 
             for (const auto &function : m_functions)
             {
                 if (!shouldGenerateCodeForFunction(function))
                     continue;
 
-                m_functionRenames[function.start] = makeName(function);
+                m_functionRenames[function.start] = scopedName(function);
             }
 
             if (m_codeGenerator)
@@ -1374,14 +1386,14 @@ namespace ps2recomp
 
             if (m_config.singleFileOutput)
             {
-                fs::path outputPath = fs::path(m_config.outputPath) / "ps2_recompiled_functions.cpp";
+                fs::path outputPath = fs::path(m_config.outputPath) / generatedFileName("ps2_recompiled_functions.cpp");
                 std::ofstream combinedOutput(outputPath);
                 if (!combinedOutput)
                 {
                     throw std::runtime_error("Failed to open combined output: " + outputPath.string());
                 }
 
-                writeCombinedOutputPreamble(combinedOutput);
+                writeCombinedOutputPreamble(combinedOutput, *m_codeGenerator);
 
                 if (outputWorkerCount <= 1)
                 {
@@ -1771,7 +1783,7 @@ namespace ps2recomp
             std::string registerFunctions = m_codeGenerator->generateFunctionRegistration(m_functions, m_generatedStubs);
             m_generatedStubs.clear();
 
-            fs::path registerPath = fs::path(m_config.outputPath) / "register_functions.cpp";
+            fs::path registerPath = fs::path(m_config.outputPath) / generatedFileName("register_functions.cpp");
             if (!writeToFile(registerPath.string(), registerFunctions))
             {
                 throw std::runtime_error("Failed to write function registration file: " + registerPath.string());
@@ -1793,6 +1805,63 @@ namespace ps2recomp
             m_reporter.printSummary(std::cout);
             throw;
         }
+    }
+
+    CodeGenerator::ModuleInfo PS2Recompiler::buildModuleInfo()
+    {
+        CodeGenerator::ModuleInfo info;
+        info.name = m_config.moduleName;
+        info.loadAddress = m_config.moduleLoadAddress;
+        if (info.loadAddress == 0u)
+        {
+            info.loadAddress = std::numeric_limits<uint32_t>::max();
+            for (const auto &section : m_sections)
+            {
+                if (section.size > 0u && section.address != 0u && (section.isCode || section.isData || section.isBSS))
+                {
+                    info.loadAddress = std::min(info.loadAddress, section.address);
+                }
+            }
+        }
+
+        for (const auto &section : m_sections)
+        {
+            if (section.data == nullptr || section.isBSS ||
+                info.loadAddress < section.address || info.loadAddress >= section.address + section.size)
+            {
+                continue;
+            }
+            const uint32_t available = section.address + section.size - info.loadAddress;
+            const uint8_t *begin = section.data + (info.loadAddress - section.address);
+            info.guard.assign(begin, begin + std::min(available, m_config.moduleGuardSize));
+            break;
+        }
+        if (info.guard.empty())
+        {
+            std::ostringstream msg;
+            msg << "module " << info.name << ": no initialized section data at load address 0x"
+                << std::hex << info.loadAddress << " to build the resident guard";
+            throw std::runtime_error(msg.str());
+        }
+
+        std::ostringstream msg;
+        msg << "overlay module " << info.name << ": load 0x" << std::hex << info.loadAddress
+            << std::dec << ", guard " << info.guard.size() << " bytes";
+        m_reporter.info("module", msg.str());
+        return info;
+    }
+
+    // Overlay modules prefix every generated support file with the module name so
+    // several modules can be built into one program.
+    std::string PS2Recompiler::generatedFileName(const std::string &defaultName) const
+    {
+        if (m_config.moduleName.empty())
+        {
+            return defaultName;
+        }
+        const std::string prefix = "ps2_recompiled_";
+        const std::string base = defaultName.rfind(prefix, 0) == 0 ? defaultName.substr(prefix.size()) : defaultName;
+        return m_config.moduleName + "_" + base;
     }
 
     bool PS2Recompiler::generateStubHeader()
@@ -1833,7 +1902,7 @@ namespace ps2recomp
             // ss << "\n} // namespace stubs\n";
             // ss << "} // namespace ps2recomp\n";
 
-            fs::path headerPath = fs::path(m_config.outputPath) / "ps2_recompiled_stubs.h";
+            fs::path headerPath = fs::path(m_config.outputPath) / generatedFileName("ps2_recompiled_stubs.h");
             writeToFile(headerPath.string(), ss.str());
 
             {
@@ -1856,8 +1925,16 @@ namespace ps2recomp
         {
             std::stringstream ss;
 
-            ss << "#ifndef PS2_RECOMPILED_FUNCTIONS_H\n";
-            ss << "#define PS2_RECOMPILED_FUNCTIONS_H\n\n";
+            std::string guardMacro = "PS2_RECOMPILED_FUNCTIONS_H";
+            if (!m_config.moduleName.empty())
+            {
+                guardMacro = m_config.moduleName + "_FUNCTIONS_H";
+                std::transform(guardMacro.begin(), guardMacro.end(), guardMacro.begin(),
+                               [](unsigned char c)
+                               { return static_cast<char>(std::toupper(c)); });
+            }
+            ss << "#ifndef " << guardMacro << "\n";
+            ss << "#define " << guardMacro << "\n\n";
 
             ss << "#include <cstdint>\n\n";
             ss << "struct R5900Context;\n";
@@ -1875,9 +1952,9 @@ namespace ps2recomp
                 ss << "void " << finalName << "(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime);\n";
             }
 
-            ss << "\n#endif // PS2_RECOMPILED_FUNCTIONS_H\n";
+            ss << "\n#endif // " << guardMacro << "\n";
 
-            fs::path headerPath = fs::path(m_config.outputPath) / "ps2_recompiled_functions.h";
+            fs::path headerPath = fs::path(m_config.outputPath) / generatedFileName("ps2_recompiled_functions.h");
             writeToFile(headerPath.string(), ss.str());
 
             {

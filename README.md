@@ -121,6 +121,25 @@ stubs = ["ret0@0x001D9410", "ret1@0x001D5BC8", "reta0@0x0024B7C0"]
 stubs = ["printf", "sceCdRead@0x00123456", "SifLoadModule@0x00127890"] 
 ```
 
+### Overlay modules
+
+Games that load code overlays into fixed RAM slots can recompile each overlay separately and link them all into one program, even when several overlays share a load address.
+
+Wrap the overlay into an ELF at its load address, export its function map from Ghidra as usual, and add to `[general]`:
+
+```toml
+module_name = "mod003"      # C identifier; scopes every generated symbol and file
+module_load = "0x35ec80"    # optional: guard address (default: lowest section address)
+module_guard_size = 64      # optional: bytes compared to identify the resident module
+```
+
+In module mode the recompiler:
+
+* prefixes every generated function with `<module_name>_` and writes `<module_name>_functions.h`, `<module_name>_stubs.h` and `<module_name>_register_functions.cpp`;
+* keeps the module's function table private and registers it with `ps2_overlays::registerModule`, together with the bytes found at `module_load` (the guard).
+
+At run time, an address with no main ELF function is resolved in the overlay module whose guard bytes match guest memory at its load address, so the code that runs always matches the image the game loaded. Game overrides can install a faster resolver with `ps2_overlays::setResidentResolver`, and patch a specific module with `ps2_overlays::replaceModuleFunction` (see `ps2xRuntime/include/ps2_overlay_modules.h`).
+
 ### Runtime
 
 To execute the recompiled code.
