@@ -24,7 +24,10 @@ namespace ps2x::iop
         void reset();
 
         [[nodiscard]] ModuleLoadResult loadModule(std::string_view path, const void *arguments = nullptr, uint32_t argumentSize = 0);
+        // loadModuleBuffer reads the IRX image from EE memory; loadModuleBufferFromIop from IOP RAM,
+        // where sceSifLoadModuleBuffer expects it (allocated with sceSifAllocIopHeap, filled by SIF DMA).
         [[nodiscard]] ModuleLoadResult loadModuleBuffer(uint32_t guestAddress, const void *arguments = nullptr, uint32_t argumentSize = 0);
+        [[nodiscard]] ModuleLoadResult loadModuleBufferFromIop(uint32_t iopAddress, const void *arguments = nullptr, uint32_t argumentSize = 0);
         [[nodiscard]] bool stopModule(int32_t moduleId, int32_t *result = nullptr);
         void runEeCycles(uint64_t eeCycles) noexcept;
 

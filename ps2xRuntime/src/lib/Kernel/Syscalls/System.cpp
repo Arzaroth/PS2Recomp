@@ -311,7 +311,15 @@ namespace ps2_syscalls
             return;
         }
 
-        const auto loaded = runtime->loadIopModuleBuffer(bufferAddr, arguments.empty() ? nullptr : arguments.data(), static_cast<uint32_t>(arguments.size()));
+        // sceSifLoadModuleBuffer takes an IOP address: the game allocates the buffer with
+        // sceSifAllocIopHeap and fills it by SIF DMA. Images left in EE memory still load.
+        const void *argumentData = arguments.empty() ? nullptr : arguments.data();
+        const auto argumentCount = static_cast<uint32_t>(arguments.size());
+        uint8_t magic[4]{};
+        const bool inIop = runtime->readIopMemory(bufferAddr, magic, sizeof(magic)) &&
+                           magic[0] == 0x7Fu && magic[1] == 'E' && magic[2] == 'L' && magic[3] == 'F';
+        const auto loaded = inIop ? runtime->loadIopModuleBufferFromIop(bufferAddr, argumentData, argumentCount)
+                                  : runtime->loadIopModuleBuffer(bufferAddr, argumentData, argumentCount);
         if (!loaded.handled || loaded.moduleId <= 0)
         {
             setReturnS32(ctx, -1);
