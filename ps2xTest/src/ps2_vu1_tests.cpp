@@ -250,6 +250,33 @@ void register_ps2_vu1_tests()
             t.Equals(vu1.state().vf[3][3], -4.0f, "ADD.xz should preserve w");
         });
 
+        tc.Run("FMAC addition drops the small operand bits below the large one", [](TestCase &t)
+        {
+            Vu1Fixture fx;
+            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
+
+            // The PS2 FMAC aligns the smaller operand by truncation, then rounds toward zero:
+            // bits of the small operand below the large one's last mantissa bit are lost. An IEEE
+            // addition, even rounded toward zero, gives a different result for x, y and z.
+            writeVuInstructionPair(fx.code, 0u, 0x8000033cu, makeVuUpper(0x28u, 0xFu, 2u, 1u, 3u)); // ADD vf3, vf1, vf2
+            writeVuInstructionPair(fx.code, 8u, 0x8000033cu, 0x400002ffu);                          // NOP, end
+            writeVuInstructionPair(fx.code, 16u, 0x8000033cu, 0x000002ffu);
+
+            VU1Interpreter vu;
+            const uint32_t large[4] = {0x41cd999au, 0x3f800000u, 0xc0000000u, 0x42c80000u}; // 25.7, 1, -2, 100
+            const uint32_t small[4] = {0xaedbe6ffu, 0x33c00000u, 0x2edbe6ffu, 0x3e800000u}; // -1e-10, 1.5*2^-24, 1e-10, 0.25
+            std::memcpy(vu.state().vf[1], large, sizeof(large));
+            std::memcpy(vu.state().vf[2], small, sizeof(small));
+            vu.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem, 0u, 0u, 0u, 64u);
+
+            uint32_t sum[4]{};
+            std::memcpy(sum, vu.state().vf[3], sizeof(sum));
+            t.Equals(sum[0], 0x41cd999au, "x: a tiny negative addend is dropped, not rounded toward zero");
+            t.Equals(sum[1], 0x3f800000u, "y: an addend over half an ulp is still dropped, not rounded up");
+            t.Equals(sum[2], 0xc0000000u, "z: a tiny positive addend leaves a negative value unchanged");
+            t.Equals(sum[3], 0x42c88000u, "w: an exact sum is unaffected");
+        });
+
         tc.Run("LOI commits the lower immediate after the upper instruction", [](TestCase &t)
         {
             Vu1Fixture fx;
