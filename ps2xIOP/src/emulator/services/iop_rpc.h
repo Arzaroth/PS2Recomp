@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <unordered_map>
 
 namespace ps2x::iop
@@ -55,6 +56,16 @@ namespace ps2x::iop::detail
         [[nodiscard]] bool hasServer(uint32_t sid) const noexcept;
         [[nodiscard]] size_t serverCount() const noexcept { return m_servers.size(); }
 
+        // IOP-side SIF command handler installed by sceSifAddCmdHandler: called as
+        // function(packet, data) when the EE sends that command id.
+        struct CmdHandler
+        {
+            uint32_t function = 0;
+            uint32_t data = 0;
+            uint32_t gp = 0;
+        };
+        [[nodiscard]] std::optional<CmdHandler> cmdHandler(uint32_t cid) const;
+
     private:
         struct RpcServer
         {
@@ -72,6 +83,7 @@ namespace ps2x::iop::detail
         IopMemory &m_memory;
         IopKernel &m_kernel;
         std::unordered_map<uint32_t, RpcServer> m_servers;
+        std::unordered_map<uint32_t, CmdHandler> m_cmdHandlers;
         uint32_t m_nextDmaId = 1u;
         bool m_sifInitialized = false;
     };

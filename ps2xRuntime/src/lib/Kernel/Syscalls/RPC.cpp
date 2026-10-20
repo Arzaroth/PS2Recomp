@@ -2,6 +2,8 @@
 #include "RPC.h"
 #include "../../ps2_iop_transport.h"
 
+#include <array>
+
 namespace ps2_syscalls
 {
     namespace
@@ -970,34 +972,78 @@ namespace ps2_syscalls
 
     void sceSifSendCmd(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        // sceSifSendCmd(cid, packet, packet_size, src_extra, dest_extra, size_extra): the extra
+        // data goes to IOP RAM by SIF DMA, then the packet reaches the IOP handler of cid.
+        constexpr uint32_t kHeaderSize = 16u;
+        constexpr uint32_t kMaxPacketSize = 112u;
+        // EE EABI: the 5th and 6th arguments are in t0 and t1, not on the stack.
         uint32_t cid = getRegU32(ctx, 4);
         uint32_t packetAddr = getRegU32(ctx, 5);
         uint32_t packetSize = getRegU32(ctx, 6);
         uint32_t srcExtra = getRegU32(ctx, 7);
+        uint32_t destExtra = getRegU32(ctx, 8);
+        uint32_t sizeExtra = getRegU32(ctx, 9);
 
-        uint32_t sp = getRegU32(ctx, 29);
-        uint32_t destExtra = 0;
-        uint32_t sizeExtra = 0;
-        readStackU32(rdram, sp, 0x10, destExtra);
-        readStackU32(rdram, sp, 0x14, sizeExtra);
+        if (!runtime || packetSize < kHeaderSize || packetSize > kMaxPacketSize)
+        {
+            setReturnS32(ctx, 0);
+            return;
+        }
+        std::array<uint8_t, kMaxPacketSize> packet{};
+        for (uint32_t i = 0; i < packetSize; ++i)
+        {
+            const uint8_t *src = getConstMemPtr(rdram, packetAddr + i);
+            if (!src)
+            {
+                setReturnS32(ctx, 0);
+                return;
+            }
+            packet[i] = *src;
+        }
 
         if (sizeExtra > 0 && srcExtra && destExtra)
         {
-            rpcCopyToRdram(rdram, destExtra, srcExtra, sizeExtra);
+            std::vector<uint8_t> extra(sizeExtra);
+            for (uint32_t i = 0; i < sizeExtra; ++i)
+            {
+                const uint8_t *src = getConstMemPtr(rdram, srcExtra + i);
+                if (!src)
+                {
+                    setReturnS32(ctx, 0);
+                    return;
+                }
+                extra[i] = *src;
+            }
+            if (!runtime->writeIopMemory(destExtra, extra.data(), extra.size()))
+            {
+                setReturnS32(ctx, 0);
+                return;
+            }
+        }
+        else
+        {
+            sizeExtra = 0;
         }
 
+        // SIF command header: psize:8 | dsize:24, dest, cid, opt (opt is left to the caller).
+        const uint32_t sizeWord = (packetSize & 0xFFu) | (sizeExtra << 8u);
+        std::memcpy(packet.data() + 0u, &sizeWord, sizeof(sizeWord));
+        std::memcpy(packet.data() + 4u, &destExtra, sizeof(destExtra));
+        std::memcpy(packet.data() + 8u, &cid, sizeof(cid));
+
+        const bool delivered = runtime->sendIopSifCommand(cid, packet.data(), packetSize);
         static int logCount = 0;
-        if (logCount < 5)
+        if (!delivered && logCount < 8)
         {
-            RUNTIME_LOG("[sceSifSendCmd] cid=0x" << std::hex << cid
-                                                 << " packet=0x" << packetAddr
-                                                 << " psize=0x" << packetSize
-                                                 << " extra=0x" << destExtra << std::dec << std::endl);
+            std::cerr << "[sceSifSendCmd] no IOP handler for cid=0x" << std::hex << cid << " psize=0x" << packetSize
+                      << " extra=0x" << sizeExtra << std::dec << std::endl;
             ++logCount;
         }
 
-        // Return non-zero on success.
-        setReturnS32(ctx, 1);
+        // Like the hardware, the DMA completes even when nothing handles the command.
+        static uint32_t nextCommandId = 1u;
+        setReturnS32(ctx, static_cast<int32_t>(nextCommandId));
+        nextCommandId = nextCommandId >= 0x7FFFFFFFu ? 1u : nextCommandId + 1u;
     }
 
     void sceRpcGetPacket(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

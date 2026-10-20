@@ -28,6 +28,9 @@ namespace ps2x::iop
         // where sceSifLoadModuleBuffer expects it (allocated with sceSifAllocIopHeap, filled by SIF DMA).
         [[nodiscard]] ModuleLoadResult loadModuleBuffer(uint32_t guestAddress, const void *arguments = nullptr, uint32_t argumentSize = 0);
         [[nodiscard]] ModuleLoadResult loadModuleBufferFromIop(uint32_t iopAddress, const void *arguments = nullptr, uint32_t argumentSize = 0);
+        // EE -> IOP SIF command (EE sceSifSendCmd). The packet header is already filled; extra data
+        // must already be in IOP RAM. Handlers run during the next IOP time slice.
+        [[nodiscard]] bool sendSifCommand(uint32_t cid, const void *packet, uint32_t size);
         [[nodiscard]] bool stopModule(int32_t moduleId, int32_t *result = nullptr);
         void runEeCycles(uint64_t eeCycles) noexcept;
 

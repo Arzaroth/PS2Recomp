@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -55,10 +56,15 @@ namespace ps2x::iop::detail
         [[nodiscard]] bool isHardwareAddress(uint32_t address) const;
         [[nodiscard]] std::string readString(uint32_t address, size_t limit = 1024u) const;
 
+        // sysmem-like pool: first fit from the end of the relocated modules (HeapBase before any is
+        // loaded) up to HeapLimit, reusing freed blocks.
         [[nodiscard]] uint32_t allocate(uint32_t size, uint32_t alignment = 16u, std::optional<uint32_t> fixed = std::nullopt);
         [[nodiscard]] bool freeAllocation(uint32_t address);
         [[nodiscard]] uint32_t maxFreeMemory() const;
         [[nodiscard]] std::optional<Allocation> allocationContaining(uint32_t address) const;
+        [[nodiscard]] bool overlapsAllocation(uint32_t address, uint32_t size) const;
+        // End of the relocated module images: the heap may borrow memory above it.
+        void setModuleWatermark(uint32_t address) noexcept { m_moduleWatermark = std::min(address, HeapBase); }
 
         [[nodiscard]] uint32_t interruptStatus() const noexcept { return m_interruptStatus; }
         [[nodiscard]] uint32_t interruptMask() const noexcept { return m_interruptMask; }
@@ -76,13 +82,15 @@ namespace ps2x::iop::detail
         [[nodiscard]] uint32_t readHardware32(uint32_t address) const;
         void writeHardware32(uint32_t address, uint32_t value);
         void markOwned(uint32_t address, size_t size);
+        [[nodiscard]] uint32_t findFree(uint32_t begin, uint32_t end, uint32_t size, uint32_t alignment) const;
+        [[nodiscard]] uint32_t largestGap(uint32_t begin, uint32_t end) const;
 
         std::vector<uint8_t> m_ram;
         std::vector<uint8_t> m_owned;
         std::vector<uint8_t> m_scratch;
         std::unordered_map<uint32_t, uint32_t> m_hardware;
         std::vector<Allocation> m_allocations;
-        uint32_t m_heapCursor = HeapBase;
+        uint32_t m_moduleWatermark = HeapBase;
         uint32_t m_interruptStatus = 0;
         uint32_t m_interruptMask = 0;
         uint32_t m_interruptControl = 1;

@@ -260,6 +260,88 @@ namespace
                     importTable, sizeof(importTable));
     }
 
+    // IRX whose entry installs a SIF command handler: sceSifAddCmdHandler(cid, 0x10300, 0x10400).
+    // The handler copies the packet word at offset 16 to its data pointer.
+    void writeSifCmdHandlerIrx(TestHost &host, uint32_t address, uint32_t cid)
+    {
+        constexpr uint32_t codeOffset = 0x100u;
+        constexpr uint32_t loadAddress = 0x00010000u;
+        constexpr uint32_t importTableOffset = 0x60u;
+        constexpr uint32_t importStubAddress = loadAddress + importTableOffset + 20u;
+        constexpr uint32_t handlerOffset = 0x300u;
+
+        ElfHeader header{};
+        header.ident[0] = 0x7Fu;
+        header.ident[1] = 'E';
+        header.ident[2] = 'L';
+        header.ident[3] = 'F';
+        header.ident[4] = 1u;
+        header.ident[5] = 1u;
+        header.ident[6] = 1u;
+        header.type = 2u;
+        header.machine = 8u;
+        header.version = 1u;
+        header.entry = loadAddress;
+        header.phoff = sizeof(ElfHeader);
+        header.ehsize = sizeof(ElfHeader);
+        header.phentsize = sizeof(ProgramHeader);
+        header.phnum = 1u;
+
+        const uint32_t code[] = {
+            0x27BDFFE0u, // addiu sp, sp, -0x20
+            0xAFBF001Cu, // sw    ra, 0x1c(sp)
+            0x3C040000u | ((cid >> 16u) & 0xFFFFu), // lui a0, cid upper
+            0x34840000u | (cid & 0xFFFFu),          // ori a0, a0, cid lower
+            0x3C050001u, // lui   a1, 1
+            0x34A50300u, // ori   a1, a1, 0x300 (handler)
+            0x3C060001u, // lui   a2, 1
+            0x34C60400u, // ori   a2, a2, 0x400 (handler data)
+            0x0C000000u | ((importStubAddress >> 2u) & 0x03FFFFFFu), // jal sceSifAddCmdHandler
+            0x00000000u, // nop
+            0x8FBF001Cu, // lw    ra, 0x1c(sp)
+            0x00001021u, // addu  v0, zero, zero
+            0x27BD0020u, // addiu sp, sp, 0x20
+            0x03E00008u, // jr    ra
+            0x00000000u, // nop
+        };
+        const uint32_t importTable[] = {
+            0x41E00000u, // IRX import magic
+            0x00000000u,
+            0x00000101u,
+            0x63666973u, // "sifc"
+            0x0000646Du, // "md"
+            0x03E00008u, // jr ra
+            0x2400000Au, // addiu zero, zero, 10 (sceSifAddCmdHandler)
+            0x00000000u,
+            0x00000000u,
+        };
+        const uint32_t handler[] = {
+            0x8C880010u, // lw    t0, 0x10(a0)
+            0x00000000u, // nop   (R3000A load delay slot)
+            0xACA80000u, // sw    t0, 0(a1)
+            0x03E00008u, // jr    ra
+            0x00000000u, // nop
+        };
+
+        ProgramHeader program{};
+        program.type = 1u;
+        program.offset = codeOffset;
+        program.vaddr = loadAddress;
+        program.paddr = loadAddress;
+        program.filesz = handlerOffset + sizeof(handler);
+        program.memsz = 0x500u;
+        program.flags = 7u;
+        program.align = 4u;
+
+        std::fill(host.guest.begin() + address, host.guest.end(), 0u);
+        std::memcpy(host.guest.data() + address, &header, sizeof(header));
+        std::memcpy(host.guest.data() + address + sizeof(header), &program, sizeof(program));
+        std::memcpy(host.guest.data() + address + codeOffset, code, sizeof(code));
+        std::memcpy(host.guest.data() + address + codeOffset + importTableOffset,
+                    importTable, sizeof(importTable));
+        std::memcpy(host.guest.data() + address + codeOffset + handlerOffset, handler, sizeof(handler));
+    }
+
     void writeRelocatableRpcServerIrx(TestHost &host, uint32_t address)
     {
         constexpr uint32_t codeOffset = 0x100u;
@@ -911,6 +993,15 @@ int main()
     if (!expect(stopResult == 0, "Emulated module stop result mismatch")) return 1;
     if (!expect(iop.debugSnapshot().emulatorLoadedModules == 0u, "Module was not released")) return 1;
 
+    // Freed IOP heap blocks are reused (sysmem first fit), so allocate/free cycles do not leak.
+    {
+        const uint32_t first = iop.allocateMemory(0x1000u, 64u);
+        if (!expect(first != 0u && iop.freeMemory(first), "IOP heap allocate/free failed")) return 1;
+        const uint32_t again = iop.allocateMemory(0x1000u, 64u);
+        if (!expect(again == first, "A freed IOP heap block must be reused")) return 1;
+        if (!expect(iop.freeMemory(again), "IOP heap free failed")) return 1;
+    }
+
     // sceSifLoadModuleBuffer path: the image sits in IOP RAM (SIF DMA target), not in EE memory.
     {
         constexpr uint32_t imageSize = 0x200u;
@@ -923,6 +1014,24 @@ int main()
         if (!expect(fromIop.startResult == 7, "IRX loaded from IOP RAM must run its entry")) return 1;
         if (!expect(iop.stopModule(fromIop.moduleId, &stopResult), "IOP RAM module stop failed")) return 1;
         if (!expect(iop.loadModuleBufferFromIop(iopBuffer + 0x40u).moduleId <= 0, "Non-ELF IOP RAM must not load")) return 1;
+    }
+
+    // EE -> IOP SIF command: delivered to the handler installed by sceSifAddCmdHandler.
+    {
+        constexpr uint32_t cmdId = 0x12u;
+        writeSifCmdHandlerIrx(host, 0x100u, cmdId);
+        const ModuleLoadResult cmdModule = iop.loadModuleBuffer(0x100u);
+        if (!expect(cmdModule.handled && cmdModule.moduleId > 0, "SIF command IRX must load")) return 1;
+        uint32_t packet[8]{};
+        packet[4] = 0xCAFEBABEu;
+        if (!expect(!iop.sendSifCommand(cmdId + 1u, packet, sizeof(packet)), "A command without handler must be refused")) return 1;
+        if (!expect(iop.sendSifCommand(cmdId, packet, sizeof(packet)), "A command with a handler must be queued")) return 1;
+        iop.runEeCycles(10000u);
+        uint32_t received = 0u;
+        if (!expect(iop.readMemory(0x00010400u, &received, sizeof(received)) && received == 0xCAFEBABEu,
+                    "The IOP handler must receive the packet")) return 1;
+        if (!expect(iop.stopModule(cmdModule.moduleId, &stopResult), "SIF command IRX stop failed")) return 1;
+        if (!expect(!iop.sendSifCommand(cmdId, packet, sizeof(packet)), "Unloading the IRX must drop its handler")) return 1;
     }
 
     constexpr uint32_t rpcSid = 0xF00DCAFEu;
