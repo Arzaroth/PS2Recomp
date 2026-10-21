@@ -802,6 +802,13 @@ namespace ps2_stubs
             g_gparam.omode = static_cast<uint8_t>(omode & 0xFF);
             g_gparam.ffmode = static_cast<uint8_t>(ffmode & 0x1);
             writeGsGParamToScratch(runtime);
+            if (runtime)
+            {
+                // Video mode 3 is PAL: 50 vblanks per second instead of NTSC's 59.94.
+                constexpr uint32_t kGsModePal = 3u;
+                runtime->eeScheduler().setFieldRate(g_gparam.omode == kGsModePal ? EeScheduler::kPalFieldRate
+                                                                                   : EeScheduler::kNtscFieldRate);
+            }
             uint64_t pmode = makePmode(1, 0, 0, 0, 0, 0x80);
             uint64_t smode2 = (interlace & 0x1) | ((ffmode & 0x1) << 1);
             uint64_t dispfb = makeDispFb(0, 10, 0, 0, 0);

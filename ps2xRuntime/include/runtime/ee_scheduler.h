@@ -335,6 +335,17 @@ public:
     void dispatchIrq(bool dmac, uint32_t cause);
     void setVSyncFlag(uint32_t flagAddress, uint32_t tickAddress);
     [[nodiscard]] uint64_t currentVSyncTick() const noexcept;
+    // Vblanks per second (numerator / denominator): NTSC fields until the game resets the GS
+    // in PAL mode (sceGsResetGraph), which switches to 50 Hz.
+    struct FieldRate
+    {
+        uint64_t numerator;
+        uint64_t denominator;
+    };
+    static constexpr FieldRate kNtscFieldRate{60000u, 1001u};
+    static constexpr FieldRate kPalFieldRate{50u, 1u};
+    void setFieldRate(FieldRate rate) noexcept;
+    [[nodiscard]] FieldRate fieldRate() const noexcept;
     uint32_t setGsVSyncCallback(uint32_t callback, uint32_t gp, uint32_t sp);
 
     [[noreturn]] void waitVSync(uint64_t afterTick, int fixedResult = -1, std::function<void(R5900Context &)> completion = {});
@@ -428,6 +439,10 @@ private:
     uint32_t m_pendingEeTimerInterrupts = 0;
     uint64_t m_eeCycle = 0;
     uint64_t m_iopEeCycles = 0; // EE cycles handed to the IOP (accounted ones plus vblank catch-up)
+    uint64_t m_iopVblankEnd = 0; // IOP cycle at which the current vblank's frame ends
+    FieldRate m_fieldRate = kNtscFieldRate;
+    uint64_t m_vblankPeriodCycles = 0;
+    std::chrono::nanoseconds m_vblankPeriod{0};
     uint64_t m_sliceEndCycle = kDefaultTimeSliceCycles;
     std::thread::id m_executorThread{};
     std::atomic<bool> m_running{false};
