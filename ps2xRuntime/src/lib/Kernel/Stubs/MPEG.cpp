@@ -17,6 +17,7 @@ extern "C"
 #endif
 
 #include <deque>
+#include <sstream>
 #include <memory>
 
 #include "Syscalls/Helpers/State.h"
@@ -2569,5 +2570,28 @@ namespace ps2_stubs
         std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
         getPlaybackState(mpegAddr).imageBufferAddr = imageBufferAddr;
         setReturnS32(ctx, 0);
+    }
+}
+
+namespace ps2_stubs
+{
+    // One-line summary of the MPEG HLE state for host diagnostics (declared by the caller).
+    std::string mpegDebugSummary()
+    {
+        std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+        std::ostringstream out;
+        out << "init=" << g_mpeg_stub_state.initialized << " cdGen=" << g_mpeg_stub_state.cdStreamGeneration
+            << " produced=" << g_mpeg_stub_state.cdStreamBytesProduced
+            << " demuxed=" << g_mpeg_stub_state.cdStreamBytesDemuxed
+            << " eof=" << g_mpeg_stub_state.currentCdStreamEofSeen << " streams=" << g_mpeg_stub_state.playbackByMpeg.size();
+        for (const auto &[mpeg, playback] : g_mpeg_stub_state.playbackByMpeg)
+        {
+            out << " [0x" << std::hex << mpeg << std::dec << " input=" << playback.sawInput
+                << " served=" << playback.picturesServed << " queued=" << playback.decodedFrames.size()
+                << " " << playback.width << "x" << playback.height << " ended=" << playback.streamEnded
+                << " failed=" << playback.decoderFailed << " seqWait=" << playback.waitingForVideoSequenceHeader
+                << " pss=" << playback.pssBuffer.size() << "]";
+        }
+        return out.str();
     }
 }
