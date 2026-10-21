@@ -248,6 +248,30 @@ void GS::compareShadowVram()
         std::fprintf(stderr, "[gs-shadow-check] %u comparisons, %u mismatched\n", comparisons, mismatches);
 }
 
+void GS::enableAsync()
+{
+    // Called by the runtime after init(). Library users (tests, tools) keep the synchronous GS, whose
+    // VRAM is current as soon as a packet call returns.
+    const char *sync = std::getenv("PS2X_GS_SYNC");
+    if (m_isShadow || (sync && *sync == '1'))
+        return;
+    m_asyncEnabled = true;
+    // PS2X_GS_ASYNC_RASTER=1 also rasterizes on the backend's workers (GSCpuBackend::SetAsyncRasterization;
+    // games may enable it themselves). Off by default: on Drakengard it differs from immediate drawing
+    // (PS2X_GS_SHADOW_CHECK) during the boot frame copies.
+    if (std::getenv("PS2X_GS_ASYNC_RASTER"))
+        GSCpuBackend::SetAsyncRasterization(true);
+    if (std::getenv("PS2X_GS_SHADOW_CHECK") && !m_shadow && m_localMemoryStorage)
+    {
+        m_shadowVram.assign(m_localMemoryStorage, m_localMemoryStorage + m_localMemorySize);
+        m_shadow = std::make_unique<GS>();
+        m_shadow->m_isShadow = true;
+        m_shadow->init(m_shadowVram.data(), m_localMemorySize, nullptr);
+        if (auto *cpu = dynamic_cast<GSCpuBackend *>(m_shadow->m_backend.get()))
+            cpu->DisallowAsyncRasterization();
+    }
+}
+
 void GS::waitForIdle()
 {
     if (!m_asyncEnabled || t_onGsWorker)
@@ -259,25 +283,6 @@ void GS::waitForIdle()
 void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
 {
     waitForIdle();
-    {
-        const char *sync = std::getenv("PS2X_GS_SYNC");
-        m_asyncEnabled = !m_isShadow && !(sync && *sync == '1');
-    }
-    // Rasterization runs on the backend's workers unless the GS runs synchronously (PS2X_GS_SYNC=1).
-    // PS2X_GS_ASYNC_RASTER=1 also rasterizes on the backend's workers (GSCpuBackend::SetAsyncRasterization;
-    // games may enable it themselves). Off by default: on Drakengard it differs from immediate drawing
-    // (PS2X_GS_SHADOW_CHECK) during the boot frame copies.
-    if (!m_isShadow && m_asyncEnabled && std::getenv("PS2X_GS_ASYNC_RASTER"))
-        GSCpuBackend::SetAsyncRasterization(true);
-    if (!m_isShadow && m_asyncEnabled && std::getenv("PS2X_GS_SHADOW_CHECK") && !m_shadow)
-    {
-        m_shadowVram.assign(vram, vram + vramSize);
-        m_shadow = std::make_unique<GS>();
-        m_shadow->m_isShadow = true;
-        m_shadow->init(m_shadowVram.data(), vramSize, nullptr);
-        if (auto *cpu = dynamic_cast<GSCpuBackend *>(m_shadow->m_backend.get()))
-            cpu->DisallowAsyncRasterization();
-    }
     m_localMemoryStorage = vram;
     m_localMemorySize = vramSize;
     m_privRegs = privRegs;

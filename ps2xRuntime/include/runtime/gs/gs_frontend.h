@@ -110,8 +110,11 @@ public:
     void setRasterBackend(std::unique_ptr<GSRasterBackend> backend);
 
     void processGIFPacket(const uint8_t *data, uint32_t sizeBytes);
+    // Moves packet processing to a GS thread (unless PS2X_GS_SYNC=1). The runtime calls it after init();
+    // without it the GS is synchronous.
+    void enableAsync();
     // Queues a GIF packet for the GS thread (processed in submission order), or processes it now when the
-    // GS runs synchronously (PS2X_GS_SYNC=1, or before init()).
+    // GS runs synchronously.
     void submitGIFPacket(const uint8_t *data, uint32_t sizeBytes);
     // Blocks until every queued packet has been processed (no-op on the GS thread itself).
     void waitForIdle();
