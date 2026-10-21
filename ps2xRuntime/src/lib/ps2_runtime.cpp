@@ -6,6 +6,8 @@
 #include "ps2_overlay_modules.h"
 #include "ps2_runtime_macros.h"
 #include "runtime/gs/gs_frontend.h"
+#include "runtime/gs/gif_path_stats.h"
+#include "runtime/vif1_command_stats.h"
 #include "runtime/ee_scheduler.h"
 #include "ThreadNaming.h"
 #include "Kernel/Stubs/Audio.h"
@@ -764,6 +766,8 @@ ps2x::iop::DebugSnapshot PS2Runtime::iopDebugSnapshot() const
 
 namespace
 {
+    std::atomic<uint64_t> g_vu1MscalCount{0};
+
     constexpr size_t kCallTraceSlots = PS2_RAM_SIZE / 4u;
 
     std::atomic<uint32_t> *callTraceCounters()
@@ -778,15 +782,27 @@ namespace
         return counters.get();
     }
 
-    void countGuestCall(uint32_t targetPc)
+    std::atomic<uint32_t> *indirectCallTraceCounters()
     {
-        if (std::atomic<uint32_t> *counters = callTraceCounters())
-            counters[(targetPc & PS2_RAM_MASK) >> 2u].fetch_add(1u, std::memory_order_relaxed);
+        static std::unique_ptr<std::atomic<uint32_t>[]> counters =
+            callTraceCounters() ? std::make_unique<std::atomic<uint32_t>[]>(kCallTraceSlots) : nullptr;
+        return counters.get();
     }
 
-    void dumpHottestCalls(std::ostringstream &text)
+    void countGuestCall(uint32_t targetPc, bool indirect)
     {
-        std::atomic<uint32_t> *counters = callTraceCounters();
+        const size_t slot = (targetPc & PS2_RAM_MASK) >> 2u;
+        if (std::atomic<uint32_t> *counters = callTraceCounters())
+            counters[slot].fetch_add(1u, std::memory_order_relaxed);
+        if (indirect)
+        {
+            if (std::atomic<uint32_t> *counters = indirectCallTraceCounters())
+                counters[slot].fetch_add(1u, std::memory_order_relaxed);
+        }
+    }
+
+    void dumpCallCounters(std::ostringstream &text, std::atomic<uint32_t> *counters, const char *label)
+    {
         if (!counters)
             return;
         std::vector<std::pair<uint32_t, uint32_t>> hot;
@@ -798,9 +814,15 @@ namespace
         const size_t shown = std::min<size_t>(hot.size(), 512u);
         std::partial_sort(hot.begin(), hot.begin() + static_cast<std::ptrdiff_t>(shown), hot.end(),
                           [](const auto &lhs, const auto &rhs) { return lhs.first > rhs.first; });
-        text << "[state] calls: " << hot.size() << " distinct targets since last dump\n";
+        text << "[state] " << label << ": " << hot.size() << " distinct targets since last dump\n";
         for (size_t index = 0; index < shown; ++index)
             text << "[state]   0x" << std::hex << hot[index].second << std::dec << " x" << hot[index].first << '\n';
+    }
+
+    void dumpHottestCalls(std::ostringstream &text)
+    {
+        dumpCallCounters(text, callTraceCounters(), "calls");
+        dumpCallCounters(text, indirectCallTraceCounters(), "indirect calls");
     }
 }
 
@@ -835,6 +857,18 @@ static void dumpRuntimeState(std::ostream &out, PS2Memory &memory, const EeKerne
             text << "[state]   evflag " << flag.id << std::hex << " bits=0x" << flag.bits << std::dec
                  << " waiters=" << flag.waiters << '\n';
     }
+    text << "[state] vu1 mscal=" << g_vu1MscalCount.load(std::memory_order_relaxed)
+         << " gif p1=" << ps2_gif_path_stats::packets(GifPathId::Path1) << '/' << ps2_gif_path_stats::bytes(GifPathId::Path1)
+         << "B p2=" << ps2_gif_path_stats::packets(GifPathId::Path2) << '/' << ps2_gif_path_stats::bytes(GifPathId::Path2)
+         << "B p3=" << ps2_gif_path_stats::packets(GifPathId::Path3) << '/' << ps2_gif_path_stats::bytes(GifPathId::Path3)
+         << "B\n";
+    text << "[state] vif1 cmds:" << std::hex;
+    for (uint32_t opcode = 0; opcode < 0x80u; ++opcode)
+    {
+        if (const uint64_t count = ps2_vif1_command_stats::commands(static_cast<uint8_t>(opcode)))
+            text << " 0x" << opcode << '=' << std::dec << count << std::hex;
+    }
+    text << std::dec << '\n';
     text << "[state] iop cycles=" << iop.emulatorCycles << " insns=" << iop.emulatorInstructions
          << " threads=" << iop.emulatorThreads << " rpc=" << iop.emulatorRpcServers << '\n';
     for (const std::string &line : iop.diagnostics)
@@ -908,6 +942,7 @@ bool PS2Runtime::syncCoreSubsystems()
                                          (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
                                      m_vu1.state().tBitEnabled =
                                          (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
+                                     g_vu1MscalCount.fetch_add(1u, std::memory_order_relaxed);
                                      g_gsDumpVu1ProgramPc.store(startPC, std::memory_order_relaxed);
                                      Vu1Recorder::instance().run(m_vu1, m_memory, false, startPC, top, itop, kVu1ProgramCycleLimit, [&]
                                                                  { m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
@@ -1620,7 +1655,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     ctx->pc = targetPc;
     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
     if (isCall)
-        countGuestCall(targetPc);
+        countGuestCall(targetPc, kind == GuestBranchKind::IndirectCall);
 
     // Every inter-function transfer is also a deterministic EE safe point.
     // Backward edges inside generated functions use eeCheckpointDue(), while

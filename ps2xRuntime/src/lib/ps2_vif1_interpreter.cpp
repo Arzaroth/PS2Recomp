@@ -1,6 +1,26 @@
 // Based on Blackline Interactive implementation
 #include "runtime/ps2_memory.h"
+#include "runtime/vif1_command_stats.h"
+#include <atomic>
 #include <cstring>
+
+namespace ps2_vif1_command_stats
+{
+    namespace
+    {
+        std::atomic<uint64_t> g_commands[0x80]{};
+    }
+
+    void noteCommand(uint8_t opcode)
+    {
+        g_commands[opcode & 0x7Fu].fetch_add(1u, std::memory_order_relaxed);
+    }
+
+    uint64_t commands(uint8_t opcode)
+    {
+        return g_commands[opcode & 0x7Fu].load(std::memory_order_relaxed);
+    }
+}
 
 enum VIFCmd : uint8_t
 {
@@ -522,6 +542,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         pos += 4;
 
         uint8_t opcode = (cmd >> 24) & 0x7F;
+        ps2_vif1_command_stats::noteCommand(opcode);
         uint16_t imm = cmd & 0xFFFF;
         uint8_t num = (cmd >> 16) & 0xFF;
         const bool irq = (cmd & 0x80000000u) != 0u;

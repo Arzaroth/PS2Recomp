@@ -1,4 +1,5 @@
 #include "runtime/gs/ps2_gif_arbiter.h"
+#include "runtime/gs/gif_path_stats.h"
 #include <algorithm>
 #include <atomic>
 #include <cstring>
@@ -21,11 +22,38 @@ bool GifArbiter::isImagePacket(const uint8_t *data, uint32_t sizeBytes)
 
 extern std::atomic<uint32_t> g_gsDumpGifPath;
 
+namespace ps2_gif_path_stats
+{
+    namespace
+    {
+        std::atomic<uint64_t> g_packets[4]{};
+        std::atomic<uint64_t> g_bytes[4]{};
+    }
+
+    void notePacket(GifPathId pathId, uint32_t sizeBytes)
+    {
+        const size_t index = static_cast<size_t>(pathId) & 3u;
+        g_packets[index].fetch_add(1u, std::memory_order_relaxed);
+        g_bytes[index].fetch_add(sizeBytes, std::memory_order_relaxed);
+    }
+
+    uint64_t packets(GifPathId pathId)
+    {
+        return g_packets[static_cast<size_t>(pathId) & 3u].load(std::memory_order_relaxed);
+    }
+
+    uint64_t bytes(GifPathId pathId)
+    {
+        return g_bytes[static_cast<size_t>(pathId) & 3u].load(std::memory_order_relaxed);
+    }
+}
+
 void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool path2DirectHl)
 {
     if (!data || sizeBytes < 16 || !m_processFn)
         return;
 
+    ps2_gif_path_stats::notePacket(pathId, sizeBytes);
     GifArbiterPacket pkt;
     pkt.pathId = pathId;
     pkt.path2DirectHl = (pathId == GifPathId::Path2) && path2DirectHl;
