@@ -402,6 +402,8 @@ bool PS2Memory::initialize(size_t ramSize)
 void PS2Memory::resetEeTimers() noexcept
 {
     m_eeTimers = {};
+    // The EE kernel keeps Timer 3 counting H-BLANKs for its alarms; games poll it unconfigured.
+    m_eeTimers[3].mode = kEeTimerModeCue | 0x3u;
     m_timerSpinCycles.store(0u, std::memory_order_release);
 }
 
