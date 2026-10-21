@@ -203,12 +203,24 @@ private:
     Unit m_unit;
     VU1State m_state;
     std::array<DecodedInstructionPair, kMaxDecodedPairs> m_decodedCodeCache{};
+    std::array<uint64_t, kMaxDecodedPairs> m_decodedPairStamp{};
+    DecodedInstructionPair m_uncachedDecodedPair{};
     const uint8_t *m_cachedVuCode = nullptr;
     const PS2Memory *m_cachedMemory = nullptr;
     uint32_t m_cachedCodeSize = 0;
-    uint64_t m_cachedCodeGeneration = 0;
-    bool m_decodedCodeCacheValid = false;
 
+    // Earliest readyCycle pending in each queue; commitReadyPipelines() skips queues with nothing due.
+    uint64_t m_nextFlagCommit = 0;
+    uint64_t m_nextScalarCommit = 0;
+    uint64_t m_nextStoreCommit = 0;
+    uint64_t m_nextVfCommit = 0;
+    uint64_t m_nextViCommit = 0;
+    uint64_t m_nextAccCommit = 0;
+    static void noteCommitCycle(uint64_t &next, uint64_t readyCycle)
+    {
+        if (readyCycle < next)
+            next = readyCycle;
+    }
     std::array<FlagPipelineEntry, kMaxFlagEntries> m_flagPipeline{};
     ScalarPipelineEntry m_fdiv{};
     std::array<ScalarPipelineEntry, 2> m_efu{};
@@ -250,8 +262,8 @@ private:
     static void addVfWrite(InstructionUsage &usage, uint8_t reg, uint8_t lanes);
     static uint8_t vfReadLanes(const InstructionUsage &usage, uint8_t reg);
     DecodedInstructionPair decodeInstructionPair(const uint8_t *vuCode, uint32_t pc) const;
-    DecodedInstructionPair getDecodedInstructionPairForPc(const uint8_t *vuCode, uint32_t codeSize, PS2Memory *memory, uint32_t pc);
-    void rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t codeSize, const PS2Memory *memory, uint64_t generation);
+    const DecodedInstructionPair &getDecodedInstructionPairForPc(const uint8_t *vuCode, uint32_t codeSize, PS2Memory *memory,
+                                                                 uint32_t pc);
 
     void execUpper(uint32_t instr);
     void execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSize, GS &gs, PS2Memory *memory, uint32_t upperInstr);

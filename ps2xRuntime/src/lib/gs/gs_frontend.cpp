@@ -639,6 +639,10 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
     return true;
 }
 
+FILE *gsDumpStream();
+extern std::atomic<uint32_t> g_gsDumpVu1ProgramPc;
+extern std::atomic<uint32_t> g_gsDumpGifPath;
+
 void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
@@ -685,6 +689,19 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
             nreg = 16;
 
         recordGifTagDebugEventUnlocked(sizeBytes, nloop, flg, nreg);
+        if (FILE *dump = gsDumpStream())
+        {
+            std::fprintf(dump, "gif path=%u vu1pc=%x size=%u at=%u tag=%016llx:%016llx nloop=%u eop=%u flg=%u nreg=%u data:",
+                         g_gsDumpGifPath.load(std::memory_order_relaxed),
+                         g_gsDumpVu1ProgramPc.load(std::memory_order_relaxed), sizeBytes, offset - 16u,
+                         static_cast<unsigned long long>(tagHi), static_cast<unsigned long long>(tagLo), nloop,
+                         static_cast<uint32_t>((tagLo >> 15) & 1u), flg, nreg);
+            for (uint32_t q = 0; q < 4u && offset + q * 16u + 16u <= sizeBytes; ++q)
+                std::fprintf(dump, " %016llx:%016llx",
+                             static_cast<unsigned long long>(loadLE64(data + offset + q * 16u + 8u)),
+                             static_cast<unsigned long long>(loadLE64(data + offset + q * 16u)));
+            std::fputc('\n', dump);
+        }
 
         bool pre = ((tagLo >> 46) & 1) != 0;
         if (pre)

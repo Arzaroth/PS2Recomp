@@ -853,7 +853,17 @@ inline __m128i ps2_u64_to_epi64_pair(uint64_t value)
 #define FPU_FLOOR_W_S(a) ((int32_t)floorf((float)(a)))
 #define FPU_CVT_S_W(a) ((float)(int32_t)(a))
 #define FPU_CVT_S_L(a) ((float)(int64_t)(a))
-#define FPU_CVT_W_S(a) ((int32_t)nearbyintf((float)(a)))
+// EE CVT.W.S always rounds toward zero (the FPU has no other rounding mode) and saturates values whose
+// magnitude is 2^31 or more, including exponent-255 patterns (no NaN/Inf on the EE).
+inline int32_t ps2FpuCvtWS(float value)
+{
+    uint32_t bits;
+    std::memcpy(&bits, &value, sizeof(bits));
+    if (((bits >> 23) & 0xFFu) >= 158u)
+        return (bits & 0x80000000u) != 0u ? INT32_MIN : INT32_MAX;
+    return static_cast<int32_t>(value);
+}
+#define FPU_CVT_W_S(a) ps2FpuCvtWS((float)(a))
 #define FPU_CVT_L_S(a) ((int64_t)(float)(a))
 // The EE FPU has no NaN/Inf: exponent 255 is an ordinary (huge) value and denormals read as zero,
 // so compares order every bit pattern. Games rely on this, e.g. 0x7FFFFFFF as "max float" in

@@ -7,6 +7,7 @@
 #include "runtime/gs/ps2_gs_memory.h"
 #include "ps2_log.h"
 #include <atomic>
+#include <chrono>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -1078,10 +1079,79 @@ GSTransferSnapshot GSCpuBackend::GetTransferSnapshot() const
     return result;
 }
 
+// VU1 microprogram (MSCAL start pc) whose XGKICK is being drawn, for PS2X_GS_DUMP_AT; ~0u outside VU1.
+std::atomic<uint32_t> g_gsDumpVu1ProgramPc{~0u};
+// GIF path (1-3) of the packet being processed, for PS2X_GS_DUMP_AT; 0 when unknown.
+std::atomic<uint32_t> g_gsDumpGifPath{0u};
+
+// PS2X_GS_DUMP_AT=<sec>: once `sec` seconds have passed, the GS writes its next PS2X_GS_DUMP_COUNT (default 20000)
+// primitives and the GIF tags that produced them to PS2X_GS_DUMP_OUT (default gs_prims.txt). Returns the open
+// stream while the dump is in progress, else nullptr.
+FILE *gsDumpStream()
+{
+    static const double dumpAt = []
+    {
+        const char *value = std::getenv("PS2X_GS_DUMP_AT");
+        return value ? std::atof(value) : -1.0;
+    }();
+    if (dumpAt < 0.0)
+        return nullptr;
+    static const auto start = std::chrono::steady_clock::now();
+    static FILE *out = nullptr;
+    static bool finished = false;
+    if (finished || std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() < dumpAt)
+        return nullptr;
+    if (!out)
+    {
+        const char *path = std::getenv("PS2X_GS_DUMP_OUT");
+        out = std::fopen(path ? path : "gs_prims.txt", "w");
+        finished = out == nullptr;
+    }
+    return out;
+}
+
+namespace
+{
+    void dumpPrimitiveIfRequested(const GSPrimitiveBatch &batch)
+    {
+        FILE *out = gsDumpStream();
+        if (!out)
+            return;
+        static uint32_t remaining = []
+        {
+            const char *value = std::getenv("PS2X_GS_DUMP_COUNT");
+            return value ? static_cast<uint32_t>(std::atoi(value)) : 20000u;
+        }();
+        if (remaining == 0u)
+            return;
+        const GSDrawState &state = batch.state;
+        const GSContext &ctx = state.context;
+        std::fprintf(out, "vu1pc=%x type=%u tme=%u fst=%u abe=%u fge=%u ctxt=%u fbp=%u psm=%x zbp=%u test=%llx alpha=%llx "
+                          "ofs=(%u,%u) sc=(%u,%u)-(%u,%u) tbp=%u tpsm=%x |",
+                     g_gsDumpVu1ProgramPc.load(std::memory_order_relaxed), static_cast<uint32_t>(state.prim.type),
+                     state.prim.tme, state.prim.fst, state.prim.abe,
+                     state.prim.fge, state.prim.ctxt, ctx.frame.fbp, static_cast<uint32_t>(ctx.frame.psm),
+                     ctx.zbuf.zbp, static_cast<unsigned long long>(ctx.test),
+                     static_cast<unsigned long long>(ctx.alpha), ctx.xyoffset.ofx >> 4, ctx.xyoffset.ofy >> 4,
+                     ctx.scissor.x0, ctx.scissor.y0, ctx.scissor.x1, ctx.scissor.y1, ctx.tex0.tbp0,
+                     static_cast<uint32_t>(ctx.tex0.psm));
+        for (uint32_t i = 0; i < batch.vertexCount && i < 3u; ++i)
+        {
+            const GSVertex &v = batch.vertices[i];
+            std::fprintf(out, " (%.1f,%.1f,%.0f c=%02x%02x%02x%02x f=%u stq=%g,%g,%g uv=%u,%u)", v.x, v.y, v.z, v.r,
+                         v.g, v.b, v.a, v.fog, v.s, v.t, v.q, v.u, v.v);
+        }
+        std::fputc('\n', out);
+        if (--remaining == 0u)
+            std::fflush(out);
+    }
+}
+
 void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
 {
     const GSDrawState &state = batch.state;
     const auto &ctx = state.context;
+    dumpPrimitiveIfRequested(batch);
     PS2_IF_AGRESSIVE_LOGS({
         const uint32_t primitiveIndex = s_debugPrimitiveCount.fetch_add(1u, std::memory_order_relaxed);
         if (primitiveIndex < 64u)
