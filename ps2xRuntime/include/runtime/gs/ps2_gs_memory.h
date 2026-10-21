@@ -14,6 +14,21 @@ namespace GSMem
 	constexpr usz MEMORY_SIZE = 4_mb;
 	constexpr usz GS_PAGE_SIZE = TexturePageCache::kPageSize;
 
+	// Write generation per 8 KiB VRAM page, bumped by every pixel write so decoded-texture caches can
+	// tell when the pages behind a texture changed.
+	constexpr usz WRITE_TRACK_PAGE_SHIFT = 13;
+	constexpr usz WRITE_TRACK_PAGE_COUNT = MEMORY_SIZE >> WRITE_TRACK_PAGE_SHIFT;
+	inline std::array<u32, WRITE_TRACK_PAGE_COUNT> g_pageWriteGeneration{};
+	// Rasterizer threads skip per-pixel tracking (shared counters thrash between cores); each primitive
+	// marks the render-target pages it may have touched once when it finishes.
+	inline thread_local bool t_deferPageWriteTracking = false;
+
+	inline void MarkAllPagesWritten()
+	{
+		for (u32 &generation : g_pageWriteGeneration)
+			++generation;
+	}
+
 	// these are all the same regardless of storage mode
 	constexpr usz BLOCKS_PER_PAGE = 32;
 	constexpr usz COLUMNS_PER_BLOCK = 4;
@@ -465,6 +480,8 @@ namespace GSMem
 		const u32 bits = pixel_addr * UnpackedBitWidth(psm) + BitOffset();
 		const u32 byte_addr = (bits / 8) & (MEMORY_SIZE - sizeof(PackedT));
 		const u32 shift = bits % 8;
+		if (!std::is_constant_evaluated() && !t_deferPageWriteTracking)
+			++g_pageWriteGeneration[byte_addr >> WRITE_TRACK_PAGE_SHIFT];
 
 		u8* ptr = &data[byte_addr];
 

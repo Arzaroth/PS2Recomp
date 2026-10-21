@@ -80,6 +80,7 @@ namespace ps2_stubs
         {
             std::string currentDir = "/";
             bool formatted = true;
+            bool cardReported = false; // GetInfo has reported this card since sceMcInit
         };
 
         std::mutex g_mcStateMutex;
@@ -849,10 +850,44 @@ namespace ps2_stubs
 
     void sceMcGetEntSpace(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        const int32_t port = static_cast<int32_t>(getRegU32(ctx, 4));
+        const int32_t slot = static_cast<int32_t>(getRegU32(ctx, 5));
+        const std::string rawPath = readPs2CStringBounded(rdram, getRegU32(ctx, 6), kMcMaxPathLen);
+
+        int32_t result = kMcResultNoEntry;
         {
             std::lock_guard<std::mutex> lock(g_mcStateMutex);
-            setMcCommandResultLocked(kMcCmdGetEntSpace, 1024);
+            if (isValidMcPortSlot(port, slot))
+            {
+                McPortState &state = g_mcPorts[static_cast<size_t>(port)];
+                if (!state.formatted)
+                {
+                    result = kMcResultNoFormat;
+                }
+                else
+                {
+                    // Free entries left in the directory's allocated clusters (2 entries per cluster,
+                    // including "." and ".."). A missing directory reports -4 like real cards; games
+                    // use that to tell "no save directory yet" from an existing one.
+                    ensureMcRootExists(port);
+                    const std::filesystem::path hostPath =
+                        guestMcPathToHostPath(port, normalizeGuestMcPathLocked(port, rawPath));
+                    std::error_code ec;
+                    if (std::filesystem::is_directory(hostPath, ec) && !ec)
+                    {
+                        int32_t usedEntries = 2;
+                        for (auto it = std::filesystem::directory_iterator(hostPath, ec);
+                             !ec && it != std::filesystem::directory_iterator(); it.increment(ec))
+                        {
+                            ++usedEntries;
+                        }
+                        result = usedEntries % 2;
+                    }
+                }
+            }
+            setMcCommandResultLocked(kMcCmdGetEntSpace, result);
         }
+        RUNTIME_LOG("[MC] GetEntSpace port=" << port << " path='" << rawPath << "' result=" << result);
         setReturnS32(ctx, 0);
     }
 
@@ -877,7 +912,17 @@ namespace ps2_stubs
                 cardType = kMcTypePs2;
                 freeBlocks = state.formatted ? kMcFreeClusters : 0;
                 format = state.formatted ? kMcFormatted : kMcUnformatted;
-                result = state.formatted ? kMcResultSucceed : kMcResultNoFormat;
+                // Like real libmc, the first GetInfo after init reports the card as newly detected
+                // (-1); later calls report "same card" (0). Games track card presence from that edge.
+                if (!state.formatted)
+                {
+                    result = kMcResultNoFormat;
+                }
+                else
+                {
+                    result = state.cardReported ? kMcResultSucceed : kMcResultChangedCard;
+                }
+                state.cardReported = true;
             }
 
             setMcCommandResultLocked(kMcCmdGetInfo, result);
@@ -929,6 +974,7 @@ namespace ps2_stubs
             {
                 state.currentDir = "/";
                 state.formatted = true;
+                state.cardReported = false;
             }
         }
         ensureMcRootExists(0);

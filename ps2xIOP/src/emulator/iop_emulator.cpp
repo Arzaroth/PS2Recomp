@@ -685,10 +685,11 @@ namespace ps2x::iop::detail
                     servicePendingGuestCallbacks();
                     timrman.serviceDue(totalCycles, *this);
                     vblank.serviceDue(totalCycles, *this);
-                    IopThread *next = kernel.beginNextReady(totalCycles);
+                    uint64_t nextDelayWake = UINT64_MAX;
+                    IopThread *next = kernel.beginNextReady(totalCycles, &nextDelayWake);
                     if (!next)
                     {
-                        uint64_t nextWake = kernel.nextWakeCycle(target);
+                        uint64_t nextWake = std::min(target, nextDelayWake);
                         for (const auto &[irq, completionCycle] : pendingDmaInterrupts)
                             nextWake = std::min(nextWake, completionCycle);
                         if (!pendingGuestCallbacks.empty())

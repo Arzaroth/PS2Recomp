@@ -1601,20 +1601,35 @@ bool PS2Memory::tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr)
     const uint32_t originalMadr = m_ioRegisters[channelBase + 0x10u] & 0x7FFFFFF0u;
     const uint32_t originalSadr = m_ioRegisters[channelBase + 0x80u] & 0x3FF0u;
 
+    // MADR addresses main RAM or, through the 0x11000000 window, VU micro/data memory (games copy VU0
+    // results out with toSPR, e.g. Drakengard's VU0 vertex pipeline reading 0x11004AE0).
+    uint8_t *mainBase = m_rdram;
     uint32_t mainOffset = 0u;
-    try
+    uint32_t vuLimit = 0u;
+    if (uint8_t *vuMemory = mapVuMemory(originalMadr, byteCount, mainOffset, vuLimit))
     {
-        mainOffset = translateAddress(originalMadr);
+        mainBase = vuMemory;
     }
-    catch (const std::exception &)
+    else
     {
-        return false;
-    }
+        try
+        {
+            mainOffset = translateAddress(originalMadr);
+        }
+        catch (const std::exception &)
+        {
+            return false;
+        }
 
-    if (mainOffset > PS2_RAM_SIZE || byteCount > PS2_RAM_SIZE - mainOffset)
-        return false;
+        if (mainOffset > PS2_RAM_SIZE || byteCount > PS2_RAM_SIZE - mainOffset)
+            return false;
+    }
 
     const bool fromScratchpad = channelBase == kSprFromChannel;
+    if (fromScratchpad && mainBase == m_vu0Code)
+        markVU0CodeModified();
+    else if (fromScratchpad && mainBase == m_vu1Code)
+        markVU1CodeModified();
     uint32_t scratchOffset = originalSadr;
     uint32_t bytesLeft = byteCount;
     uint32_t copied = 0u;
@@ -1624,12 +1639,13 @@ bool PS2Memory::tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr)
         const uint32_t chunk = std::min(bytesLeft, scratchChunk);
         if (fromScratchpad)
         {
-            std::memcpy(m_rdram + mainOffset + copied, m_scratchpad + scratchOffset, chunk);
-            markModified(mainOffset + copied, chunk);
+            std::memcpy(mainBase + mainOffset + copied, m_scratchpad + scratchOffset, chunk);
+            if (mainBase == m_rdram)
+                markModified(mainOffset + copied, chunk);
         }
         else
         {
-            std::memcpy(m_scratchpad + scratchOffset, m_rdram + mainOffset + copied, chunk);
+            std::memcpy(m_scratchpad + scratchOffset, mainBase + mainOffset + copied, chunk);
         }
 
         copied += chunk;

@@ -427,6 +427,111 @@ namespace
         }
     }
 
+    // Interlaced FRAME mode (SMODE2 INT=1, FFMD=1) shows the same framebuffer lines in both fields,
+    // so the buffer holds only (DH+1)/2 lines; scale them back up to the display height.
+    void applyFrameModeLineDouble(std::vector<uint8_t> &pixels, uint32_t width, uint32_t sourceHeight, uint32_t targetHeight)
+    {
+        if (pixels.empty() || width == 0u || sourceHeight == 0u || targetHeight <= sourceHeight)
+            return;
+        for (uint32_t y = targetHeight; y-- > 0u;)
+        {
+            const uint32_t sourceY = std::min<uint32_t>((y * sourceHeight) / targetHeight, sourceHeight - 1u);
+            std::memmove(pixels.data() + y * kHostFrameWidth * 4u,
+                         pixels.data() + sourceY * kHostFrameWidth * 4u,
+                         width * 4u);
+        }
+    }
+
+    // Games in interlaced FRAME mode often alternate a sub-line offset every frame (one field draws
+    // half a line lower) so a TV interleaves the fields; on a progressive display the picture then
+    // shimmers up and down. While consecutive frames differ only by such a small amount, present the
+    // average of the newest frame and the previous distinct one, which is identical every frame. Real
+    // motion (larger differences) and long-static images are presented unblended.
+    void applyFrameModeStabilize(std::vector<uint8_t> &pixels, uint32_t width, uint32_t sourceHeight, uint32_t targetHeight)
+    {
+        if (pixels.empty() || width == 0u || sourceHeight < 4u || targetHeight <= sourceHeight)
+            return;
+
+        constexpr uint32_t kStaticPresentsBeforeUnblend = 8u;
+        constexpr uint32_t kMaxMeanDifference = 6u; // per sampled pixel, sum of RGB, after level removal
+
+        const size_t rowBytes = kHostFrameWidth * 4u;
+        const size_t usedBytes = rowBytes * sourceHeight;
+        std::vector<uint8_t> other;
+        bool recentlyChanged = false;
+        {
+            static std::mutex historyMutex;
+            static std::vector<uint8_t> latest, previous;
+            static uint32_t historyWidth = 0u, historyHeight = 0u;
+            static uint32_t presentsSinceChange = 0u;
+            std::lock_guard<std::mutex> lock(historyMutex);
+            if (historyWidth != width || historyHeight != sourceHeight)
+            {
+                latest.clear();
+                previous.clear();
+                historyWidth = width;
+                historyHeight = sourceHeight;
+            }
+            if (latest.size() != usedBytes || std::memcmp(latest.data(), pixels.data(), usedBytes) != 0)
+            {
+                previous.swap(latest);
+                latest.assign(pixels.begin(), pixels.begin() + static_cast<std::ptrdiff_t>(usedBytes));
+                presentsSinceChange = 0u;
+            }
+            else if (presentsSinceChange < kStaticPresentsBeforeUnblend)
+            {
+                ++presentsSinceChange;
+            }
+            recentlyChanged = presentsSinceChange < kStaticPresentsBeforeUnblend;
+            if (recentlyChanged && previous.size() == usedBytes)
+                other = previous;
+        }
+
+        if (!other.empty())
+        {
+            auto level = [&](const uint8_t *frame)
+            {
+                uint64_t sum = 0u, count = 0u;
+                for (uint32_t y = 0; y < sourceHeight; y += 2u)
+                    for (uint32_t x = 0; x < width; x += 4u, ++count)
+                    {
+                        const uint8_t *p = frame + y * rowBytes + x * 4u;
+                        sum += p[0] + p[1] + p[2];
+                    }
+                return count ? static_cast<int64_t>(sum / count) : 0;
+            };
+            const int64_t levelCurrent = level(pixels.data());
+            const int64_t levelOther = level(other.data());
+            // Compare the change since the previous frame with what shifting this image by one line
+            // costs: a field offset (up to a line) stays within that, real motion usually does not.
+            uint64_t difference = 0u, oneLineShift = 0u, samples = 0u;
+            for (uint32_t y = 0; y + 1u < sourceHeight; y += 2u)
+                for (uint32_t x = 0; x < width; x += 4u, ++samples)
+                {
+                    const uint8_t *a = pixels.data() + y * rowBytes + x * 4u;
+                    const uint8_t *below = a + rowBytes;
+                    const uint8_t *b = other.data() + y * rowBytes + x * 4u;
+                    difference += static_cast<uint64_t>(std::llabs((int64_t(a[0]) + a[1] + a[2] - levelCurrent) -
+                                                                   (int64_t(b[0]) + b[1] + b[2] - levelOther)));
+                    oneLineShift += static_cast<uint64_t>(std::llabs((int64_t(a[0]) + a[1] + a[2]) -
+                                                                     (int64_t(below[0]) + below[1] + below[2])));
+                }
+            const uint64_t allowed = std::max<uint64_t>(samples * kMaxMeanDifference, oneLineShift + oneLineShift / 2u);
+            if (samples != 0u && difference <= allowed)
+            {
+                for (uint32_t y = 0; y < sourceHeight; ++y)
+                {
+                    uint8_t *dst = pixels.data() + y * rowBytes;
+                    const uint8_t *src = other.data() + y * rowBytes;
+                    for (uint32_t i = 0; i < width * 4u; ++i)
+                        dst[i] = static_cast<uint8_t>((uint32_t(dst[i]) + src[i] + 1u) >> 1u);
+                }
+            }
+        }
+
+        applyFrameModeLineDouble(pixels, width, sourceHeight, targetHeight);
+    }
+
     void normalizePresentationAlpha(std::vector<uint8_t> &pixels, uint32_t width, uint32_t height)
     {
         for (uint32_t y = 0; y < height; ++y)
@@ -972,14 +1077,83 @@ void GSCpuBackend::ResetUnlocked()
     m_localToHostReadPos = 0u;
 }
 
+// VU1 microprogram (MSCAL start pc) whose XGKICK is being drawn, for PS2X_GS_DUMP_AT; ~0u outside VU1.
+std::atomic<uint32_t> g_gsDumpVu1ProgramPc{~0u};
+// GIF path (1-3) of the packet being processed, for PS2X_GS_DUMP_AT; 0 when unknown.
+std::atomic<uint32_t> g_gsDumpGifPath{0u};
+
+// PS2X_GS_DUMP_AT=<sec>: once `sec` seconds have passed, the GS writes its next PS2X_GS_DUMP_COUNT (default 20000)
+// primitives and the GIF tags that produced them to PS2X_GS_DUMP_OUT (default gs_prims.txt). Returns the open
+// stream while the dump is in progress, else nullptr.
+FILE *gsDumpStream()
+{
+    static const double dumpAt = []
+    {
+        const char *value = std::getenv("PS2X_GS_DUMP_AT");
+        return value ? std::atof(value) : -1.0;
+    }();
+    if (dumpAt < 0.0)
+        return nullptr;
+    static const auto start = std::chrono::steady_clock::now();
+    static FILE *out = nullptr;
+    static bool finished = false;
+    if (finished || std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() < dumpAt)
+        return nullptr;
+    if (!out)
+    {
+        const char *path = std::getenv("PS2X_GS_DUMP_OUT");
+        out = std::fopen(path ? path : "gs_prims.txt", "w");
+        finished = out == nullptr;
+    }
+    return out;
+}
+
+namespace
+{
+    void dumpPrimitiveIfRequested(const GSPrimitiveBatch &batch)
+    {
+        FILE *out = gsDumpStream();
+        if (!out)
+            return;
+        static uint32_t remaining = []
+        {
+            const char *value = std::getenv("PS2X_GS_DUMP_COUNT");
+            return value ? static_cast<uint32_t>(std::atoi(value)) : 20000u;
+        }();
+        if (remaining == 0u)
+            return;
+        const GSDrawState &state = batch.state;
+        const GSContext &ctx = state.context;
+        std::fprintf(out, "vu1pc=%x type=%u tme=%u fst=%u abe=%u fge=%u ctxt=%u fbp=%u psm=%x zbp=%u test=%llx alpha=%llx "
+                          "ofs=(%u,%u) sc=(%u,%u)-(%u,%u) tbp=%u tpsm=%x |",
+                     g_gsDumpVu1ProgramPc.load(std::memory_order_relaxed), static_cast<uint32_t>(state.prim.type),
+                     state.prim.tme, state.prim.fst, state.prim.abe,
+                     state.prim.fge, state.prim.ctxt, ctx.frame.fbp, static_cast<uint32_t>(ctx.frame.psm),
+                     ctx.zbuf.zbp, static_cast<unsigned long long>(ctx.test),
+                     static_cast<unsigned long long>(ctx.alpha), ctx.xyoffset.ofx >> 4, ctx.xyoffset.ofy >> 4,
+                     ctx.scissor.x0, ctx.scissor.y0, ctx.scissor.x1, ctx.scissor.y1, ctx.tex0.tbp0,
+                     static_cast<uint32_t>(ctx.tex0.psm));
+        for (uint32_t i = 0; i < batch.vertexCount && i < 3u; ++i)
+        {
+            const GSVertex &v = batch.vertices[i];
+            std::fprintf(out, " (%.1f,%.1f,%.0f c=%02x%02x%02x%02x f=%u stq=%g,%g,%g uv=%u,%u)", v.x, v.y, v.z, v.r,
+                         v.g, v.b, v.a, v.fog, v.s, v.t, v.q, v.u, v.v);
+        }
+        std::fputc('\n', out);
+        if (--remaining == 0u)
+            std::fflush(out);
+    }
+}
+
 void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
     if (!m_vram || batch.vertexCount == 0u)
         return;
-    if (s_asyncRasterization.load(std::memory_order_relaxed))
+    if (s_asyncRasterization.load(std::memory_order_relaxed) && m_asyncAllowed)
         StartWorkersUnlocked();
     DumpUpdateUnlocked();
+    dumpPrimitiveIfRequested(batch);
     DrawPrimitive(batch);
 }
 
@@ -2047,10 +2221,12 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch, const RasterContext
         float u0f, v0f, u1f, v1f;
         if (state.prim.fst)
         {
-            u0f = static_cast<float>(v0.u >> 4);
-            v0f = static_cast<float>(v0.v >> 4);
-            u1f = static_cast<float>(v1.u >> 4);
-            v1f = static_cast<float>(v1.v >> 4);
+            // UV registers are 12.4 fixed point; keep the fraction (games use sub-texel offsets,
+            // e.g. per-field half-texel shifts when copying an interlaced frame with bilinear filtering).
+            u0f = static_cast<float>(v0.u) / 16.0f;
+            v0f = static_cast<float>(v0.v) / 16.0f;
+            u1f = static_cast<float>(v1.u) / 16.0f;
+            v1f = static_cast<float>(v1.v) / 16.0f;
         }
         else
         {
@@ -2796,6 +2972,14 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
     uint32_t width1 = 0u, height1 = 0u, width2 = 0u, height2 = 0u;
     decodeDisplaySize(request.display1, width1, height1);
     decodeDisplaySize(request.display2, width2, height2);
+    const bool frameModeInterlace = smode2.interlaced && smode2.frameMode;
+    const uint32_t displayHeight1 = height1;
+    const uint32_t displayHeight2 = height2;
+    if (frameModeInterlace)
+    {
+        height1 = (height1 + 1u) / 2u;
+        height2 = (height2 + 1u) / 2u;
+    }
     const bool valid1 = pmode.enableCrt1 && hasDisplaySetup(request.display1, displayFrame1);
     const bool valid2 = pmode.enableCrt2 && hasDisplaySetup(request.display2, displayFrame2);
     if (!valid1 && !valid2)
@@ -2883,6 +3067,12 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
             normalizePresentationAlpha(result.pixels, result.width, result.height);
             if (fieldMode)
                 applyFieldPresentation(result.pixels, result.width, result.height, oddField);
+            if (frameModeInterlace)
+            {
+                const uint32_t displayHeight = std::max(displayHeight1, displayHeight2);
+                applyFrameModeStabilize(result.pixels, result.width, result.height, displayHeight);
+                result.height = displayHeight;
+            }
             result.displayFbp = displayFrame1.fbp;
             result.sourceFbp = selected1.fbp;
             return result;
@@ -2898,6 +3088,12 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
         return {};
     if (fieldMode)
         applyFieldPresentation(result.pixels, result.width, result.height, oddField);
+    if (frameModeInterlace)
+    {
+        const uint32_t displayHeight = valid1 ? displayHeight1 : displayHeight2;
+        applyFrameModeStabilize(result.pixels, result.width, result.height, displayHeight);
+        result.height = displayHeight;
+    }
     normalizePresentationAlpha(result.pixels, result.width, result.height);
     result.displayFbp = displayFrame.fbp;
     result.sourceFbp = selected.fbp;

@@ -853,24 +853,47 @@ inline __m128i ps2_u64_to_epi64_pair(uint64_t value)
 #define FPU_FLOOR_W_S(a) ((int32_t)floorf((float)(a)))
 #define FPU_CVT_S_W(a) ((float)(int32_t)(a))
 #define FPU_CVT_S_L(a) ((float)(int64_t)(a))
-#define FPU_CVT_W_S(a) ((int32_t)nearbyintf((float)(a)))
+// EE CVT.W.S always rounds toward zero (the FPU has no other rounding mode) and saturates values whose
+// magnitude is 2^31 or more, including exponent-255 patterns (no NaN/Inf on the EE).
+inline int32_t ps2FpuCvtWS(float value)
+{
+    uint32_t bits;
+    std::memcpy(&bits, &value, sizeof(bits));
+    if (((bits >> 23) & 0xFFu) >= 158u)
+        return (bits & 0x80000000u) != 0u ? INT32_MIN : INT32_MAX;
+    return static_cast<int32_t>(value);
+}
+#define FPU_CVT_W_S(a) ps2FpuCvtWS((float)(a))
 #define FPU_CVT_L_S(a) ((int64_t)(float)(a))
+// The EE FPU has no NaN/Inf: exponent 255 is an ordinary (huge) value and denormals read as zero,
+// so compares order every bit pattern. Games rely on this, e.g. 0x7FFFFFFF as "max float" in
+// nearest-search loops, which an IEEE compare treats as NaN and never satisfies.
+inline int32_t ps2FpuCompareKey(float value)
+{
+    uint32_t bits;
+    std::memcpy(&bits, &value, sizeof(bits));
+    if ((bits & 0x7F800000u) == 0u)
+        return 0;
+    const int32_t magnitude = static_cast<int32_t>(bits & 0x7FFFFFFFu);
+    return (bits & 0x80000000u) != 0u ? -magnitude : magnitude;
+}
+
 #define FPU_C_F_S(a, b) (0)
-#define FPU_C_UN_S(a, b) (isnan((float)(a)) || isnan((float)(b)))
-#define FPU_C_EQ_S(a, b) ((float)(a) == (float)(b))
-#define FPU_C_UEQ_S(a, b) ((float)(a) == (float)(b) || isnan((float)(a)) || isnan((float)(b)))
-#define FPU_C_OLT_S(a, b) ((float)(a) < (float)(b))
-#define FPU_C_ULT_S(a, b) ((float)(a) < (float)(b) || isnan((float)(a)) || isnan((float)(b)))
-#define FPU_C_OLE_S(a, b) ((float)(a) <= (float)(b))
-#define FPU_C_ULE_S(a, b) ((float)(a) <= (float)(b) || isnan((float)(a)) || isnan((float)(b)))
+#define FPU_C_UN_S(a, b) (0)
+#define FPU_C_EQ_S(a, b) (ps2FpuCompareKey((float)(a)) == ps2FpuCompareKey((float)(b)))
+#define FPU_C_UEQ_S(a, b) FPU_C_EQ_S(a, b)
+#define FPU_C_OLT_S(a, b) (ps2FpuCompareKey((float)(a)) < ps2FpuCompareKey((float)(b)))
+#define FPU_C_ULT_S(a, b) FPU_C_OLT_S(a, b)
+#define FPU_C_OLE_S(a, b) (ps2FpuCompareKey((float)(a)) <= ps2FpuCompareKey((float)(b)))
+#define FPU_C_ULE_S(a, b) FPU_C_OLE_S(a, b)
 #define FPU_C_SF_S(a, b) (0)
-#define FPU_C_NGLE_S(a, b) (isnan((float)(a)) || isnan((float)(b)))
-#define FPU_C_SEQ_S(a, b) ((float)(a) == (float)(b))
-#define FPU_C_NGL_S(a, b) ((float)(a) == (float)(b) || isnan((float)(a)) || isnan((float)(b)))
-#define FPU_C_LT_S(a, b) ((float)(a) < (float)(b))
-#define FPU_C_NGE_S(a, b) ((float)(a) < (float)(b) || isnan((float)(a)) || isnan((float)(b)))
-#define FPU_C_LE_S(a, b) ((float)(a) <= (float)(b))
-#define FPU_C_NGT_S(a, b) ((float)(a) <= (float)(b) || isnan((float)(a)) || isnan((float)(b)))
+#define FPU_C_NGLE_S(a, b) (0)
+#define FPU_C_SEQ_S(a, b) FPU_C_EQ_S(a, b)
+#define FPU_C_NGL_S(a, b) FPU_C_EQ_S(a, b)
+#define FPU_C_LT_S(a, b) FPU_C_OLT_S(a, b)
+#define FPU_C_NGE_S(a, b) FPU_C_OLT_S(a, b)
+#define FPU_C_LE_S(a, b) FPU_C_OLE_S(a, b)
+#define FPU_C_NGT_S(a, b) FPU_C_OLE_S(a, b)
 
 // QFSRV: Quadword Funnel Shift Right Variable
 // Concatenates rs || rt (256 bits) and right-shifts by SA bits, taking lower 128 bits.

@@ -2,6 +2,7 @@
 #include "ps2_vu1_detail.h"
 
 #include <cmath>
+#include <emmintrin.h>
 #include <cstring>
 #include <limits>
 
@@ -24,6 +25,7 @@ namespace
     // and depends on the exact PS2 result (PCSX2 hardcodes these additions as a "TriAce hack").
     float vuAdd(float a, float b)
     {
+
         uint32_t ua = 0u;
         uint32_t ub = 0u;
         std::memcpy(&ua, &a, sizeof(ua));
@@ -45,6 +47,34 @@ namespace
     {
         return vuAdd(a, -b);
     }
+
+    // MAX/MINI compare raw sign-magnitude bit patterns and pass the chosen operand through unchanged, so
+    // denormals (often integer data, e.g. colors unpacked by VIF) and exponent-255 values survive.
+    int64_t vuMinMaxKey(float value)
+    {
+        uint32_t bits = 0u;
+        std::memcpy(&bits, &value, sizeof(bits));
+        const int64_t magnitude = static_cast<int64_t>(bits & 0x7FFFFFFFu);
+        return (bits & 0x80000000u) != 0u ? -magnitude : magnitude;
+    }
+
+    float vuMax(float a, float b) { return vuMinMaxKey(a) > vuMinMaxKey(b) ? a : b; }
+    float vuMini(float a, float b) { return vuMinMaxKey(a) < vuMinMaxKey(b) ? a : b; }
+
+    // normalizeOperand() on four lanes: denormals become signed zero, exponent 255 becomes +-FLT_MAX.
+    void normalizeVector(const float *source, float *target)
+    {
+        const __m128i bits = _mm_loadu_si128(reinterpret_cast<const __m128i *>(source));
+        const __m128i exponentMask = _mm_set1_epi32(0x7F800000);
+        const __m128i sign = _mm_and_si128(bits, _mm_set1_epi32(static_cast<int>(0x80000000u)));
+        const __m128i exponent = _mm_and_si128(bits, exponentMask);
+        const __m128i zeroExponent = _mm_cmpeq_epi32(exponent, _mm_setzero_si128());
+        const __m128i maxExponent = _mm_cmpeq_epi32(exponent, exponentMask);
+        __m128i result = _mm_or_si128(_mm_andnot_si128(zeroExponent, bits), _mm_and_si128(zeroExponent, sign));
+        result = _mm_or_si128(_mm_andnot_si128(maxExponent, result),
+                              _mm_and_si128(maxExponent, _mm_or_si128(sign, _mm_set1_epi32(0x7F7FFFFF))));
+        _mm_storeu_si128(reinterpret_cast<__m128i *>(target), result);
+    }
 }
 
 // ============================================================================
@@ -59,16 +89,18 @@ void VU1Interpreter::execUpper(uint32_t instr)
     uint8_t fd = FD(instr);
     uint8_t op = instr & 0x3F;
 
+    // NOP (special 0x2F/0x30) is the most common upper instruction.
+    const uint32_t low11 = instr & 0x7FFu;
+    if (low11 == 0x2FFu || low11 == 0x33Cu)
+        return;
+
     float *vd = m_state.vf[fd];
-    float normalizedVs[4];
-    float normalizedVt[4];
-    float normalizedAcc[4];
-    for (uint32_t component = 0; component < 4u; ++component)
-    {
-        normalizedVs[component] = normalizeOperand(m_state.vf[fs][component]);
-        normalizedVt[component] = normalizeOperand(m_state.vf[ft][component]);
-        normalizedAcc[component] = normalizeOperand(m_state.acc[component]);
-    }
+    alignas(16) float normalizedVs[4];
+    alignas(16) float normalizedVt[4];
+    alignas(16) float normalizedAcc[4];
+    normalizeVector(m_state.vf[fs], normalizedVs);
+    normalizeVector(m_state.vf[ft], normalizedVt);
+    normalizeVector(m_state.acc, normalizedAcc);
     const float *vs = normalizedVs;
     const float *vt = normalizedVt;
     const float *acc = normalizedAcc;
@@ -128,9 +160,9 @@ void VU1Interpreter::execUpper(uint32_t instr)
     case 0x12:
     case 0x13: // MAXbc
     {
-        float bc = broadcast(vt, op & 3);
+        const float bc = m_state.vf[ft][op & 3];
         for (int c = 0; c < 4; c++)
-            result[c] = (vs[c] > bc) ? vs[c] : bc;
+            result[c] = vuMax(m_state.vf[fs][c], bc);
         applyDest(vd, result, dest);
         return;
     }
@@ -139,9 +171,9 @@ void VU1Interpreter::execUpper(uint32_t instr)
     case 0x16:
     case 0x17: // MINIbc
     {
-        float bc = broadcast(vt, op & 3);
+        const float bc = m_state.vf[ft][op & 3];
         for (int c = 0; c < 4; c++)
-            result[c] = (vs[c] < bc) ? vs[c] : bc;
+            result[c] = vuMini(m_state.vf[fs][c], bc);
         applyDest(vd, result, dest);
         return;
     }
@@ -163,7 +195,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
         return;
     case 0x1D: // MAXi
         for (int c = 0; c < 4; c++)
-            result[c] = (vs[c] > i) ? vs[c] : i;
+            result[c] = vuMax(m_state.vf[fs][c], m_state.i);
         applyDest(vd, result, dest);
         return;
     case 0x1E: // MULi
@@ -173,7 +205,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
         return;
     case 0x1F: // MINIi
         for (int c = 0; c < 4; c++)
-            result[c] = (vs[c] < i) ? vs[c] : i;
+            result[c] = vuMini(m_state.vf[fs][c], m_state.i);
         applyDest(vd, result, dest);
         return;
     case 0x20: // ADDq
@@ -233,7 +265,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
         return;
     case 0x2B: // MAX
         for (int c = 0; c < 4; c++)
-            result[c] = (vs[c] > vt[c]) ? vs[c] : vt[c];
+            result[c] = vuMax(m_state.vf[fs][c], m_state.vf[ft][c]);
         applyDest(vd, result, dest);
         return;
     case 0x2C: // SUB
@@ -255,7 +287,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
         return;
     case 0x2F: // MINI
         for (int c = 0; c < 4; c++)
-            result[c] = (vs[c] < vt[c]) ? vs[c] : vt[c];
+            result[c] = vuMini(m_state.vf[fs][c], m_state.vf[ft][c]);
         applyDest(vd, result, dest);
         return;
 
@@ -401,9 +433,14 @@ void VU1Interpreter::execUpper(uint32_t instr)
                 result[c] = vs[c] * q;
             applyFmacDestAcc(result, dest);
             return;
-        case 0x1D: // ABS
+        case 0x1D: // ABS (clears the sign bit; the magnitude bits pass through)
             for (int c = 0; c < 4; c++)
-                result[c] = std::fabs(vs[c]);
+            {
+                uint32_t bits = 0u;
+                std::memcpy(&bits, &m_state.vf[fs][c], sizeof(bits));
+                bits &= 0x7FFFFFFFu;
+                std::memcpy(&result[c], &bits, sizeof(bits));
+            }
             applyDest(vtDest, result, dest);
             return;
         case 0x1E: // MULAi
