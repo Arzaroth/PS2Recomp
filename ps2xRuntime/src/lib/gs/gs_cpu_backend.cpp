@@ -292,11 +292,19 @@ namespace
         return psm == GS_PSM_T8 || psm == GS_PSM_T8H;
     }
 
-    uint8_t lerpChannel(uint8_t c00, uint8_t c10, uint8_t c01, uint8_t c11, float fx, float fy)
+    // Bilinear blend with 8-bit fixed-point weights (0..256): integer only, since the CRT
+    // rounding calls it replaces dominated movie playback (four per channel per pixel).
+    uint8_t lerpChannel(uint8_t c00, uint8_t c10, uint8_t c01, uint8_t c11, int fx, int fy)
     {
-        const float top = static_cast<float>(c00) + (static_cast<float>(c10) - static_cast<float>(c00)) * fx;
-        const float bottom = static_cast<float>(c01) + (static_cast<float>(c11) - static_cast<float>(c01)) * fx;
-        return clampU8(static_cast<int>(std::lround(top + (bottom - top) * fy)));
+        const int top = (static_cast<int>(c00) << 8) + (static_cast<int>(c10) - static_cast<int>(c00)) * fx;
+        const int bottom = (static_cast<int>(c01) << 8) + (static_cast<int>(c11) - static_cast<int>(c01)) * fx;
+        return clampU8(((top << 8) + (bottom - top) * fy + 0x8000) >> 16);
+    }
+
+    int floorToInt(float value)
+    {
+        const int truncated = static_cast<int>(value);
+        return value < static_cast<float>(truncated) ? truncated - 1 : truncated;
     }
 }
 
@@ -1120,12 +1128,16 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
 
     const float sampleU = texUf - 0.5f;
     const float sampleV = texVf - 0.5f;
-    const int u0 = static_cast<int>(std::floor(sampleU));
-    const int v0 = static_cast<int>(std::floor(sampleV));
+    const int u0 = floorToInt(sampleU);
+    const int v0 = floorToInt(sampleV);
     const int u1 = u0 + 1;
     const int v1 = v0 + 1;
-    const float fx = sampleU - static_cast<float>(u0);
-    const float fy = sampleV - static_cast<float>(v0);
+    const int fx = static_cast<int>((sampleU - static_cast<float>(u0)) * 256.0f + 0.5f);
+    const int fy = static_cast<int>((sampleV - static_cast<float>(v0)) * 256.0f + 0.5f);
+    if ((fx | fy) == 0)
+    {
+        return samplePoint(u0, v0); // texel-aligned (e.g. 1:1 movie frames): the blend is c00
+    }
 
     const uint32_t c00 = samplePoint(u0, v0);
     const uint32_t c10 = samplePoint(u1, v0);
