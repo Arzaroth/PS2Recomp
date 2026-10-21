@@ -4,13 +4,23 @@
 #include "runtime/gs/gs_texture_page_cache.h"
 
 #include <array>
+#include <atomic>
+#include <condition_variable>
+#include <memory>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 class GSCpuBackend final : public GSRasterBackend
 {
 public:
     GSCpuBackend();
+    ~GSCpuBackend() override;
+
+    // Opt-in, process wide: backends draw on worker threads, asynchronously to Submit. Code
+    // that reads VRAM must then go through the backend (which waits for queued drawing);
+    // raw reads of the VRAM buffer may see primitives still being drawn.
+    static void SetAsyncRasterization(bool enabled) noexcept;
 
     void Initialize(uint8_t *vram, uint32_t vramSize) override;
     void Reset() override;
@@ -40,13 +50,50 @@ private:
     uint32_t ReadTextureVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y);
     void WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value);
 
+    // Registers decoded once per primitive, and the slice of rows one thread rasterizes.
+    struct PixelPipeline;
+    struct TextureSampler;
+    struct RasterContext;
+    PixelPipeline MakePixelPipeline(const GSDrawState &state) const;
+    TextureSampler MakeTextureSampler(const GSDrawState &state) const;
+    const std::array<uint16_t, 512> *ClutSnapshotUnlocked(uint64_t queueIndex);
+
     void DrawPrimitive(const GSPrimitiveBatch &batch);
-    void DrawSprite(const GSPrimitiveBatch &batch);
-    void DrawTriangle(const GSPrimitiveBatch &batch);
-    void DrawLine(const GSPrimitiveBatch &batch);
-    void WritePixel(const GSDrawState &state, int x, int y, int z, uint8_t r, uint8_t g, uint8_t b, uint8_t a, uint8_t fog);
-    uint32_t SampleTexture(const GSDrawState &state, float s, float t, float q, uint16_t u, uint16_t v);
-    uint32_t LookupCLUT(const GSDrawState &state, uint8_t index, uint8_t cpsm, uint8_t csm, uint8_t csa, uint8_t sourcePsm);
+    void DrawSprite(const GSPrimitiveBatch &batch, const RasterContext &raster);
+    void DrawTriangle(const GSPrimitiveBatch &batch, const RasterContext &raster);
+    void DrawLine(const GSPrimitiveBatch &batch, const RasterContext &raster);
+    void WritePixel(const PixelPipeline &pipeline, int x, int y, uint32_t z, uint8_t r, uint8_t g, uint8_t b, uint8_t a, uint8_t fog);
+    uint32_t SampleTexture(const TextureSampler &sampler, GSMem::TexturePageCache &cache, float s, float t, float q, uint16_t u, uint16_t v);
+
+    // Submit queues primitives; worker threads draw them in order, each on its own row
+    // stripes, so every pixel sees the same draw order as a serial rasterizer. Anything else
+    // that touches VRAM drains the queue first.
+    struct QueuedPrimitive;
+    struct DecodedTexture;
+    struct DecodedTextureCache;
+    uint32_t FetchTexel(const TextureSampler &sampler, GSMem::TexturePageCache &cache, int u, int v);
+    void DecodeTile(DecodedTexture &texture, const TextureSampler &sampler, GSMem::TexturePageCache &cache, uint32_t tile);
+    DecodedTexture *FindDecodedTexture(DecodedTextureCache &cache, const TextureSampler &sampler);
+    struct alignas(64) WorkerProgress
+    {
+        std::atomic<uint64_t> done{0};
+    };
+    void StartWorkersUnlocked();
+    void DrainUnlocked() const;
+    bool ReadsPendingWrite(const GSPrimitiveBatch &batch) const;
+    void NotePendingWrites(const GSPrimitiveBatch &batch);
+    void NotePendingRange(std::vector<std::pair<uint32_t, uint32_t>> &ranges, std::pair<uint32_t, uint32_t> range);
+    void NoteBarrierRange(std::vector<std::pair<uint32_t, uint32_t>> &ranges, std::pair<uint32_t, uint32_t> range);
+    // Writes (or, with write false, only counts) the pixels of an upload chunk; with rows, only
+    // those on the rows that raster slice owns. Returns the pixels consumed.
+    uint32_t WriteUploadPixels(const GSTransferCommand &transfer, uint32_t firstPixel, uint32_t totalPixels,
+                               const uint8_t *data, uint32_t sizeBytes, const RasterContext *rows, bool write);
+    QueuedPrimitive &ReserveQueueSlotUnlocked();
+    void PublishQueueSlotUnlocked();
+    void DrawQueued(const QueuedPrimitive &item, uint32_t index);
+    void DrawWith(const GSPrimitiveBatch &batch, const RasterContext &raster);
+    void WorkerMain(uint32_t index);
+    uint32_t LookupCLUT(const GSDrawState &state, const std::array<uint16_t, 512> &clut, uint8_t index, uint8_t cpsm, uint8_t csm, uint8_t csa, uint8_t sourcePsm);
 
     void PerformLocalToLocalTransfer();
     void PerformLocalToHostTransfer();
@@ -72,7 +119,34 @@ private:
     std::array<WriteVramFunc, kPsmHandlerCount> m_writeVramFuncs{};
     std::array<uint16_t, 512> m_clut{};
     std::array<uint32_t, 2> m_clutCbp{};
-    GSMem::TexturePageCache m_texturePageCache;
+    // Copies of m_clut taken when it changed, one per run of queued primitives that sample it.
+    std::vector<std::array<uint16_t, 512>> m_clutSnapshots;
+    std::vector<uint64_t> m_clutSnapshotLastUse; // queue index + 1 of the slot's last user
+    uint32_t m_clutSnapshotSlot = 0;
+    bool m_clutSnapshotStale = true;
+    std::vector<GSMem::TexturePageCache> m_texturePageCaches; // [0] caller (CLUT loads), [1 + i] worker i
+    std::vector<DecodedTextureCache> m_decodedCaches;           // same indexing, used by workers only
+    uint64_t m_clutSerial = 1;                                  // bumped whenever m_clut changes
+
+    std::vector<QueuedPrimitive> m_queue; // ring of primitives
+    std::atomic<uint64_t> m_queueTail{0}; // primitives queued so far
+    std::unique_ptr<WorkerProgress[]> m_workerProgress;
+    uint32_t m_workerCount = 0;
+    // VRAM block ranges the queued primitives draw to (start, count): a texture read from one
+    // of them waits for the queue to drain (render to texture).
+    mutable std::vector<std::pair<uint32_t, uint32_t>> m_pendingWrites;
+    // Writes queued since the last in-queue barrier: a primitive sampling one of them gets a
+    // barrier (the workers wait for each other there) instead of draining the queue.
+    mutable std::vector<std::pair<uint32_t, uint32_t>> m_writesSinceBarrier;
+    // Texture ranges read since the last barrier: a queued upload over them gets a barrier.
+    mutable std::vector<std::pair<uint32_t, uint32_t>> m_readsSinceBarrier;
+    bool m_barrierRequested = false;
+    std::vector<std::thread> m_workers;
+    std::mutex m_workMutex;
+    std::condition_variable m_workCv;
+    std::atomic<uint32_t> m_sleepingWorkers{0};
+    std::atomic<bool> m_stopWorkers{false};
+    static std::atomic<bool> s_asyncRasterization;
 
     GSTransferCommand m_transfer{};
     GSTransferSnapshot m_transferState{};

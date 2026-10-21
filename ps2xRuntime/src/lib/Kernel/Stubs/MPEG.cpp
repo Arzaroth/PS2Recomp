@@ -2531,9 +2531,13 @@ namespace ps2_stubs
         // Only the producer/demux EOF is authoritative. A sequence_end_code can
         // be observed while more PSS data is still buffered, and a decoder
         // failure before producer EOF may still recover on a later sequence.
+        // Games that stream with their own sceCdRead loop (VP2) never start the
+        // runtime's CD stream: the end of the MPEG stream itself is all there is.
+        const bool runtimeStream = g_mpeg_stub_state.cdStreamGeneration != 0u;
         const bool producerEnded =
-            g_mpeg_stub_state.currentCdStreamEofSeen &&
-            playback.cdStreamGeneration == g_mpeg_stub_state.cdStreamGeneration;
+            !runtimeStream ||
+            (g_mpeg_stub_state.currentCdStreamEofSeen &&
+             playback.cdStreamGeneration == g_mpeg_stub_state.cdStreamGeneration);
         const bool ended = producerEnded &&
                            (playback.streamEnded || (playback.decoderFailed && playback.sawInput));
         const uint64_t presentationEnd = playback.presentationEndTickQ32;
