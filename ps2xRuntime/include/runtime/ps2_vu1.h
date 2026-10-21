@@ -205,6 +205,35 @@ private:
     std::array<uint64_t, 16> m_viReady{};
     std::array<uint64_t, 4> m_accReady{};
 
+    // Register writes of the last few cycles with their previous values: a run that stops on its cycle
+    // budget hides those still in flight, and the next run reveals them again.
+    struct InFlightWrite
+    {
+        enum class Kind : uint8_t
+        {
+            Vf,
+            Vi,
+            Acc
+        };
+        uint64_t readyCycle = 0;
+        float oldValue[4]{};
+        float newValue[4]{};
+        Kind kind = Kind::Vf;
+        uint8_t reg = 0;
+        uint8_t lanes = 0;
+    };
+    static constexpr uint32_t kInFlightWrites = 16u;
+    std::array<InFlightWrite, kInFlightWrites> m_inFlight{};
+    uint32_t m_inFlightNext = 0;
+    uint32_t m_inFlightCount = 0;
+    bool m_inFlightHidden = false;
+    bool m_logInFlight = false;
+    void logInFlightWrite(InFlightWrite::Kind kind, uint8_t reg, uint8_t lanes, uint64_t readyCycle,
+                          const float oldValue[4], const float newValue[4]);
+    void applyInFlightWrite(const InFlightWrite &entry, bool newValue);
+    void hideInFlightWrites();
+    void revealInFlightWrites();
+
     uint64_t m_cycle = 0;
     uint64_t m_lastWritebackCycle = 0;
     uint64_t m_efuResourceReady = 0;

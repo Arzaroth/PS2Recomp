@@ -392,6 +392,17 @@ void register_ps2_sif_rpc_tests()
             std::memset(env.rdram.data() + kRecvAddr, 0xCC, 12u);
             std::memset(env.rdram.data() + kEndParamAddr, 0xCC, 192u);
 
+            // The first GETINFO after init reports -1 (new card detected), as libmc does on hardware; the
+            // next one succeeds.
+            const ps2x::iop::RpcResult firstGetInfo =
+                callIop(env, IOP_SID_MCSERV, 0x01u,
+                        kSendAddr, sizeof(McDescParam), kRecvAddr, 4u);
+            t.IsTrue(firstGetInfo.handled, "MCSERV first get info RPC should be handled");
+            t.Equals(readGuestStruct<int32_t>(env.rdram.data(), kRecvAddr), -1,
+                     "first get info should report a newly detected card");
+
+            std::memset(env.rdram.data() + kRecvAddr, 0xCC, 12u);
+            std::memset(env.rdram.data() + kEndParamAddr, 0xCC, 192u);
             const ps2x::iop::RpcResult getInfoResult =
                 callIop(env, IOP_SID_MCSERV, 0x01u,
                         kSendAddr, sizeof(McDescParam), kRecvAddr, 4u);

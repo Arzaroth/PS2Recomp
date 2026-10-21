@@ -805,6 +805,7 @@ bool PS2Runtime::syncCoreSubsystems()
     }
 
     m_gs.init(gsVram, static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &m_memory.gs());
+    m_gs.enableAsync();
     m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
                                     { m_gs.submitGIFPacket(data, size); });
     m_memory.setGifArbiter(&m_gifArbiter);

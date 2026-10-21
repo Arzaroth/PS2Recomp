@@ -70,6 +70,8 @@ void VU1Interpreter::resetScheduler()
     m_flagPipeline = {};
     m_flagHead = 0u;
     m_flagCount = 0u;
+    m_inFlightCount = 0u;
+    m_inFlightHidden = false;
     m_fdiv = {};
     m_efu = {};
     resetXgkick();
@@ -1475,6 +1477,67 @@ void VU1Interpreter::reportReservedInstruction(bool upper, uint32_t instruction)
     m_stopRequested = true;
 }
 
+void VU1Interpreter::logInFlightWrite(InFlightWrite::Kind kind, uint8_t reg, uint8_t lanes, uint64_t readyCycle,
+                                      const float oldValue[4], const float newValue[4])
+{
+    // Writes become ready at most a few cycles after issue, so the oldest entry of the ring has
+    // always landed when it is overwritten.
+    InFlightWrite &entry = m_inFlight[m_inFlightNext];
+    m_inFlightNext = (m_inFlightNext + 1u) % kInFlightWrites;
+    if (m_inFlightCount < kInFlightWrites)
+        ++m_inFlightCount;
+    entry.kind = kind;
+    entry.reg = reg;
+    entry.lanes = lanes;
+    entry.readyCycle = readyCycle;
+    std::memcpy(entry.oldValue, oldValue, sizeof(entry.oldValue));
+    std::memcpy(entry.newValue, newValue, sizeof(entry.newValue));
+}
+
+void VU1Interpreter::applyInFlightWrite(const InFlightWrite &entry, bool newValue)
+{
+    const float *value = newValue ? entry.newValue : entry.oldValue;
+    if (entry.kind == InFlightWrite::Kind::Vi)
+    {
+        m_state.vi[entry.reg] = static_cast<int32_t>(value[0]);
+        return;
+    }
+    float *target = entry.kind == InFlightWrite::Kind::Acc ? m_state.acc : m_state.vf[entry.reg];
+    for (uint32_t component = 0; component < 4u; ++component)
+    {
+        if ((entry.lanes & laneForComponent(component)) != 0u)
+            target[component] = value[component];
+    }
+}
+
+void VU1Interpreter::hideInFlightWrites()
+{
+    // The run stopped before these results' writeback: show the registers as the pipeline would,
+    // undoing the newest writes first.
+    for (uint32_t back = 1u; back <= m_inFlightCount; ++back)
+    {
+        const InFlightWrite &entry = m_inFlight[(m_inFlightNext + kInFlightWrites - back) % kInFlightWrites];
+        if (entry.readyCycle > m_cycle)
+        {
+            applyInFlightWrite(entry, false);
+            m_inFlightHidden = true;
+        }
+    }
+}
+
+void VU1Interpreter::revealInFlightWrites()
+{
+    if (!m_inFlightHidden)
+        return;
+    m_inFlightHidden = false;
+    for (uint32_t forward = m_inFlightCount; forward > 0u; --forward)
+    {
+        const InFlightWrite &entry = m_inFlight[(m_inFlightNext + kInFlightWrites - forward) % kInFlightWrites];
+        if (entry.readyCycle > m_cycle) // hidden at the end of the previous run (the clock has not moved)
+            applyInFlightWrite(entry, true);
+    }
+}
+
 void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
                              uint8_t *vuData, uint32_t dataSize,
                              GS &gs, PS2Memory *memory,
@@ -1525,6 +1588,12 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     const uint64_t budgetEnd = m_cycle + maxCycles;
     bool programEnded = false;
     commitReadyPipelines(); // afterwards every clock advance commits what became ready
+    revealInFlightWrites();
+    // Only short time slices can stop with writes in flight that a caller then inspects; run-to-completion
+    // budgets (VIF MSCAL/MSCNT) skip the logging.
+    m_logInFlight = maxCycles < (1u << 20);
+    if (!m_logInFlight)
+        m_inFlightCount = 0u;
     while (m_cycle < budgetEnd && !m_stopRequested)
     {
         if (m_state.pc + 8u > codeSize)
@@ -1567,8 +1636,26 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         }
 
         // Results are written immediately. Every reader stalls until its operands' latency has elapsed
-        // (calculatePairReadyCycle), so the delayed writeback is unobservable; only the same-pair case
-        // (lower reads the register upper writes) needs the old value.
+        // (calculatePairReadyCycle), so the delayed writeback is unobservable inside a run; only the same-pair
+        // case (lower reads the register upper writes) needs the old value. A run that stops on its cycle
+        // budget hides writes still in flight (logInFlightWrites / hideInFlightWrites).
+        const VfAccess upperWrite = decoded.upperUsage.vfWrite;
+        const VfAccess lowerWrite = decoded.lowerUsage.vfWrite;
+        const bool logLowerVf = lowerWrite.reg != 0u && decoded.suppressedLowerVf != lowerWrite.reg &&
+                                lowerWrite.reg != upperWrite.reg;
+        alignas(16) float oldUpperVf[4];
+        alignas(16) float oldLowerVf[4];
+        alignas(16) float oldAcc[4];
+        if (m_logInFlight)
+        {
+            if (upperWrite.reg != 0u)
+                std::memcpy(oldUpperVf, m_state.vf[upperWrite.reg], sizeof(oldUpperVf));
+            if (logLowerVf)
+                std::memcpy(oldLowerVf, m_state.vf[lowerWrite.reg], sizeof(oldLowerVf));
+            if (decoded.upperUsage.accWrite != 0u)
+                std::memcpy(oldAcc, m_state.acc, sizeof(oldAcc));
+        }
+
         if (decoded.iBit)
         {
             execUpper(decoded.upper);
@@ -1604,6 +1691,31 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         m_viBranchBackupValid = false;
 
         markPairWrites(decoded);
+        if (m_logInFlight && upperWrite.reg != 0u)
+        {
+            const uint32_t latency =
+                decoded.upperUsage.vfLatency != 0u ? decoded.upperUsage.vfLatency : decoded.upperUsage.latency;
+            logInFlightWrite(InFlightWrite::Kind::Vf, upperWrite.reg, upperWrite.lanes, m_cycle + latency, oldUpperVf,
+                             m_state.vf[upperWrite.reg]);
+        }
+        if (m_logInFlight && logLowerVf)
+        {
+            const uint32_t latency =
+                decoded.lowerUsage.vfLatency != 0u ? decoded.lowerUsage.vfLatency : decoded.lowerUsage.latency;
+            logInFlightWrite(InFlightWrite::Kind::Vf, lowerWrite.reg, lowerWrite.lanes, m_cycle + latency, oldLowerVf,
+                             m_state.vf[lowerWrite.reg]);
+        }
+        if (m_logInFlight && decoded.upperUsage.accWrite != 0u)
+            logInFlightWrite(InFlightWrite::Kind::Acc, 0u, decoded.upperUsage.accWrite, m_cycle + kAccForwardLatency,
+                             oldAcc, m_state.acc);
+        if (m_logInFlight && writtenVi != 0u)
+        {
+            const uint32_t latency =
+                decoded.lowerUsage.viLatency != 0u ? decoded.lowerUsage.viLatency : decoded.lowerUsage.latency;
+            const float oldValue[4] = {static_cast<float>(oldVi), 0.0f, 0.0f, 0.0f};
+            const float newValue[4] = {static_cast<float>(m_state.vi[writtenVi]), 0.0f, 0.0f, 0.0f};
+            logInFlightWrite(InFlightWrite::Kind::Vi, writtenVi, 0x8u, m_cycle + latency, oldValue, newValue);
+        }
         if (writtenVi != 0u && decoded.lowerUsage.delaysNextBranchRead)
             recordViWriteForBranch(writtenVi, oldVi);
 
@@ -1663,6 +1775,9 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         if (programEnded)
             break;
     }
+
+    if (!programEnded)
+        hideInFlightWrites();
 
     // Small budgets are deliberate time slices; a run-to-completion budget that expires means a
     // runaway program.
