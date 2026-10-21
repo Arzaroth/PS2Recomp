@@ -33,6 +33,7 @@ namespace ps2x::iop::detail
         m_hardware.clear();
         m_allocations.clear();
         m_heapCursor = HeapBase;
+        m_moduleTop = HeapBase;
         m_interruptStatus = 0;
         m_interruptMask = 0;
         m_interruptControl = 1;
@@ -316,7 +317,14 @@ namespace ps2x::iop::detail
                 break;
         }
         if (candidate > HeapLimit || size > HeapLimit - candidate)
-            return 0u;
+        {
+            candidate = findLowArenaGap(size, alignment, nullptr);
+            if (candidate == 0u)
+                return 0u;
+            m_allocations.push_back({candidate, size});
+            markOwned(candidate, size);
+            return candidate;
+        }
         m_allocations.push_back({candidate, size});
         markOwned(candidate, size);
         m_heapCursor = std::max(m_heapCursor, candidate + size);
@@ -339,7 +347,59 @@ namespace ps2x::iop::detail
 
     uint32_t IopMemory::maxFreeMemory() const
     {
-        return m_heapCursor < HeapLimit ? HeapLimit - m_heapCursor : 0u;
+        uint32_t largestLowGap = 0u;
+        (void)findLowArenaGap(0xFFFFFFFFu, 16u, &largestLowGap);
+        const uint32_t heapWindow = m_heapCursor < HeapLimit ? HeapLimit - m_heapCursor : 0u;
+        return std::max(heapWindow, largestLowGap);
+    }
+
+    void IopMemory::setModuleTop(uint32_t moduleTop) noexcept
+    {
+        // m_moduleTop == HeapBase means no module is loaded yet (no low arena available).
+        const uint32_t top = (m_moduleTop >= HeapBase) ? moduleTop : std::max(m_moduleTop, moduleTop);
+        m_moduleTop = std::min(top, HeapBase);
+    }
+
+    bool IopMemory::overlapsAllocation(uint32_t address, uint32_t size) const
+    {
+        for (const auto &block : m_allocations)
+            if (address < block.address + block.size && block.address < address + size)
+                return true;
+        return false;
+    }
+
+    uint32_t IopMemory::findLowArenaGap(uint32_t size, uint32_t alignment, uint32_t *largestGap) const
+    {
+        // First fit between the end of the loaded modules (plus a guard page) and HeapBase.
+        constexpr uint32_t kModuleGuard = 0x1000u;
+        if (m_moduleTop >= HeapBase || HeapBase - m_moduleTop <= kModuleGuard)
+            return 0u;
+        std::vector<Allocation> blocks;
+        for (const auto &block : m_allocations)
+            if (block.address < HeapBase)
+                blocks.push_back(block);
+        std::sort(blocks.begin(), blocks.end(), [](const Allocation &l, const Allocation &r)
+                  { return l.address < r.address; });
+
+        uint32_t cursor = m_moduleTop + kModuleGuard;
+        auto consider = [&](uint32_t gapEnd) -> uint32_t
+        {
+            const uint32_t start = alignUp(cursor, alignment);
+            if (start >= gapEnd)
+                return 0u;
+            if (largestGap)
+                *largestGap = std::max(*largestGap, gapEnd - start);
+            return (size <= gapEnd - start) ? start : 0u;
+        };
+        for (const auto &block : blocks)
+        {
+            if (block.address + block.size <= cursor)
+                continue;
+            if (const uint32_t found = consider(block.address))
+                return found;
+            cursor = std::max(cursor, block.address + block.size);
+        }
+        return consider(HeapBase);
     }
 
     std::optional<IopMemory::Allocation> IopMemory::allocationContaining(uint32_t address) const

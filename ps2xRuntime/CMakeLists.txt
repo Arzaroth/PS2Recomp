@@ -512,6 +512,15 @@ target_link_libraries(ps2EntryRunner
     ps2_runtime
 )
 
+# Opt-in sampling profiler (PS2X_PROFILE=<seconds>, Windows only). It includes <windows.h>, which clashes
+# with raylib names inside unity batches, so it is compiled on its own.
+if(WIN32 AND NOT PS2X_IS_ANDROID AND NOT PS2X_IS_VITA)
+    set(PS2X_SAMPLING_PROFILER_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/src/profiling/sampling_profiler.cpp")
+    target_sources(ps2EntryRunner PRIVATE "${PS2X_SAMPLING_PROFILER_SOURCE}")
+    set_source_files_properties("${PS2X_SAMPLING_PROFILER_SOURCE}" PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
+    target_link_libraries(ps2EntryRunner PRIVATE winmm)
+endif()
+
 if(PS2X_ENABLE_DEBUG_UI AND NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
     target_sources(ps2EntryRunner PRIVATE
         src/lib/ps2_debug_panel.cpp
@@ -552,6 +561,12 @@ if(PS2X_IS_VITA)
             ${PS2X_VITA_VPK_FILES}
         )
     endif()
+endif()
+
+# "Fast" is a local /O2 config without LTCG (the generated code is too large to link with /GL in
+# reasonable time); give the runtime library itself full inlining, it holds the software rasterizer.
+if(MSVC AND CMAKE_BUILD_TYPE STREQUAL "Fast")
+    target_compile_options(ps2_runtime PRIVATE /Ob2 /Oi /GS-)
 endif()
 
 if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")

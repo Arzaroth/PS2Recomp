@@ -371,6 +371,21 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
         return true;
     }
 
+    // Guest code that runs slower than real time (busy-wait loops) would otherwise stretch
+    // VBlank and timer events; once the host deadline has passed, fast-forward to the event.
+    if (nextEventCycle != 0u && (++m_hostCatchUpPoll & 0xFFu) == 0u)
+    {
+        const auto hostDeadline = std::chrono::steady_clock::time_point(
+            std::chrono::steady_clock::duration(m_nextDeadlineHostTicks.load(std::memory_order_acquire)));
+        if (std::chrono::steady_clock::now() >= hostDeadline)
+        {
+            accountCycles(static_cast<uint32_t>(std::min<uint64_t>(nextEventCycle - m_eeCycle,
+                                                                   std::numeric_limits<uint32_t>::max())));
+            m_checkpointPending.store(true, std::memory_order_release);
+            return true;
+        }
+    }
+
     if (m_eeCycle < m_sliceEndCycle)
     {
         return false;
@@ -1901,6 +1916,8 @@ void EeScheduler::processEvent(const EeEvent &event)
             queueInvocation(std::move(invocation));
         }
         dispatchIrq(false, 2u);
+        // Catch GS SIGNAL/FINISH raised asynchronously by the GS frontend.
+        m_runtime.pollGsInterrupt(m_rdram);
         break;
     case EeEventType::ExternalWake:
         completeExternalWait(event.id, event.value, KE_OK);
@@ -1909,6 +1926,9 @@ void EeScheduler::processEvent(const EeEvent &event)
         dispatchIrq(false, 3u);
         break;
     case EeEventType::Dmac:
+        break;
+    case EeEventType::GsInterrupt:
+        m_runtime.pollGsInterrupt(m_rdram);
         break;
     case EeEventType::Alarm:
     {
@@ -2083,6 +2103,7 @@ void EeScheduler::updateNextDeadline()
                                          return left.sequence < right.sequence;
                                      });
     m_nextDeadlineCycle.store(it->deadlineCycle, std::memory_order_release);
+    m_nextDeadlineHostTicks.store(it->hostDeadline.time_since_epoch().count(), std::memory_order_release);
 }
 
 bool EeScheduler::hasReadyAtOrAbovePriority(int priority) const

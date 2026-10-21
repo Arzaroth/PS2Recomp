@@ -236,6 +236,7 @@ enum class EeEventType : uint8_t
     Dmac,
     ExternalWake,
     Alarm,
+    GsInterrupt, // GS raised SIGNAL/FINISH; dispatch INTC cause 0 now rather than at the next VBlank
 };
 
 struct EeEvent
@@ -449,6 +450,9 @@ private:
     uint32_t m_gsVSyncCallbackSp = 0;
     std::unordered_map<uint64_t, uint32_t> m_invocationStackTops;
     std::atomic<uint64_t> m_nextDeadlineCycle{0};
+    // Host deadline of the event at m_nextDeadlineCycle; lets slow guest code catch up to wall-clock time.
+    std::atomic<std::chrono::steady_clock::rep> m_nextDeadlineHostTicks{0};
+    uint32_t m_hostCatchUpPoll = 0;
 
     mutable std::mutex m_snapshotMutex;
     EeKernelSnapshot m_snapshot;

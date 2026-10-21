@@ -37,6 +37,9 @@ namespace ps2_stubs
 #define EM_MIPS 8            // MIPS architecture
 #define PT_LOAD 1            // Loadable segment
 
+// Runtime that receives GS SIGNAL/FINISH edge notifications (see ps2NotifyGsCsrEdge).
+static std::atomic<PS2Runtime *> g_gsCsrEdgeRuntime{nullptr};
+
 static constexpr int FB_WIDTH = 640;
 static constexpr int FB_HEIGHT = 512;
 static constexpr int DEFAULT_DISPLAY_HEIGHT = 448;
@@ -475,6 +478,35 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     outWidth = width;
     outHeight = height;
     s_hasUploadedFrame = true;
+
+    // Unattended frame capture: PS2X_CAPTURE_DIR=<folder> saves the presented guest frame as
+    // frame_<seconds>.png every PS2X_CAPTURE_INTERVAL seconds (default 5), independent of window focus.
+    static const char *s_captureDir = std::getenv("PS2X_CAPTURE_DIR");
+    if (s_captureDir && *s_captureDir && width != 0u && height != 0u)
+    {
+        static const double s_captureInterval = []()
+        {
+            const char *value = std::getenv("PS2X_CAPTURE_INTERVAL");
+            const double parsed = value ? std::atof(value) : 0.0;
+            return parsed > 0.0 ? parsed : 5.0;
+        }();
+        static const auto s_captureStart = std::chrono::steady_clock::now();
+        static double s_nextCapture = s_captureInterval;
+        const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - s_captureStart).count();
+        if (elapsed >= s_nextCapture)
+        {
+            s_nextCapture += s_captureInterval;
+            Image image{};
+            image.data = s_uploadBuffer.data();
+            image.width = FB_WIDTH;
+            image.height = static_cast<int>(std::min<uint32_t>(height, FB_HEIGHT));
+            image.mipmaps = 1;
+            image.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+            char path[1024];
+            std::snprintf(path, sizeof(path), "%s/frame_%06d.png", s_captureDir, static_cast<int>(elapsed * 10.0));
+            ExportImage(image, path);
+        }
+    }
 }
 
 PS2Runtime::PS2Runtime()
@@ -483,6 +515,7 @@ PS2Runtime::PS2Runtime()
     m_iopSubsystem = std::make_unique<ps2x::iop::IopSubsystem>(*m_iopHost);
 
     m_eeScheduler = std::make_unique<EeScheduler>(*this);
+    g_gsCsrEdgeRuntime.store(this, std::memory_order_release);
 
     // Assign rather than memset: R5900Context's constructor zeroes itself and
     // then applies the COP0 reset values, which a memset here would discard.
@@ -526,6 +559,8 @@ void PS2Runtime::setDebugUiCallbacks(DebugUiCallback initCallback,
 
 PS2Runtime::~PS2Runtime()
 {
+    PS2Runtime *expected = this;
+    g_gsCsrEdgeRuntime.compare_exchange_strong(expected, nullptr);
     try
     {
         requestStop();
@@ -1489,6 +1524,20 @@ void PS2Runtime::drainCompletedDmacHandlers(uint8_t *rdram)
     {
         ps2_syscalls::dispatchDmacHandlersForCause(rdram, this, cause);
     }
+    pollGsInterrupt(rdram);
+}
+
+void PS2Runtime::pollGsInterrupt(uint8_t *rdram)
+{
+    (void)rdram;
+    // Edges are recorded by the GS when CSR SIGNAL (bit0) / FINISH (bit1) go 0->1;
+    // IMR bit8 SIGMSK / bit9 FINISHMSK (1 = masked) suppress the interrupt.
+    const uint32_t rising = g_gsCsrRaisedEdges.exchange(0u, std::memory_order_acq_rel);
+    const uint32_t unmasked = rising & ~static_cast<uint32_t>(m_memory.gs().imr >> 8) & 0x3u;
+    if (unmasked != 0u)
+    {
+        eeScheduler().dispatchIrq(false, 0u);
+    }
 }
 
 void PS2Runtime::handleTrap(uint8_t *rdram, R5900Context *ctx)
@@ -2202,6 +2251,13 @@ EeScheduler &PS2Runtime::eeScheduler()
 const EeScheduler &PS2Runtime::eeScheduler() const
 {
     return *m_eeScheduler;
+}
+
+// Called by the GS (possibly on its worker thread) when CSR SIGNAL/FINISH rises.
+void ps2NotifyGsCsrEdge()
+{
+    if (PS2Runtime *runtime = g_gsCsrEdgeRuntime.load(std::memory_order_acquire))
+        runtime->postEeEvent(EeEvent{EeEventType::GsInterrupt, 0u, 0u});
 }
 
 void PS2Runtime::postEeEvent(EeEvent event)

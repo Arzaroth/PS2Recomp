@@ -432,13 +432,14 @@ namespace ps2x::iop::detail
         if (relocate)
         {
             base = alignUp(moduleCursor, 0x100u);
-            if (base + span >= IopMemory::HeapBase)
+            if (base + span >= IopMemory::HeapBase || memory.overlapsAllocation(base, span))
             {
                 result.error = IopImageLoadError::ArenaExhausted;
                 return result;
             }
             delta = static_cast<int64_t>(base) - minVaddr;
             result.nextModuleCursor = base + span;
+            memory.setModuleTop(base + span);
         }
         else
         {

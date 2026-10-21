@@ -58,6 +58,10 @@ namespace ps2x::iop::detail
         [[nodiscard]] uint32_t allocate(uint32_t size, uint32_t alignment = 16u, std::optional<uint32_t> fixed = std::nullopt);
         [[nodiscard]] bool freeAllocation(uint32_t address);
         [[nodiscard]] uint32_t maxFreeMemory() const;
+        // Loaded modules occupy [kModuleLoadBase, moduleTop); free RAM between moduleTop and HeapBase
+        // backs heap requests that do not fit the heap window (real SysMem serves both from one pool).
+        void setModuleTop(uint32_t moduleTop) noexcept;
+        [[nodiscard]] bool overlapsAllocation(uint32_t address, uint32_t size) const;
         [[nodiscard]] std::optional<Allocation> allocationContaining(uint32_t address) const;
 
         [[nodiscard]] uint32_t interruptStatus() const noexcept { return m_interruptStatus; }
@@ -76,6 +80,7 @@ namespace ps2x::iop::detail
         [[nodiscard]] uint32_t readHardware32(uint32_t address) const;
         void writeHardware32(uint32_t address, uint32_t value);
         void markOwned(uint32_t address, size_t size);
+        [[nodiscard]] uint32_t findLowArenaGap(uint32_t size, uint32_t alignment, uint32_t *largestGap) const;
 
         std::vector<uint8_t> m_ram;
         std::vector<uint8_t> m_owned;
@@ -83,6 +88,7 @@ namespace ps2x::iop::detail
         std::unordered_map<uint32_t, uint32_t> m_hardware;
         std::vector<Allocation> m_allocations;
         uint32_t m_heapCursor = HeapBase;
+        uint32_t m_moduleTop = HeapBase;
         uint32_t m_interruptStatus = 0;
         uint32_t m_interruptMask = 0;
         uint32_t m_interruptControl = 1;

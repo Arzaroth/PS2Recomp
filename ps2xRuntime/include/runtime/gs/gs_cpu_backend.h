@@ -4,6 +4,7 @@
 #include "runtime/gs/gs_texture_page_cache.h"
 
 #include <array>
+#include <functional>
 #include <mutex>
 #include <vector>
 
@@ -73,6 +74,35 @@ private:
     std::array<uint16_t, 512> m_clut{};
     std::array<uint32_t, 2> m_clutCbp{};
     GSMem::TexturePageCache m_texturePageCache;
+
+    // Lazily decoded RGBA texels of the texture bound to the primitive being drawn. A texel is valid
+    // when its stamp equals the epoch; the epoch advances when the texture identity, its VRAM pages
+    // (GSMem::g_pageWriteGeneration) or the CLUT buffer change.
+    struct TexelCacheKey
+    {
+        uint32_t tbp0 = 0;
+        uint32_t tbw = 0;
+        uint32_t psm = 0;
+        uint32_t cpsm = 0;
+        uint32_t csm = 0;
+        uint32_t csa = 0;
+        uint32_t width = 0;
+        uint32_t height = 0;
+        uint32_t texa = 0;
+        uint32_t clutGeneration = 0;
+        bool operator==(const TexelCacheKey &) const = default;
+    };
+    void PrepareTexelCache(const GSDrawState &state);
+    // Runs row(y) for y in [y0, y1]; splits large primitives across worker threads when every pixel
+    // write lands in its own bytes (16/32-bit frame and Z formats).
+    void ForEachRow(const GSDrawState &state, int y0, int y1, int width, const std::function<void(int)> &row);
+    TexelCacheKey m_texelCacheKey{};
+    const GSDrawState *m_texelCacheOwner = nullptr;
+    std::vector<uint32_t> m_texelCache;
+    std::vector<uint32_t> m_texelCacheStamp;
+    uint32_t m_texelCacheEpoch = 1u;
+    std::vector<std::pair<uint32_t, uint32_t>> m_texelCachePages; // (page, write generation)
+    uint32_t m_clutGeneration = 0u;
 
     GSTransferCommand m_transfer{};
     GSTransferSnapshot m_transferState{};
