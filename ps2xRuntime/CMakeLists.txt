@@ -531,6 +531,16 @@ endif()
 
 ps2x_stage_ffmpeg_runtime_dlls(ps2EntryRunner)
 
+# Offline VU1 interpreter check/benchmark against runs recorded with PS2X_VU1_RECORD.
+if(NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
+    add_executable(ps2_vu1_replay tools/ps2_vu1_replay.cpp)
+    target_link_libraries(ps2_vu1_replay PRIVATE ps2_runtime)
+    if(WIN32)
+        target_sources(ps2_vu1_replay PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/profiling/sampling_profiler.cpp")
+    endif()
+    ps2x_stage_ffmpeg_runtime_dlls(ps2_vu1_replay)
+endif()
+
 if(PS2X_IS_VITA)
     set(VITA_MKSFOEX_FLAGS "${VITA_MKSFOEX_FLAGS} -d PARENTAL_LEVEL=1") 
     set(VITA_MKSFOEX_FLAGS "${VITA_MKSFOEX_FLAGS} -d ATTRIBUTE2=12")

@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <iostream>
 #include <sstream>
 
@@ -106,14 +107,171 @@ namespace
 }
 
 
+namespace
+{
+    thread_local bool t_onGsWorker = false;
+    // Back-pressure: the EE waits once this much packet data is queued ahead of the GS thread.
+    constexpr size_t kMaxQueuedBytes = 32u * 1024u * 1024u;
+}
+
 GS::GS()
     : m_backend(std::make_unique<GSCpuBackend>())
 {
     reset();
 }
 
+GS::~GS()
+{
+    {
+        std::lock_guard<std::mutex> lock(m_queueMutex);
+        m_stopWorker = true;
+    }
+    m_queueReady.notify_all();
+    if (m_worker.joinable())
+        m_worker.join();
+}
+
+bool GS::shouldQueue() const
+{
+    return m_asyncEnabled && !t_onGsWorker;
+}
+
+void GS::enqueue(QueuedCommand &&command)
+{
+    std::unique_lock<std::mutex> lock(m_queueMutex);
+    if (!m_worker.joinable())
+        m_worker = std::thread([this]() { workerLoop(); });
+    m_queueIdle.wait(lock, [this]() { return m_queuedBytes < kMaxQueuedBytes; });
+    m_queuedBytes += command.bytes.size();
+    m_queue.push_back(std::move(command));
+    lock.unlock();
+    m_queueReady.notify_one();
+}
+
+void GS::workerLoop()
+{
+    t_onGsWorker = true;
+    for (;;)
+    {
+        QueuedCommand command;
+        {
+            std::unique_lock<std::mutex> lock(m_queueMutex);
+            m_queueReady.wait(lock, [this]() { return m_stopWorker || !m_queue.empty(); });
+            if (m_queue.empty())
+                return;
+            command = std::move(m_queue.front());
+            m_queue.pop_front();
+            m_workerBusy = true;
+        }
+
+        const uint8_t *data = command.bytes.data();
+        const uint32_t size = static_cast<uint32_t>(command.bytes.size());
+        for (GS *target : {this, m_shadow.get()})
+        {
+            if (!target)
+                continue;
+            switch (command.kind)
+            {
+            case QueuedCommand::Kind::GifPacket:
+                target->processGIFPacket(data, size);
+                break;
+            case QueuedCommand::Kind::NativePackedGifPacket:
+                target->processNativePackedGIFPacketNow(data, size);
+                break;
+            case QueuedCommand::Kind::NativeImageUpload:
+                target->uploadImageNativeNow(command.registers[0], command.registers[1], command.registers[2],
+                                             command.registers[3], data, size);
+                break;
+            }
+        }
+
+        bool drained = false;
+        {
+            std::lock_guard<std::mutex> lock(m_queueMutex);
+            m_queuedBytes -= command.bytes.size();
+            drained = m_queue.empty();
+        }
+        // Batched primitives are finished once the EE has nothing more queued, before anyone waiting for
+        // idle can observe VRAM.
+        if (drained && m_backend)
+            m_backend->Flush();
+        if (drained && m_shadow)
+            compareShadowVram();
+        {
+            std::lock_guard<std::mutex> lock(m_queueMutex);
+            m_workerBusy = false;
+        }
+        m_queueIdle.notify_all();
+    }
+}
+
+void GS::submitGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+{
+    if (!data || sizeBytes < 16u)
+        return;
+    if (!shouldQueue())
+    {
+        processGIFPacket(data, sizeBytes);
+        return;
+    }
+    QueuedCommand command;
+    command.kind = QueuedCommand::Kind::GifPacket;
+    command.bytes.assign(data, data + sizeBytes);
+    enqueue(std::move(command));
+}
+
+void GS::compareShadowVram()
+{
+    if ((++m_shadowDrains & 0x3u) != 0u || !m_localMemoryStorage)
+        return;
+    static uint32_t comparisons = 0u, mismatches = 0u;
+    ++comparisons;
+    size_t differing = 0u, first = 0u;
+    const uint8_t *shadow = m_shadowVram.data();
+    for (size_t offset = 0; offset < m_shadowVram.size(); offset += 8u)
+    {
+        uint64_t a = 0u, b = 0u;
+        std::memcpy(&a, m_localMemoryStorage + offset, 8u);
+        std::memcpy(&b, shadow + offset, 8u);
+        if (a != b && differing++ == 0u)
+            first = offset;
+    }
+    if (differing != 0u && mismatches++ < 20u)
+        std::fprintf(stderr, "[gs-shadow-check] VRAM differs: %zu qwords, first at 0x%zx (comparison %u)\n", differing,
+                     first, comparisons);
+    if ((comparisons & 0xFFu) == 0u)
+        std::fprintf(stderr, "[gs-shadow-check] %u comparisons, %u mismatched\n", comparisons, mismatches);
+}
+
+void GS::waitForIdle()
+{
+    if (!m_asyncEnabled || t_onGsWorker)
+        return;
+    std::unique_lock<std::mutex> lock(m_queueMutex);
+    m_queueIdle.wait(lock, [this]() { return m_queue.empty() && !m_workerBusy; });
+}
+
 void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
 {
+    waitForIdle();
+    {
+        const char *sync = std::getenv("PS2X_GS_SYNC");
+        m_asyncEnabled = !m_isShadow && !(sync && *sync == '1');
+    }
+    if (!m_isShadow && std::getenv("PS2X_GS_BATCH"))
+    {
+        if (auto *cpu = dynamic_cast<GSCpuBackend *>(m_backend.get()))
+            cpu->setDeferralEnabled(true);
+    }
+    if (!m_isShadow && m_asyncEnabled && std::getenv("PS2X_GS_SHADOW_CHECK") && !m_shadow)
+    {
+        m_shadowVram.assign(vram, vram + vramSize);
+        m_shadow = std::make_unique<GS>();
+        m_shadow->m_isShadow = true;
+        m_shadow->init(m_shadowVram.data(), vramSize, nullptr);
+        if (auto *cpu = dynamic_cast<GSCpuBackend *>(m_shadow->m_backend.get()))
+            cpu->setDeferralEnabled(false);
+    }
     m_localMemoryStorage = vram;
     m_localMemorySize = vramSize;
     m_privRegs = privRegs;
@@ -125,6 +283,7 @@ void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
 
 void GS::reset()
 {
+    waitForIdle();
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     std::memset(m_ctx, 0, sizeof(m_ctx));
     m_prim = {};
@@ -648,6 +807,18 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     if (!data || sizeBytes < 16 || !m_backend)
         return;
+    // The backend may hold primitives for batched rasterization. On the GS thread they stay queued across
+    // packets until the queue runs dry (workerLoop); otherwise a packet's drawing completes when it ends.
+    struct FlushBackendAtEnd
+    {
+        GSRasterBackend &backend;
+        bool enabled;
+        ~FlushBackendAtEnd()
+        {
+            if (enabled)
+                backend.Flush();
+        }
+    } flushAtEnd{*m_backend, !t_onGsWorker};
 
     if (tryProcessNativeImageUploadPacket(data, sizeBytes))
         return;
@@ -756,9 +927,33 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 
 bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 {
+    if (!shouldQueue())
+        return processNativePackedGIFPacketNow(data, sizeBytes);
+    // Validation only looks at the packet, so the EE can still fall back when it fails.
+    if (!data || sizeBytes < 16u || !m_backend || !validatePackedGifPacket(data, sizeBytes))
+        return false;
+    QueuedCommand command;
+    command.kind = QueuedCommand::Kind::NativePackedGifPacket;
+    command.bytes.assign(data, data + sizeBytes);
+    enqueue(std::move(command));
+    return true;
+}
+
+bool GS::processNativePackedGIFPacketNow(const uint8_t *data, uint32_t sizeBytes)
+{
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     if (!data || sizeBytes < 16u || !m_backend)
         return false;
+    struct FlushBackendAtEnd
+    {
+        GSRasterBackend &backend;
+        bool enabled;
+        ~FlushBackendAtEnd()
+        {
+            if (enabled)
+                backend.Flush();
+        }
+    } flushAtEnd{*m_backend, !t_onGsWorker};
 
     if (!validatePackedGifPacket(data, sizeBytes))
         return false;
@@ -800,6 +995,29 @@ void GS::uploadImageNative(uint64_t bitbltbuf,
                            uint64_t trxdir,
                            const uint8_t *data,
                            uint32_t sizeBytes)
+{
+    if (!shouldQueue())
+    {
+        uploadImageNativeNow(bitbltbuf, trxpos, trxreg, trxdir, data, sizeBytes);
+        return;
+    }
+    QueuedCommand command;
+    command.kind = QueuedCommand::Kind::NativeImageUpload;
+    command.registers[0] = bitbltbuf;
+    command.registers[1] = trxpos;
+    command.registers[2] = trxreg;
+    command.registers[3] = trxdir;
+    if (data && sizeBytes != 0u)
+        command.bytes.assign(data, data + sizeBytes);
+    enqueue(std::move(command));
+}
+
+void GS::uploadImageNativeNow(uint64_t bitbltbuf,
+                              uint64_t trxpos,
+                              uint64_t trxreg,
+                              uint64_t trxdir,
+                              const uint8_t *data,
+                              uint32_t sizeBytes)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     uploadImageNativeUnlocked(bitbltbuf, trxpos, trxreg, trxdir, data, sizeBytes);
@@ -1079,6 +1297,9 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
 
 void GS::writeRegister(uint8_t regAddr, uint64_t value)
 {
+    waitForIdle(); // the EE needs every earlier packet applied first
+    if (m_shadow)
+        m_shadow->writeRegister(regAddr, value);
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     writeRegisterUnlocked(regAddr, value);
 }
@@ -1644,18 +1865,30 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
 
 bool GS::clearFramebufferContext(uint32_t contextIndex, uint32_t rgba)
 {
+    waitForIdle(); // the EE needs every earlier packet applied first
+    if (m_shadow)
+        m_shadow->clearFramebufferContext(contextIndex, rgba);
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     return m_backend && m_backend->ClearFramebuffer(m_ctx[(contextIndex != 0u) ? 1 : 0], rgba);
 }
 
 bool GS::clearActiveFramebuffer(uint32_t rgba)
 {
+    waitForIdle(); // the EE needs every earlier packet applied first
+    if (m_shadow)
+        m_shadow->clearActiveFramebuffer(rgba);
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     return m_backend && m_backend->ClearFramebuffer(activeContext(), rgba);
 }
 
 uint32_t GS::consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
 {
+    waitForIdle(); // the EE needs every earlier packet applied first
+    if (m_shadow && dst)
+    {
+        std::vector<uint8_t> discard(maxBytes);
+        m_shadow->consumeLocalToHostBytes(discard.data(), maxBytes);
+    }
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     return m_backend ? m_backend->ConsumeLocalToHostBytes(dst, maxBytes) : 0u;
 }

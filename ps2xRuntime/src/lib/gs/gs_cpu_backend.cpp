@@ -7,6 +7,7 @@
 #include "runtime/gs/ps2_gs_memory.h"
 #include "ps2_log.h"
 #include <atomic>
+#include <immintrin.h>
 #include <chrono>
 #include <algorithm>
 #include <cmath>
@@ -635,11 +636,16 @@ void GSCpuBackend::Initialize(uint8_t *vram, uint32_t vramSize)
 void GSCpuBackend::Reset()
 {
     std::lock_guard<std::mutex> lock(m_mutex);
+    FlushDeferredUnlocked();
     ResetUnlocked();
 }
 
 void GSCpuBackend::ResetUnlocked()
 {
+    for (TexelCacheSlot &slot : m_texelSlots)
+        slot.valid = false;
+    m_serialSlot = nullptr;
+    m_texelCacheOwner = nullptr;
     m_clut.fill(0u);
     ++m_clutGeneration;
     m_clutCbp.fill(0u);
@@ -652,17 +658,15 @@ void GSCpuBackend::ResetUnlocked()
     m_localToHostReadPos = 0u;
 }
 
-void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
-{
-    std::lock_guard<std::mutex> lock(m_mutex);
-    if (!m_vram || batch.vertexCount == 0u)
-        return;
-    DrawPrimitive(batch);
-}
-
 void GSCpuBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
+    // Queued primitives keep their slot's CLUT copy; only a CLUT read from pages they render to must wait.
+    {
+        const uint32_t clutPage = tex0.cbp / static_cast<uint32_t>(GSMem::BLOCKS_PER_PAGE);
+        if (DeferredTouchesPages(clutPage, clutPage + 2u, false))
+            FlushDeferredUnlocked();
+    }
     if (!m_vram || (!isFourBitIndexedPsm(tex0.psm) && !isEightBitIndexedPsm(tex0.psm)))
         return;
 
@@ -694,7 +698,11 @@ void GSCpuBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
         return;
     }
 
+    const std::array<uint16_t, 512> previous = m_clut;
+    const uint32_t previousGeneration = m_clutGeneration;
     LoadClutUnlocked(tex0, texclut);
+    if (m_clut == previous)
+        m_clutGeneration = previousGeneration; // same palette: keep texel caches valid
 }
 
 void GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
@@ -760,25 +768,42 @@ namespace
 
         bool available() const noexcept { return !m_threads.empty(); }
 
-        void run(int y0, int y1, const std::function<void(int)> &row)
+        void run(int y0, int y1, const std::function<void(int)> &row, int chunk = kRowsPerChunk)
         {
+            // One job at a time: different backends (e.g. the shadow-check GS) may rasterize concurrently.
+            std::lock_guard<std::mutex> jobLock(m_jobMutex);
             {
                 std::lock_guard<std::mutex> lock(m_mutex);
                 m_row = &row;
                 m_end = y1;
+                m_chunk = chunk;
                 m_next.store(y0, std::memory_order_relaxed);
-                m_pending = static_cast<uint32_t>(m_threads.size());
-                ++m_generation;
+                m_pending.store(static_cast<uint32_t>(m_threads.size()), std::memory_order_relaxed);
+                m_generation.store(m_generation.load(std::memory_order_relaxed) + 1u, std::memory_order_release);
             }
-            m_wake.notify_all();
+            if (m_sleepers.load(std::memory_order_acquire) != 0u)
+                m_wake.notify_all();
             work();
-            std::unique_lock<std::mutex> lock(m_mutex);
-            m_done.wait(lock, [this]() { return m_pending == 0u; });
+            // Workers usually finish within microseconds of the caller; spin before sleeping.
+            for (uint32_t spin = 0; m_pending.load(std::memory_order_acquire) != 0u; ++spin)
+            {
+                if (spin < kSpinIterations)
+                {
+                    _mm_pause();
+                    continue;
+                }
+                std::unique_lock<std::mutex> lock(m_mutex);
+                m_done.wait(lock, [this]() { return m_pending.load(std::memory_order_acquire) == 0u; });
+                break;
+            }
             m_row = nullptr;
         }
 
     private:
         static constexpr int kRowsPerChunk = 4;
+        // A few microseconds of polling bridge back-to-back primitives; longer spins steal the EE thread's core
+        // (hyper-threading siblings).
+        static constexpr uint32_t kSpinIterations = 2000u;
 
         RowWorkerPool()
         {
@@ -797,6 +822,7 @@ namespace
             {
                 std::lock_guard<std::mutex> lock(m_mutex);
                 m_stop = true;
+                m_generation.fetch_add(1u, std::memory_order_release);
             }
             m_wake.notify_all();
             for (std::thread &thread : m_threads)
@@ -807,10 +833,10 @@ namespace
         {
             for (;;)
             {
-                const int first = m_next.fetch_add(kRowsPerChunk, std::memory_order_relaxed);
+                const int first = m_next.fetch_add(m_chunk, std::memory_order_relaxed);
                 if (first > m_end)
                     return;
-                const int last = std::min(first + kRowsPerChunk - 1, m_end);
+                const int last = std::min(first + m_chunk - 1, m_end);
                 for (int y = first; y <= last; ++y)
                     (*m_row)(y);
             }
@@ -821,17 +847,31 @@ namespace
             uint64_t seen = 0u;
             for (;;)
             {
+                uint32_t spin = 0u;
+                while (m_generation.load(std::memory_order_acquire) == seen && spin < kSpinIterations)
+                {
+                    _mm_pause();
+                    ++spin;
+                }
+                if (m_generation.load(std::memory_order_acquire) == seen)
                 {
                     std::unique_lock<std::mutex> lock(m_mutex);
-                    m_wake.wait(lock, [&]() { return m_stop || m_generation != seen; });
+                    m_sleepers.fetch_add(1u, std::memory_order_acq_rel);
+                    m_wake.wait(lock, [&]() { return m_generation.load(std::memory_order_acquire) != seen; });
+                    m_sleepers.fetch_sub(1u, std::memory_order_acq_rel);
+                }
+                {
+                    std::lock_guard<std::mutex> lock(m_mutex);
                     if (m_stop)
                         return;
-                    seen = m_generation;
+                    seen = m_generation.load(std::memory_order_acquire);
                 }
                 work();
-                std::lock_guard<std::mutex> lock(m_mutex);
-                if (--m_pending == 0u)
+                if (m_pending.fetch_sub(1u, std::memory_order_acq_rel) == 1u)
+                {
+                    std::lock_guard<std::mutex> lock(m_mutex);
                     m_done.notify_one();
+                }
             }
         }
 
@@ -839,11 +879,14 @@ namespace
         std::mutex m_mutex;
         std::condition_variable m_wake;
         std::condition_variable m_done;
+        std::mutex m_jobMutex;
         const std::function<void(int)> *m_row = nullptr;
         std::atomic<int> m_next{0};
         int m_end = 0;
-        uint32_t m_pending = 0u;
-        uint64_t m_generation = 0u;
+        int m_chunk = kRowsPerChunk;
+        std::atomic<uint32_t> m_pending{0u};
+        std::atomic<uint64_t> m_generation{0u};
+        std::atomic<uint32_t> m_sleepers{0u};
         bool m_stop = false;
     };
 
@@ -900,8 +943,83 @@ namespace
     }
 }
 
+namespace
+{
+    // Rows owned by the current thread while it rasterizes a deferred batch: stripes of kBandStripeRows rows,
+    // stripe k belonging to band k % count. Inactive (count == 0) outside FlushDeferredUnlocked().
+    struct RowBand
+    {
+        int band = 0;
+        int count = 0;
+    };
+    constexpr int kBandStripeRows = 4;
+    thread_local RowBand t_rowBand;
+    // The batch's texture has been prepared in the texel cache (all textured primitives of a batch share it).
+
+
+    // VRAM page interval [first, end) touched by a frame/Z buffer of `width` pixels-per-row units and rows
+    // up to `lastRow`, or by a texture; conservative (whole page rows, one page of slack).
+    struct PageRange
+    {
+        uint32_t first = 0;
+        uint32_t end = 0;
+        bool overlaps(const PageRange &other) const { return first < other.end && other.first < end; }
+    };
+
+    uint32_t pageHeightForPsm(uint32_t psm)
+    {
+        switch (psm)
+        {
+        case GS_PSM_CT16:
+        case GS_PSM_CT16S:
+        case GS_PSM_Z16:
+        case GS_PSM_Z16S:
+        case GS_PSM_T8:
+            return 64u;
+        case GS_PSM_T4:
+            return 128u;
+        default:
+            return 32u;
+        }
+    }
+
+    // Pages of a frame/Z buffer drawn up to row `lastRow` (conservative).
+    PageRange targetPages(uint32_t basePage, uint32_t fbw, uint32_t psm, uint32_t lastRow)
+    {
+        const uint32_t pageRows = (lastRow + pageHeightForPsm(psm)) / pageHeightForPsm(psm);
+        return PageRange{basePage, basePage + std::max<uint32_t>(fbw, 1u) * pageRows + 1u};
+    }
+
+    // Pages of the bound texture (conservative).
+    PageRange texturePages(const GSDrawState &state)
+    {
+        const GSTex0Reg &tex = state.context.tex0;
+        const uint32_t first = tex.tbp0 / static_cast<uint32_t>(GSMem::BLOCKS_PER_PAGE);
+        const uint32_t pageRows =
+            (static_cast<uint32_t>(state.textureHeight) + pageHeightForPsm(tex.psm) - 1u) / pageHeightForPsm(tex.psm);
+        return PageRange{first, first + (std::max<uint32_t>(tex.tbw, 1u) + 1u) * pageRows + 2u};
+    }
+}
+
+thread_local GSCpuBackend::TexelCacheSlot *GSCpuBackend::t_texelSlot = nullptr;
+
 void GSCpuBackend::ForEachRow(const GSDrawState &state, int y0, int y1, int width, const std::function<void(int)> &row)
 {
+    if (t_rowBand.count != 0)
+    {
+        // Inside a deferred batch: this thread only owns its band's stripes.
+        const int stripes = t_rowBand.count;
+        int stripe = y0 / kBandStripeRows;
+        stripe += ((t_rowBand.band - stripe % stripes) + stripes) % stripes;
+        for (; stripe * kBandStripeRows <= y1; stripe += stripes)
+        {
+            const int first = std::max(y0, stripe * kBandStripeRows);
+            const int last = std::min(y1, stripe * kBandStripeRows + kBandStripeRows - 1);
+            for (int y = first; y <= last; ++y)
+                row(y);
+        }
+        return;
+    }
     constexpr int64_t kMinParallelPixels = 2048;
     const auto &ctx = state.context;
     const bool parallel = y1 - y0 >= 8 &&
@@ -917,7 +1035,7 @@ void GSCpuBackend::ForEachRow(const GSDrawState &state, int y0, int y1, int widt
     RowWorkerPool::instance().run(y0, y1, row);
 }
 
-void GSCpuBackend::PrepareTexelCache(const GSDrawState &state)
+GSCpuBackend::TexelCacheSlot *GSCpuBackend::PrepareTexelCache(const GSDrawState &state)
 {
     const auto &tex = state.context.tex0;
     TexelCacheKey key{};
@@ -962,42 +1080,66 @@ void GSCpuBackend::PrepareTexelCache(const GSDrawState &state)
     const uint32_t pageCount = std::min<uint32_t>(pagesPerRow * pageRows + 1u,
                                                   static_cast<uint32_t>(GSMem::WRITE_TRACK_PAGE_COUNT));
 
-    bool valid = key == m_texelCacheKey && m_texelCachePages.size() == pageCount;
-    for (uint32_t i = 0; valid && i < pageCount; ++i)
+    const auto pagesCurrent = [&](const TexelCacheSlot &slot)
     {
-        const uint32_t page = (firstPage + i) % static_cast<uint32_t>(GSMem::WRITE_TRACK_PAGE_COUNT);
-        valid = m_texelCachePages[i].first == page &&
-                m_texelCachePages[i].second == GSMem::g_pageWriteGeneration[page];
-    }
-
-    if (!valid)
-    {
-        const size_t texels = static_cast<size_t>(key.width) * key.height;
-        if (m_texelCache.size() != texels)
-        {
-            m_texelCache.assign(texels, 0u);
-            m_texelCacheStamp.assign(texels, 0u);
-            m_texelCacheEpoch = 0u;
-        }
-        if (++m_texelCacheEpoch == 0u)
-        {
-            std::fill(m_texelCacheStamp.begin(), m_texelCacheStamp.end(), 0u);
-            m_texelCacheEpoch = 1u;
-        }
-        m_texelCacheKey = key;
-        m_texelCachePages.resize(pageCount);
+        if (slot.pages.size() != pageCount)
+            return false;
         for (uint32_t i = 0; i < pageCount; ++i)
         {
             const uint32_t page = (firstPage + i) % static_cast<uint32_t>(GSMem::WRITE_TRACK_PAGE_COUNT);
-            m_texelCachePages[i] = {page, GSMem::g_pageWriteGeneration[page]};
+            if (slot.pages[i].first != page || slot.pages[i].second != GSMem::g_pageWriteGeneration[page])
+                return false;
         }
+        return true;
+    };
+
+    TexelCacheSlot *victim = nullptr;
+    for (size_t index = 0; index < m_texelSlots.size(); ++index)
+    {
+        TexelCacheSlot &slot = m_texelSlots[index];
+        if (slot.valid && slot.key == key && pagesCurrent(slot))
+        {
+            slot.lastUse = ++m_texelSlotClock;
+            return &slot;
+        }
+        if ((m_batchSlotMask & (1u << index)) != 0u)
+            continue; // queued primitives still sample this slot
+        if (!victim || !slot.valid || (victim->valid && slot.lastUse < victim->lastUse))
+            victim = &slot;
     }
-    m_texelCacheOwner = &state;
+    if (!victim)
+        return nullptr;
+
+    const size_t texels = static_cast<size_t>(key.width) * key.height;
+    if (victim->texels.size() != texels)
+    {
+        victim->texels.assign(texels, 0u);
+        victim->stamps.assign(texels, 0u);
+        victim->epoch = 0u;
+    }
+    if (++victim->epoch == 0u)
+    {
+        std::fill(victim->stamps.begin(), victim->stamps.end(), 0u);
+        victim->epoch = 1u;
+    }
+    victim->key = key;
+    victim->complete = false;
+    victim->clut = m_clut;
+    victim->pages.resize(pageCount);
+    for (uint32_t i = 0; i < pageCount; ++i)
+    {
+        const uint32_t page = (firstPage + i) % static_cast<uint32_t>(GSMem::WRITE_TRACK_PAGE_COUNT);
+        victim->pages[i] = {page, GSMem::g_pageWriteGeneration[page]};
+    }
+    victim->valid = true;
+    victim->lastUse = ++m_texelSlotClock;
+    return victim;
 }
 
 void GSCpuBackend::Flush()
 {
-    // CPU backend is immediate. GPU backends may submit command buffers here.
+    std::lock_guard<std::mutex> lock(m_mutex);
+    FlushDeferredUnlocked();
 }
 
 void GSCpuBackend::TextureFlush()
@@ -1008,7 +1150,8 @@ void GSCpuBackend::TextureFlush()
 
 void GSCpuBackend::Sync(GSSyncReason)
 {
-    // CPU backend is immediate. GPU backends may wait on fences/readbacks here.
+    std::lock_guard<std::mutex> lock(m_mutex);
+    FlushDeferredUnlocked();
 }
 
 uint32_t GSCpuBackend::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
@@ -1047,6 +1190,7 @@ uint32_t GSCpuBackend::ReadTextureVramUnlocked(uint32_t psm, uint32_t base, uint
 void GSCpuBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
+    FlushDeferredUnlocked();
     WriteVramUnlocked(psm, base, bw, x, y, value);
 }
 
@@ -1147,11 +1291,210 @@ namespace
     }
 }
 
+void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_vram || batch.vertexCount == 0u)
+        return;
+    dumpPrimitiveIfRequested(batch);
+    if (CanDefer(batch))
+    {
+        if (!m_deferred.empty())
+        {
+            // Batches reorder work between rows, so dependencies on queued primitives force a flush: sampling
+            // pages they render to, or rendering to pages they still sample from VRAM.
+            const GSContext &ctx = batch.state.context;
+            const uint32_t lastRow = ctx.scissor.y1;
+            const PageRange frame = targetPages(ctx.frame.fbp, ctx.frame.fbw, ctx.frame.psm, lastRow);
+            const PageRange zbuf = targetPages(ctx.zbuf.zbp, ctx.frame.fbw, ctx.zbuf.psm, lastRow);
+            bool hazard = DeferredTouchesPages(frame.first, frame.end, true, false) ||
+                          DeferredTouchesPages(zbuf.first, zbuf.end, true, false);
+            if (!hazard && batch.state.prim.tme)
+            {
+                const PageRange texture = texturePages(batch.state);
+                hazard = DeferredTouchesPages(texture.first, texture.end, false, true);
+            }
+            if (hazard)
+                FlushDeferredUnlocked();
+        }
+        int8_t slotIndex = -1;
+        if (batch.state.prim.tme)
+        {
+            TexelCacheSlot *slot = PrepareTexelCache(batch.state);
+            if (!slot)
+            {
+                FlushDeferredUnlocked();
+                slot = PrepareTexelCache(batch.state);
+            }
+            // Decode the whole texture now: queued primitives then no longer read its VRAM, so later uploads
+            // (games stream textures through one staging area) need not wait for them.
+            if (static_cast<size_t>(batch.state.textureWidth) * batch.state.textureHeight <= kMaxSnapshotTexels)
+                SnapshotTexelSlot(*slot, batch.state);
+            slotIndex = static_cast<int8_t>(slot - m_texelSlots.data());
+            m_batchSlotMask |= 1u << static_cast<uint32_t>(slotIndex);
+        }
+        m_deferred.push_back(batch);
+        m_deferredSlots.push_back(slotIndex);
+        if (m_deferred.size() >= kMaxDeferredPrimitives)
+            FlushDeferredUnlocked();
+        return;
+    }
+    FlushDeferredUnlocked();
+    DrawPrimitive(batch);
+}
+
+bool GSCpuBackend::DeferredTouchesPages(uint32_t firstPage, uint32_t endPage, bool includeTextures,
+                                        bool includeTargets) const
+{
+    const PageRange range{firstPage, endPage};
+    const GSContext *previous = nullptr;
+    if (includeTargets)
+    {
+        for (const GSPrimitiveBatch &primitive : m_deferred)
+        {
+            const GSContext &ctx = primitive.state.context;
+            if (previous && previous->frame.fbp == ctx.frame.fbp && previous->zbuf.zbp == ctx.zbuf.zbp &&
+                previous->frame.fbw == ctx.frame.fbw && previous->scissor.y1 == ctx.scissor.y1)
+                continue;
+            previous = &ctx;
+            const uint32_t rows = static_cast<uint32_t>(ctx.scissor.y1) + 1u;
+            const auto target = [rows](uint32_t basePage, uint32_t fbw, uint32_t psm)
+            {
+                const uint32_t pageRows = (rows + pageHeightForPsm(psm) - 1u) / pageHeightForPsm(psm);
+                return PageRange{basePage, basePage + std::max<uint32_t>(fbw, 1u) * pageRows + 1u};
+            };
+            if (range.overlaps(target(ctx.frame.fbp, ctx.frame.fbw, ctx.frame.psm)) ||
+                range.overlaps(target(ctx.zbuf.zbp, ctx.frame.fbw, ctx.zbuf.psm)))
+                return true;
+        }
+    }
+    if (includeTextures)
+    {
+        for (size_t index = 0; index < m_texelSlots.size(); ++index)
+        {
+            if ((m_batchSlotMask & (1u << index)) == 0u || m_texelSlots[index].complete)
+                continue;
+            for (const auto &page : m_texelSlots[index].pages)
+                if (page.first >= firstPage && page.first < endPage)
+                    return true;
+        }
+    }
+    return false;
+}
+
+void GSCpuBackend::FlushDeferredForTransferUnlocked(const GSTransferCommand &command)
+{
+    if (m_deferred.empty())
+        return;
+    const auto rectPages = [](uint32_t basePointer, uint32_t bufferWidth, uint32_t psm, uint32_t lastRow)
+    {
+        const uint32_t first = basePointer / static_cast<uint32_t>(GSMem::BLOCKS_PER_PAGE);
+        const uint32_t pageRows = (lastRow + pageHeightForPsm(psm)) / pageHeightForPsm(psm);
+        return PageRange{first, first + (std::max<uint32_t>(bufferWidth, 1u) + 1u) * pageRows + 2u};
+    };
+    const GSBitBltBuf &buf = command.bitbltbuf;
+    const PageRange destination =
+        rectPages(buf.dbp, buf.dbw, buf.dpsm, static_cast<uint32_t>(command.trxpos.dsay) + command.trxreg.rrh);
+    bool conflict = command.direction == 1u || // local->host reads VRAM the queue may still write
+                    DeferredTouchesPages(destination.first, destination.end, true);
+    if (!conflict && command.direction == 2u)
+    {
+        const PageRange source =
+            rectPages(buf.sbp, buf.sbw, buf.spsm, static_cast<uint32_t>(command.trxpos.ssay) + command.trxreg.rrh);
+        conflict = DeferredTouchesPages(source.first, source.end, false);
+    }
+    if (conflict)
+        FlushDeferredUnlocked();
+}
+
+bool GSCpuBackend::CanDefer(const GSPrimitiveBatch &batch) const
+{
+    const GSDrawState &state = batch.state;
+    const auto &ctx = state.context;
+    const bool rasterType = state.prim.type == GS_PRIM_SPRITE || state.prim.type == GS_PRIM_TRIANGLE ||
+                            state.prim.type == GS_PRIM_TRISTRIP || state.prim.type == GS_PRIM_TRIFAN;
+    if (!m_deferralEnabled || !rasterType || !hasPixelDistinctLayout(ctx.frame.psm) ||
+        !hasPixelDistinctLayout(ctx.zbuf.psm) || !RowWorkerPool::instance().available())
+        return false;
+    if (!state.prim.tme)
+        return true;
+
+    // Banded rasterization reorders writes and texture reads between rows, so a primitive that samples
+    // pages it (or its batch) may render to is drawn on its own.
+    const uint32_t rows = static_cast<uint32_t>(ctx.scissor.y1) + 1u;
+    const auto targetRange = [rows](uint32_t basePage, uint32_t fbw, uint32_t psm)
+    {
+        const uint32_t pageRows = (rows + pageHeightForPsm(psm) - 1u) / pageHeightForPsm(psm);
+        return PageRange{basePage, basePage + std::max<uint32_t>(fbw, 1u) * pageRows + 1u};
+    };
+    const PageRange frame = targetRange(ctx.frame.fbp, ctx.frame.fbw, ctx.frame.psm);
+    const PageRange zbuf = targetRange(ctx.zbuf.zbp, ctx.frame.fbw, ctx.zbuf.psm);
+    const uint32_t texPage = ctx.tex0.tbp0 / static_cast<uint32_t>(GSMem::BLOCKS_PER_PAGE);
+    const uint32_t texPageRows = (static_cast<uint32_t>(state.textureHeight) + pageHeightForPsm(ctx.tex0.psm) - 1u) /
+                                 pageHeightForPsm(ctx.tex0.psm);
+    const PageRange texture{texPage, texPage + (std::max<uint32_t>(ctx.tex0.tbw, 1u) + 1u) * texPageRows + 2u};
+    return !texture.overlaps(frame) && !texture.overlaps(zbuf);
+}
+
+void GSCpuBackend::FlushDeferredUnlocked()
+{
+    if (m_deferred.empty())
+        return;
+    if (m_deferred.size() == 1u)
+    {
+        const GSPrimitiveBatch only = m_deferred.front();
+        m_deferred.clear();
+        m_deferredSlots.clear();
+        m_batchSlotMask = 0u;
+        DrawPrimitive(only);
+        return;
+    }
+
+
+    // Every band walks the whole batch in order, rasterizing only its own rows: each pixel is still
+    // written by one thread in primitive order.
+    constexpr int kBands = 32;
+    RowWorkerPool::instance().run(0, kBands - 1, [&](int band)
+                                  {
+                                      const bool previousDefer = GSMem::t_deferPageWriteTracking;
+                                      GSMem::t_deferPageWriteTracking = true;
+                                      t_rowBand = {band, kBands};
+                                      for (size_t index = 0; index < m_deferred.size(); ++index)
+                                      {
+                                          const GSPrimitiveBatch &primitive = m_deferred[index];
+                                          const int8_t slot = m_deferredSlots[index];
+                                          t_texelSlot = slot >= 0 ? &m_texelSlots[static_cast<size_t>(slot)] : nullptr;
+                                          if (primitive.state.prim.type == GS_PRIM_SPRITE)
+                                              DrawSprite(primitive);
+                                          else
+                                              DrawTriangle(primitive);
+                                      }
+                                      t_rowBand = {};
+                                      t_texelSlot = nullptr;
+                                      GSMem::t_deferPageWriteTracking = previousDefer; }, 1);
+
+    const GSDrawState *marked = nullptr;
+    for (const GSPrimitiveBatch &primitive : m_deferred)
+    {
+        const GSContext &ctx = primitive.state.context;
+        if (marked && marked->context.frame.fbp == ctx.frame.fbp && marked->context.zbuf.zbp == ctx.zbuf.zbp &&
+            marked->context.frame.fbw == ctx.frame.fbw && marked->context.scissor.y0 == ctx.scissor.y0 &&
+            marked->context.scissor.y1 == ctx.scissor.y1 && marked->context.zbuf.zmask == ctx.zbuf.zmask &&
+            marked->context.frame.psm == ctx.frame.psm && marked->context.zbuf.psm == ctx.zbuf.psm)
+            continue;
+        markRenderTargetPagesWritten(ctx.frame, ctx.zbuf, ctx.scissor.y0, ctx.scissor.y1);
+        marked = &primitive.state;
+    }
+    m_texelCacheOwner = nullptr;
+    m_deferred.clear();
+    m_deferredSlots.clear();
+    m_batchSlotMask = 0u;
+}
+
 void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
 {
     const GSDrawState &state = batch.state;
     const auto &ctx = state.context;
-    dumpPrimitiveIfRequested(batch);
     PS2_IF_AGRESSIVE_LOGS({
         const uint32_t primitiveIndex = s_debugPrimitiveCount.fetch_add(1u, std::memory_order_relaxed);
         if (primitiveIndex < 64u)
@@ -1258,10 +1601,9 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
         }
     });
 
-    if (state.prim.tme)
-        PrepareTexelCache(state);
-    else
-        m_texelCacheOwner = nullptr;
+    // Drawn outside a batch: the queue is empty, so a slot is always available.
+    m_serialSlot = state.prim.tme ? PrepareTexelCache(state) : nullptr;
+    m_texelCacheOwner = m_serialSlot ? &state : nullptr;
 
     struct DeferredPageTracking
     {
@@ -1474,7 +1816,8 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
                                   uint8_t cpsm,
                                   uint8_t csm,
                                   uint8_t csa,
-                                  uint8_t sourcePsm)
+                                  uint8_t sourcePsm,
+                                  const uint16_t *clut)
 {
     const bool sixteenBit = cpsm == GS_PSM_CT16 || cpsm == GS_PSM_CT16S;
     const uint32_t csaMask = sixteenBit ? 0x1Fu : 0x0Fu;
@@ -1494,22 +1837,68 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
     {
     case GS_PSM_CT32:
     {
-        const uint32_t raw = static_cast<uint32_t>(m_clut[clutIndex]) | (static_cast<uint32_t>(m_clut[clutIndex + 256u]) << 16u);
+        const uint32_t raw = static_cast<uint32_t>(clut[clutIndex]) | (static_cast<uint32_t>(clut[clutIndex + 256u]) << 16u);
         return applyTexa(state.texa, cpsm, raw);
     }
     case GS_PSM_CT24:
     {
-        const uint32_t raw = static_cast<uint32_t>(m_clut[clutIndex]) | (static_cast<uint32_t>(m_clut[clutIndex + 256u]) << 16u);
+        const uint32_t raw = static_cast<uint32_t>(clut[clutIndex]) | (static_cast<uint32_t>(clut[clutIndex + 256u]) << 16u);
         return applyTexa(state.texa, cpsm, raw & 0x00FFFFFFu);
     }
     case GS_PSM_CT16:
     case GS_PSM_CT16S:
-        return applyTexa(state.texa, cpsm, Rgba5551ToRgba8888(m_clut[clutIndex]));
+        return applyTexa(state.texa, cpsm, Rgba5551ToRgba8888(clut[clutIndex]));
     default:
         break;
     }
 
     return 0xFFFF00FFu;
+}
+
+uint32_t GSCpuBackend::DecodeTexel(const GSDrawState &state, int u, int v, const uint16_t *clut)
+{
+    const auto &tex = state.context.tex0;
+    const u32 out = ReadTextureVramUnlocked(tex.psm, tex.tbp0, tex.tbw, u, v);
+    switch (tex.psm)
+    {
+    case GS_PSM_CT32:
+    case GS_PSM_Z32:
+    case GS_PSM_CT24:
+    case GS_PSM_Z24:
+        return applyTexa(state.texa, tex.psm, out);
+    case GS_PSM_CT16:
+    case GS_PSM_CT16S:
+    case GS_PSM_Z16:
+    case GS_PSM_Z16S:
+        return applyTexa(state.texa, tex.psm, Rgba5551ToRgba8888(out));
+    case GS_PSM_T8:
+    case GS_PSM_T8H:
+    case GS_PSM_T4:
+    case GS_PSM_T4HL:
+    case GS_PSM_T4HH:
+        return LookupCLUT(state, static_cast<u8>(out), tex.cpsm, tex.csm, tex.csa, tex.psm, clut);
+    }
+    return 0xFFFF00FFu;
+}
+
+void GSCpuBackend::SnapshotTexelSlot(TexelCacheSlot &slot, const GSDrawState &state)
+{
+    if (slot.complete)
+        return;
+    const int width = state.textureWidth;
+    const int height = state.textureHeight;
+    for (int v = 0; v < height; ++v)
+    {
+        const size_t row = static_cast<size_t>(v) * static_cast<size_t>(width);
+        for (int u = 0; u < width; ++u)
+        {
+            if (slot.stamps[row + static_cast<size_t>(u)] == slot.epoch)
+                continue;
+            slot.texels[row + static_cast<size_t>(u)] = DecodeTexel(state, u, v, slot.clut.data());
+            slot.stamps[row + static_cast<size_t>(u)] = slot.epoch;
+        }
+    }
+    slot.complete = true;
 }
 
 uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t, float q, uint16_t u, uint16_t v)
@@ -1540,33 +1929,11 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
         texVf = t * invQ * static_cast<float>(texH);
     }
 
-    const bool useTexelCache = m_texelCacheOwner == &state;
+    TexelCacheSlot *const slot = t_texelSlot ? t_texelSlot : (m_texelCacheOwner == &state ? m_serialSlot : nullptr);
+    const bool useTexelCache = slot != nullptr;
+    const uint16_t *const clut = slot ? slot->clut.data() : m_clut.data();
     auto decodeTexel = [&](int sampleU, int sampleV) -> uint32_t
-    {
-        u32 out = ReadTextureVramUnlocked(tex.psm, tex.tbp0, tex.tbw, sampleU, sampleV);
-
-        switch (tex.psm)
-        {
-        case GS_PSM_CT32:
-        case GS_PSM_Z32:
-        case GS_PSM_CT24:
-        case GS_PSM_Z24:
-            return applyTexa(state.texa, tex.psm, out);
-        case GS_PSM_CT16:
-        case GS_PSM_CT16S:
-        case GS_PSM_Z16:
-        case GS_PSM_Z16S:
-            return applyTexa(state.texa, tex.psm, Rgba5551ToRgba8888(out));
-        case GS_PSM_T8:
-        case GS_PSM_T8H:
-        case GS_PSM_T4:
-        case GS_PSM_T4HL:
-        case GS_PSM_T4HH:
-            return LookupCLUT(state, static_cast<u8>(out), tex.cpsm, tex.csm, tex.csa, tex.psm);
-        }
-
-        return 0xFFFF00FFu;
-    };
+    { return DecodeTexel(state, sampleU, sampleV, clut); };
 
     auto samplePoint = [&](int sampleU, int sampleV) -> uint32_t
     {
@@ -1575,12 +1942,12 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
         if (!useTexelCache || sampleU < 0 || sampleV < 0 || sampleU >= texW || sampleV >= texH)
             return decodeTexel(sampleU, sampleV);
         const size_t index = static_cast<size_t>(sampleV) * static_cast<size_t>(texW) + static_cast<size_t>(sampleU);
-        std::atomic_ref<uint32_t> stamp(m_texelCacheStamp[index]);
-        if (stamp.load(std::memory_order_acquire) == m_texelCacheEpoch)
-            return std::atomic_ref<uint32_t>(m_texelCache[index]).load(std::memory_order_relaxed);
+        std::atomic_ref<uint32_t> stamp(slot->stamps[index]);
+        if (stamp.load(std::memory_order_acquire) == slot->epoch)
+            return std::atomic_ref<uint32_t>(slot->texels[index]).load(std::memory_order_relaxed);
         const uint32_t texel = decodeTexel(sampleU, sampleV);
-        std::atomic_ref<uint32_t>(m_texelCache[index]).store(texel, std::memory_order_relaxed);
-        stamp.store(m_texelCacheEpoch, std::memory_order_release);
+        std::atomic_ref<uint32_t>(slot->texels[index]).store(texel, std::memory_order_relaxed);
+        stamp.store(slot->epoch, std::memory_order_release);
         return texel;
     };
 
@@ -1779,10 +2146,50 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
     const float invAbsDenom = 1.0f / std::fabs(denom);
     constexpr float kEdgeEpsilon = 1.0e-4f;
 
+    // Each barycentric weight is affine along a row: w = slope * px + offset. Solving w >= -epsilon for every
+    // edge gives the covered span; it is widened by a pixel and a tolerance so that rounding can never drop a
+    // pixel the exact per-pixel test below would accept.
+    const float slope0 = (fy1 - fy2) * winding * invAbsDenom;
+    const float slope1 = (fy2 - fy0) * winding * invAbsDenom;
+    const float slope2 = -slope0 - slope1;
+    const auto rowSpan = [&](float py, int &spanStart, int &spanEnd)
+    {
+        const float offset0 = ((fy1 - fy2) * -fx2 + (fx2 - fx1) * (py - fy2)) * winding * invAbsDenom;
+        const float offset1 = ((fy2 - fy0) * -fx2 + (fx0 - fx2) * (py - fy2)) * winding * invAbsDenom;
+        const float offset2 = 1.0f - offset0 - offset1;
+        float low = static_cast<float>(minX) - 1.0f;
+        float high = static_cast<float>(maxX) + 2.0f;
+        constexpr float kSpanTolerance = 1.0e-3f;
+        const auto constrain = [&](float slope, float offset)
+        {
+            // Relative tolerance covers the rounding of offset, which grows with the coordinates involved.
+            const float threshold = -kEdgeEpsilon - kSpanTolerance * (1.0f + std::fabs(offset));
+            if (std::fabs(slope) < 1.0e-7f)
+            {
+                if (offset < threshold)
+                    high = low - 1.0f; // edge excludes the whole row
+                return;
+            }
+            const float bound = (threshold - offset) / slope;
+            if (slope > 0.0f)
+                low = std::max(low, bound);
+            else
+                high = std::min(high, bound);
+        };
+        constrain(slope0, offset0);
+        constrain(slope1, offset1);
+        constrain(slope2, offset2);
+        // px = x + 0.5
+        spanStart = std::max(minX, static_cast<int>(std::floor(low - 0.5f)) - 1);
+        spanEnd = std::min(maxX, static_cast<int>(std::ceil(high - 0.5f)) + 1);
+    };
+
     const std::function<void(int)> rasterRow = [&](int y)
     {
         float py = static_cast<float>(y) + 0.5f;
-        for (int x = minX; x <= maxX; ++x)
+        int spanStart = minX, spanEnd = maxX;
+        rowSpan(py, spanStart, spanEnd);
+        for (int x = spanStart; x <= spanEnd; ++x)
         {
             float px = static_cast<float>(x) + 0.5f;
 
@@ -1859,7 +2266,11 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
             WritePixel(state, x, y, static_cast<u32>(z + 0.5), r, g, b, a, fog);
         }
     };
-    ForEachRow(state, minY, maxY, maxX - minX + 1, rasterRow);
+    // Rows only visit their covered span, so the triangle's area (not its bounding box) is the work.
+    const int rows = std::max(maxY - minY + 1, 1);
+    const int coveredWidth = static_cast<int>(std::min(std::fabs(denom) * 0.5f / static_cast<float>(rows),
+                                                       static_cast<float>(maxX - minX + 1)));
+    ForEachRow(state, minY, maxY, coveredWidth, rasterRow);
 }
 
 void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch)
@@ -1932,6 +2343,7 @@ void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch)
 void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
+    FlushDeferredForTransferUnlocked(command);
     m_transfer = command;
     m_transferState.x = command.trxpos.dsax;
     m_transferState.y = command.trxpos.dsay;
@@ -1949,6 +2361,8 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
 void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
+    // Primitives queued since BeginTransfer may sample the destination.
+    FlushDeferredForTransferUnlocked(m_transfer);
     if (!data || sizeBytes == 0u || !m_vram || m_transferState.direction != 0u)
         return;
     if (m_transfer.trxreg.rrw == 0u || m_transfer.trxreg.rrh == 0u || m_transferState.totalPixels == 0u)
@@ -2166,6 +2580,7 @@ void GSCpuBackend::PerformLocalToHostTransfer()
 uint32_t GSCpuBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
+    FlushDeferredUnlocked();
     if (!dst || maxBytes == 0u || m_localToHostReadPos >= m_localToHostBuffer.size())
         return 0u;
     const size_t count = std::min<size_t>(maxBytes, m_localToHostBuffer.size() - m_localToHostReadPos);
@@ -2178,6 +2593,7 @@ uint32_t GSCpuBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
 bool GSCpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
+    FlushDeferredUnlocked();
     if (!m_vram || context.frame.fbw == 0u)
         return false;
 

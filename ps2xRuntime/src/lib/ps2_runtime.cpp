@@ -23,11 +23,91 @@
 #include <limits>
 #include <chrono>
 #include <atomic>
+#include <chrono>
+#include "runtime/ps2_vu1_trace.h"
 #include <thread>
 #include <unordered_map>
 #include <sstream>
 
 extern std::atomic<uint32_t> g_gsDumpVu1ProgramPc;
+
+namespace
+{
+    // PS2X_VU1_RECORD=<file> (+ PS2X_VU1_RECORD_AT=<sec>, PS2X_VU1_RECORD_COUNT=<runs>, default 4000): records
+    // VU1 microprogram runs (inputs, outputs, PATH1 packets) for the ps2_vu1_replay tool.
+    class Vu1Recorder
+    {
+    public:
+        static Vu1Recorder &instance()
+        {
+            static Vu1Recorder recorder;
+            return recorder;
+        }
+
+        // Runs `body` (which executes VU1), recording it when recording is active.
+        template <typename Body>
+        void run(VU1Interpreter &vu1, PS2Memory &memory, bool resume, uint32_t startPC, uint32_t top, uint32_t itop,
+                 uint32_t maxCycles, Body &&body)
+        {
+            if (!m_out || m_remaining == 0u ||
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - m_start).count() < m_startAt)
+            {
+                body();
+                return;
+            }
+            Vu1TraceRecord record;
+            record.resume = resume ? 1u : 0u;
+            record.startPC = startPC;
+            record.top = top;
+            record.itop = itop;
+            record.maxCycles = maxCycles;
+            const uint64_t generation = memory.getVU1CodeGeneration();
+            if (!m_wroteCode || generation != m_codeGeneration)
+            {
+                record.code.assign(memory.getVU1Code(), memory.getVU1Code() + Vu1TraceRecord::kMemorySize);
+                m_codeGeneration = generation;
+                m_wroteCode = true;
+            }
+            record.stateBefore = vu1.state();
+            record.dataBefore.assign(memory.getVU1Data(), memory.getVU1Data() + Vu1TraceRecord::kMemorySize);
+            vu1.setPacketObserver([&record](const uint8_t *data, uint32_t size)
+                                  { record.packets.emplace_back(data, data + size); });
+            body();
+            vu1.setPacketObserver(nullptr);
+            record.stateAfter = vu1.state();
+            record.dataAfter.assign(memory.getVU1Data(), memory.getVU1Data() + Vu1TraceRecord::kMemorySize);
+            writeVu1TraceRecord(m_out, record);
+            std::fflush(m_out);
+            if (--m_remaining == 0u)
+            {
+                std::fclose(m_out);
+                m_out = nullptr;
+                std::fprintf(stderr, "[vu1-record] done\n");
+            }
+        }
+
+    private:
+        Vu1Recorder()
+        {
+            const char *path = std::getenv("PS2X_VU1_RECORD");
+            if (!path || !*path)
+                return;
+            m_out = std::fopen(path, "wb");
+            if (const char *at = std::getenv("PS2X_VU1_RECORD_AT"))
+                m_startAt = std::atof(at);
+            if (const char *count = std::getenv("PS2X_VU1_RECORD_COUNT"))
+                m_remaining = static_cast<uint32_t>(std::atoi(count));
+        }
+
+        FILE *m_out = nullptr;
+        double m_startAt = 0.0;
+        uint32_t m_remaining = 4000u;
+        uint64_t m_codeGeneration = 0u;
+        bool m_wroteCode = false;
+        // Process start (static initialization), not the first VU1 run.
+        static inline const std::chrono::steady_clock::time_point m_start = std::chrono::steady_clock::now();
+    };
+}
 
 namespace ps2_stubs
 {
@@ -703,7 +783,7 @@ bool PS2Runtime::syncCoreSubsystems()
 
     m_gs.init(gsVram, static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &m_memory.gs());
     m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
-                                    { m_gs.processGIFPacket(data, size); });
+                                    { m_gs.submitGIFPacket(data, size); });
     m_memory.setGifArbiter(&m_gifArbiter);
     m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t top, uint32_t itop)
                                  {
@@ -717,9 +797,10 @@ bool PS2Runtime::syncCoreSubsystems()
                                      m_vu1.state().tBitEnabled =
                                          (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
                                      g_gsDumpVu1ProgramPc.store(startPC, std::memory_order_relaxed);
-                                     m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
-                                                   m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
-                                                   m_gs, &m_memory, startPC, top, itop, 65536);
+                                     Vu1Recorder::instance().run(m_vu1, m_memory, false, startPC, top, itop, 65536, [&]
+                                                                 { m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
+                                                                                 m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
+                                                                                 m_gs, &m_memory, startPC, top, itop, 65536); });
                                      g_gsDumpVu1ProgramPc.store(~0u, std::memory_order_relaxed);
                                      cpuContext->vu0_vpu_stat =
                                          (cpuContext->vu0_vpu_stat & ~0x0600u) |
@@ -746,9 +827,10 @@ bool PS2Runtime::syncCoreSubsystems()
                                      m_vu1.state().tBitEnabled =
                                          (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
                                      g_gsDumpVu1ProgramPc.store(0x10000u | m_vu1.state().pc, std::memory_order_relaxed);
-                                     m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
-                                                  m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
-                                                  m_gs, &m_memory, top, itop, 65536);
+                                     Vu1Recorder::instance().run(m_vu1, m_memory, true, m_vu1.state().pc, top, itop, 65536, [&]
+                                                                 { m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
+                                                                                m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
+                                                                                m_gs, &m_memory, top, itop, 65536); });
                                      g_gsDumpVu1ProgramPc.store(~0u, std::memory_order_relaxed);
                                      cpuContext->vu0_vpu_stat =
                                          (cpuContext->vu0_vpu_stat & ~0x0600u) |
