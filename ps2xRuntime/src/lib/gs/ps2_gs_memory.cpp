@@ -220,6 +220,43 @@ namespace GSMem
         PixelStorageTraits<P4>::InitPageLookupTable(PageTableP4, BlockTableP4, ColumnTable4);
     }
 
+    template <PixelStorageMode psm, typename Table>
+    u32 pageOfPixel(const Table& table, u32 bp, u32 bw, u32 x, u32 y)
+    {
+        const u32 bits = PixelStorageTraits<psm>::Address(table, bp, bw, x, y) * UnpackedBitWidth(psm);
+        return ((bits / 8u) & (MEMORY_SIZE - 1u)) / GS_PAGE_SIZE;
+    }
+
+    u32 PageOf(u32 psm, u32 bp, u32 bw, u32 x, u32 y)
+    {
+        switch (static_cast<PixelStorageMode>(psm & 0x3Fu))
+        {
+        case C32:
+        case C24:
+        case P8H:
+        case P4HL:
+        case P4HH:
+            return pageOfPixel<C32>(PageTableC32, bp, bw, x, y);
+        case C16:
+            return pageOfPixel<C16>(PageTableC16, bp, bw, x, y);
+        case C16S:
+            return pageOfPixel<C16S>(PageTableC16S, bp, bw, x, y);
+        case P8:
+            return pageOfPixel<P8>(PageTableP8, bp, bw, x, y);
+        case P4:
+            return pageOfPixel<P4>(PageTableP4, bp, bw, x, y);
+        case Z32:
+        case Z24:
+            return pageOfPixel<Z32>(PageTableZ32, bp, bw, x, y);
+        case Z16:
+            return pageOfPixel<Z16>(PageTableZ16, bp, bw, x, y);
+        case Z16S:
+            return pageOfPixel<Z16S>(PageTableZ16S, bp, bw, x, y);
+        default:
+            return 0u;
+        }
+    }
+
     u32 ReadTexture(TexturePageCache& cache, const u8* data, u32 psm, u32 bp, u32 bw, u32 x, u32 y)
     {
         switch (static_cast<PixelStorageMode>(psm & 0x3Fu))

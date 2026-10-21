@@ -1003,6 +1003,34 @@ void register_ps2_gs_tests()
                 gs.writeRegister(GS_REG_UV, uv(16u, 16u));
                 gs.writeRegister(GS_REG_XYZ2, xyz(64u, 24u, 280u));
 
+                // 4-bit glyphs in the upper byte of a 24-bit buffer of another width (VP2's font):
+                // the CT24 drawing and the T4HL upload write the same words through different
+                // geometries.
+                gs.writeRegister(GS_REG_FRAME_1, 400ull | (10ull << 16) | (static_cast<uint64_t>(GS_PSM_CT24) << 24));
+                gs.writeRegister(GS_REG_SCISSOR_1, (639ull << 16) | (63ull << 48));
+                gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
+                gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_SPRITE));
+                gs.writeRegister(GS_REG_RGBAQ, 0x80204060ull);
+                gs.writeRegister(GS_REG_XYZ2, xyz(0u, 0u, 0u));
+                gs.writeRegister(GS_REG_XYZ2, xyz(640u, 64u, 0u));
+                gs.writeRegister(GS_REG_BITBLTBUF, (400ull * 32ull << 32) | (16ull << 48) |
+                                                       (static_cast<uint64_t>(GS_PSM_T4HL) << 56));
+                gs.writeRegister(GS_REG_TRXPOS, 0ull);
+                gs.writeRegister(GS_REG_TRXREG, 64ull | (40ull << 32));
+                gs.writeRegister(GS_REG_TRXDIR, 0ull);
+                std::vector<uint8_t> glyphs;
+                appendU64(glyphs, makeGifTag(80u, GIF_FMT_IMAGE, 0u, true));
+                appendU64(glyphs, 0ull);
+                for (uint32_t i = 0u; i < 1280u; ++i)
+                    glyphs.push_back(static_cast<uint8_t>((i * 7u) ^ (i >> 3)));
+                gs.processGIFPacket(glyphs.data(), static_cast<uint32_t>(glyphs.size()));
+                gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_SPRITE));
+                gs.writeRegister(GS_REG_RGBAQ, 0x80604020ull);
+                gs.writeRegister(GS_REG_XYZ2, xyz(0u, 16u, 0u));
+                gs.writeRegister(GS_REG_XYZ2, xyz(640u, 48u, 0u));
+                gs.writeRegister(GS_REG_SCISSOR_1, kScissor);
+                gs.writeRegister(GS_REG_FRAME_1, kFrame);
+
                 // Render to texture: draw into an offscreen buffer, then sample it (the queue
                 // orders this with a barrier).
                 gs.writeRegister(GS_REG_FRAME_1, 8ull | (1ull << 16) | (static_cast<uint64_t>(GS_PSM_CT32) << 24));

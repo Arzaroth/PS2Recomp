@@ -691,11 +691,43 @@ struct GSCpuBackend::RasterContext
     GSMem::TexturePageCache *cache;
     uint32_t stripe;
     uint32_t stripeCount;
+    // Page geometry of the frame buffer being drawn: a worker owns the VRAM pages whose
+    // number modulo stripeCount is its stripe, so each word (whatever buffer geometry or
+    // format writes it) is always written by the same worker, in queue order.
+    uint32_t basePage = 0;
+    uint32_t pagesPerRow = 1;
+    uint32_t pageWidth = 64;
+    uint32_t pageHeight = 32;
 
-    // Rows are dealt out in stripes of 4 so every thread gets a share of any primitive.
-    bool ownsRow(int y) const
+    bool owns(int x, int y) const
     {
-        return stripeCount <= 1u || ((static_cast<uint32_t>(y) >> 2u) % stripeCount) == stripe;
+        if (stripeCount <= 1u)
+            return true;
+        const uint32_t page = basePage + (static_cast<uint32_t>(y) / pageHeight) * pagesPerRow + static_cast<uint32_t>(x) / pageWidth;
+        return (page % stripeCount) == stripe;
+    }
+
+    // Narrows [start, limit] on row y to its first run of owned pixels, in end.
+    bool ownedRun(int y, int &start, int &end, int limit) const
+    {
+        if (stripeCount <= 1u)
+        {
+            end = limit;
+            return start <= limit;
+        }
+        const uint32_t rowPage = basePage + (static_cast<uint32_t>(y) / pageHeight) * pagesPerRow;
+        while (start <= limit)
+        {
+            const uint32_t column = static_cast<uint32_t>(start) / pageWidth;
+            const int columnEnd = std::min(limit, static_cast<int>((column + 1u) * pageWidth) - 1);
+            if (((rowPage + column) % stripeCount) == stripe)
+            {
+                end = columnEnd;
+                return true;
+            }
+            start = columnEnd + 1;
+        }
+        return false;
     }
 };
 
@@ -1272,14 +1304,33 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
     }
 
     // Render to texture: rather than stopping the producer, the workers wait for each other
-    // at this primitive.
-    const bool barrier = m_barrierRequested || (state.prim.tme && ReadsPendingWrite(batch));
+    // at this primitive. Depth words follow the owner of their color page, so a Z buffer
+    // reused under another color-page layout (double buffering) also gets a barrier.
+    bool barrier = m_barrierRequested || (state.prim.tme && ReadsPendingWrite(batch));
+    uint64_t zOwnerKey = 0;
+    const bool writesZ = !state.context.zbuf.zmask;
+    if (writesZ)
+    {
+        const auto &frame = state.context.frame;
+        uint32_t pageWidth = 0;
+        uint32_t pageHeight = 0;
+        pageGeometry(frame.psm, pageWidth, pageHeight);
+        const uint32_t basePage = GSInternal::framePageBaseToBlock(frame.fbp) / 32u;
+        const uint32_t pagesPerRow = std::max(1u, (std::max<uint32_t>(frame.fbw, 1u) * 64u + pageWidth - 1u) / pageWidth);
+        zOwnerKey = (static_cast<uint64_t>(state.context.zbuf.zbp) << 40u) | (static_cast<uint64_t>(basePage % m_workerCount) << 32u) |
+                    (static_cast<uint64_t>(pagesPerRow) << 16u) | (pageWidth << 8u) | pageHeight;
+        for (const uint64_t key : m_zOwnerKeys)
+            barrier = barrier || ((key >> 40u) == state.context.zbuf.zbp && key != zOwnerKey);
+    }
     if (barrier)
     {
         m_writesSinceBarrier.clear();
         m_readsSinceBarrier.clear();
+        m_zOwnerKeys.clear();
         m_barrierRequested = false;
     }
+    if (writesZ && std::find(m_zOwnerKeys.begin(), m_zOwnerKeys.end(), zOwnerKey) == m_zOwnerKeys.end())
+        m_zOwnerKeys.push_back(zOwnerKey);
 
     QueuedPrimitive &item = ReserveQueueSlotUnlocked();
     item.batch = batch;
@@ -1338,7 +1389,12 @@ void GSCpuBackend::DrawQueued(const QueuedPrimitive &item, uint32_t index)
     texture.state = &state;
     if (state.prim.tme && item.area >= kDecodedMinPixels)
         texture.decoded = FindDecodedTexture(m_decodedCaches[index + 1u], texture);
-    DrawWith(batch, RasterContext{&item.pixel, &texture, &m_texturePageCaches[index + 1u], index, m_workerCount});
+    RasterContext raster{&item.pixel, &texture, &m_texturePageCaches[index + 1u], index, m_workerCount};
+    const auto &frame = state.context.frame;
+    pageGeometry(frame.psm, raster.pageWidth, raster.pageHeight);
+    raster.basePage = GSInternal::framePageBaseToBlock(frame.fbp) / 32u;
+    raster.pagesPerRow = std::max(1u, (std::max<uint32_t>(frame.fbw, 1u) * 64u + raster.pageWidth - 1u) / raster.pageWidth);
+    DrawWith(batch, raster);
 }
 
 void GSCpuBackend::DrawWith(const GSPrimitiveBatch &batch, const RasterContext &raster)
@@ -1364,7 +1420,7 @@ void GSCpuBackend::DrawWith(const GSPrimitiveBatch &batch, const RasterContext &
         const auto &ctx = state.context;
         int px = static_cast<int>(v.x) - (ctx.xyoffset.ofx >> 4);
         int py = static_cast<int>(v.y) - (ctx.xyoffset.ofy >> 4);
-        if (raster.ownsRow(py))
+        if (raster.owns(px, py))
             WritePixel(*raster.pixel, px, py, static_cast<u32>(v.z), v.r, v.g, v.b, v.a, v.fog);
         break;
     }
@@ -1407,6 +1463,7 @@ void GSCpuBackend::DrainUnlocked() const
     m_pendingWrites.clear();
     m_writesSinceBarrier.clear();
     m_readsSinceBarrier.clear();
+    m_zOwnerKeys.clear();
 }
 
 bool GSCpuBackend::ReadsPendingWrite(const GSPrimitiveBatch &batch) const
@@ -1993,12 +2050,11 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch, const RasterContext
 
         for (int y = drawY0; y <= drawY1; ++y)
         {
-            if (!raster.ownsRow(y))
-                continue;
             float ty = (static_cast<float>(y - unclippedY0) + 0.5f) / spriteH;
             float texVf = v0f + (v1f - v0f) * ty;
 
-            for (int x = drawX0; x <= drawX1; ++x)
+            for (int runStart = drawX0, runEnd = 0; raster.ownedRun(y, runStart, runEnd, drawX1); runStart = runEnd + 1)
+            for (int x = runStart; x <= runEnd; ++x)
             {
                 float tx = (static_cast<float>(x - unclippedX0) + 0.5f) / spriteW;
                 float texUf = u0f + (u1f - u0f) * tx;
@@ -2030,10 +2086,9 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch, const RasterContext
     {
         for (int y = drawY0; y <= drawY1; ++y)
         {
-            if (!raster.ownsRow(y))
-                continue;
-            for (int x = drawX0; x <= drawX1; ++x)
-                WritePixel(*raster.pixel, x, y, z1, r, g, b, a, v1.fog);
+            for (int runStart = drawX0, runEnd = 0; raster.ownedRun(y, runStart, runEnd, drawX1); runStart = runEnd + 1)
+                for (int x = runStart; x <= runEnd; ++x)
+                    WritePixel(*raster.pixel, x, y, z1, r, g, b, a, v1.fog);
         }
     }
 }
@@ -2082,8 +2137,6 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch, const RasterConte
 
     for (int y = minY; y <= maxY; ++y)
     {
-        if (!raster.ownsRow(y))
-            continue;
         float py = static_cast<float>(y) + 0.5f;
 
         const float row0 = (((fx2 - fx1) * (py - fy2)) * winding) * invAbsDenom;
@@ -2109,7 +2162,8 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch, const RasterConte
         const int spanX0 = std::max(minX, floorToInt(lo + fx2 - 0.5f) - 1);
         const int spanX1 = std::min(maxX, floorToInt(hi + fx2 - 0.5f) + 2);
 
-        for (int x = spanX0; x <= spanX1; ++x)
+        for (int runStart = spanX0, runEnd = 0; raster.ownedRun(y, runStart, runEnd, spanX1); runStart = runEnd + 1)
+        for (int x = runStart; x <= runEnd; ++x)
         {
             float px = static_cast<float>(x) + 0.5f;
 
@@ -2235,7 +2289,7 @@ void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch, const RasterContext &
 
         double z = (v0.z + (v1.z - v0.z) * t);
         const uint8_t fog = clampU8(static_cast<int>(v0.fog + (v1.fog - v0.fog) * t));
-        if (raster.ownsRow(y0))
+        if (raster.owns(x0, y0))
             WritePixel(*raster.pixel, x0, y0, static_cast<u32>(z), r, g, b, a, fog);
 
         if (x0 == x1 && y0 == y1)
@@ -2356,9 +2410,10 @@ uint32_t GSCpuBackend::WriteUploadPixels(const GSTransferCommand &transfer,
 
     auto put = [&](uint32_t index, uint32_t value)
     {
+        const uint32_t x = dsax + index % rrw;
         const uint32_t y = dsay + index / rrw;
-        if (write && (!rows || rows->ownsRow(static_cast<int>(y))))
-            WriteVramUnlocked(dpsm, dbp, dbw, dsax + index % rrw, y, value);
+        if (write && (!rows || (GSMem::PageOf(dpsm, dbp, dbw, x, y) % rows->stripeCount) == rows->stripe))
+            WriteVramUnlocked(dpsm, dbp, dbw, x, y, value);
     };
 
     while (offset < sizeBytes && pixel < totalPixels)

@@ -65,8 +65,8 @@ private:
     void WritePixel(const PixelPipeline &pipeline, int x, int y, uint32_t z, uint8_t r, uint8_t g, uint8_t b, uint8_t a, uint8_t fog);
     uint32_t SampleTexture(const TextureSampler &sampler, GSMem::TexturePageCache &cache, float s, float t, float q, uint16_t u, uint16_t v);
 
-    // Submit queues primitives; worker threads draw them in order, each on its own row
-    // stripes, so every pixel sees the same draw order as a serial rasterizer. Anything else
+    // Submit queues primitives; worker threads draw them in order, each on the VRAM pages it
+    // owns, so every word sees the same write order as a serial rasterizer. Anything else
     // that touches VRAM drains the queue first.
     struct QueuedPrimitive;
     struct DecodedTexture;
@@ -141,6 +141,9 @@ private:
     // Texture ranges read since the last barrier: a queued upload over them gets a barrier.
     mutable std::vector<std::pair<uint32_t, uint32_t>> m_readsSinceBarrier;
     bool m_barrierRequested = false;
+    // Z buffers written since the last barrier, with the color-page layout that decided
+    // which worker wrote each depth word.
+    mutable std::vector<uint64_t> m_zOwnerKeys;
     std::vector<std::thread> m_workers;
     std::mutex m_workMutex;
     std::condition_variable m_workCv;
