@@ -1407,10 +1407,16 @@ namespace ps2_stubs
                             callbackEvents,
                             pes.pts90k,
                             pes.dts90k);
-                        // DATA packets start with 0xFF, then 0x90 + channel (VP2: ff 90 00 00).
+                        // DATA packets start with a 4-byte sub-header: 0xFF, 0x90, then the
+                        // channel. Valkyrie Profile 2 puts its raw PCM movie audio on channel 0
+                        // (ff 90 00 00) and its compressed audio, which goes to a separate
+                        // callback and IOP decoder, on channel 1 (ff 90 00 01).
                         if (streamId == kMpegPrivateStream1 && packetEnd - payloadStart > 4u &&
                             buffer[payloadStart] == 0xFFu)
                         {
+                            const uint32_t channel = buffer[payloadStart + 3u] != 0u
+                                                         ? buffer[payloadStart + 3u]
+                                                         : (buffer[payloadStart + 1u] & 0x0Fu);
                             queueStreamCallbackEvent(
                                 mpegAddr,
                                 kMpegStrDATA,
@@ -1419,7 +1425,7 @@ namespace ps2_stubs
                                 callbackEvents,
                                 pes.pts90k,
                                 pes.dts90k,
-                                buffer[payloadStart + 1u] & 0x0Fu);
+                                channel);
                         }
                     }
                 }
