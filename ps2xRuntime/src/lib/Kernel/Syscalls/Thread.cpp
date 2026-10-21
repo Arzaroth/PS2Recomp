@@ -112,7 +112,7 @@ namespace ps2_syscalls
             const int priority = static_cast<int>(getRegU32(ctx, 5));
             int oldPriority = 0;
             const int result = ee.changePriority(id, priority, interruptSafe, oldPriority);
-            setReturnS32(ctx, result);
+            setReturnS32(ctx, result == KE_OK ? oldPriority : result);
             ee.transferIfRequested(interruptSafe);
         }
 
