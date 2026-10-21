@@ -135,7 +135,7 @@ namespace
     static_assert(sizeof(SectionHeader) == 40u);
     static_assert(sizeof(Relocation) == 8u);
 
-    void writeMinimalIrx(TestHost &host, uint32_t address)
+    void writeCodeIrx(TestHost &host, uint32_t address, const uint32_t *code, size_t codeBytes)
     {
         constexpr uint32_t codeOffset = 0x100u;
         constexpr uint32_t loadAddress = 0x00010000u;
@@ -157,6 +157,23 @@ namespace
         header.phentsize = sizeof(ProgramHeader);
         header.phnum = 1u;
 
+        ProgramHeader program{};
+        program.type = 1u;
+        program.offset = codeOffset;
+        program.vaddr = loadAddress;
+        program.paddr = loadAddress;
+        program.filesz = static_cast<uint32_t>(codeBytes);
+        program.memsz = static_cast<uint32_t>(codeBytes);
+        program.flags = 5u;
+        program.align = 4u;
+
+        std::memcpy(host.guest.data() + address, &header, sizeof(header));
+        std::memcpy(host.guest.data() + address + sizeof(header), &program, sizeof(program));
+        std::memcpy(host.guest.data() + address + codeOffset, code, codeBytes);
+    }
+
+    void writeMinimalIrx(TestHost &host, uint32_t address)
+    {
         // Branch is deliberately included so the test checks that its delay slot runs.
         const uint32_t code[] = {
             0x24080001u, // addiu t0, zero, 1
@@ -166,20 +183,7 @@ namespace
             0x03E00008u, // jr    ra
             0x00000000u, // nop
         };
-
-        ProgramHeader program{};
-        program.type = 1u;
-        program.offset = codeOffset;
-        program.vaddr = loadAddress;
-        program.paddr = loadAddress;
-        program.filesz = sizeof(code);
-        program.memsz = sizeof(code);
-        program.flags = 5u;
-        program.align = 4u;
-
-        std::memcpy(host.guest.data() + address, &header, sizeof(header));
-        std::memcpy(host.guest.data() + address + sizeof(header), &program, sizeof(program));
-        std::memcpy(host.guest.data() + address + codeOffset, code, sizeof(code));
+        writeCodeIrx(host, address, code, sizeof(code));
     }
 
     void writeRpcServerIrx(TestHost &host,
@@ -992,6 +996,29 @@ int main()
     if (!expect(iop.stopModule(result.moduleId, &stopResult), "Emulated module stop failed")) return 1;
     if (!expect(stopResult == 0, "Emulated module stop result mismatch")) return 1;
     if (!expect(iop.debugSnapshot().emulatorLoadedModules == 0u, "Module was not released")) return 1;
+
+    // An unaligned load is LWR then LWL of the same register: LWL merges into the value LWR has
+    // in flight in the load delay slot, as on the R3000A.
+    {
+        const uint32_t code[] = {
+            0x3C090001u, // lui   t1, 1          (the code's own load address)
+            0x99220001u, // lwr   v0, 1(t1)
+            0x89220004u, // lwl   v0, 4(t1)
+            0x00000000u, // nop   (load delay slot)
+            0x03E00008u, // jr    ra
+            0x00000000u, // nop
+        };
+        uint32_t expected = 0u;
+        std::memcpy(&expected, reinterpret_cast<const uint8_t *>(code) + 1u, sizeof(expected));
+        writeCodeIrx(host, 0x100u, code, sizeof(code));
+        const ModuleLoadResult unaligned = iop.loadModuleBuffer(0x100u);
+        if (!expect(unaligned.handled, "Unaligned-load IRX was not loaded")) return 1;
+        if (!expect(static_cast<uint32_t>(unaligned.startResult) == expected,
+                    "LWL must merge with the pending LWR load of the same register")) return 1;
+        int32_t ignored = 0;
+        if (!expect(iop.stopModule(unaligned.moduleId, &ignored), "Unaligned-load IRX stop failed")) return 1;
+        writeMinimalIrx(host, 0x100u); // the IOP RAM load below reuses this image
+    }
 
     // Freed IOP heap blocks are reused (sysmem first fit), so allocate/free cycles do not leak.
     {
