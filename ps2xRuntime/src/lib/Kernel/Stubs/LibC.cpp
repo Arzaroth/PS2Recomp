@@ -2,6 +2,9 @@
 #include "LibC.h"
 #include "ps2_log.h"
 
+#include <mutex>
+#include <unordered_set>
+
 namespace ps2_stubs
 {
     namespace
@@ -47,10 +50,24 @@ namespace ps2_stubs
 
     }
 
+    namespace
+    {
+        void logGuestAllocation(const char *name, R5900Context *ctx, uint32_t size, uint32_t alignment, uint32_t result)
+        {
+            static uint32_t count = 0;
+            if (count++ < 128u || result == 0u)
+            {
+                RUNTIME_LOG("[" << name << "] size=0x" << std::hex << size << " align=0x" << alignment << " -> 0x"
+                                << result << " ra=0x" << getRegU32(ctx, 31) << std::dec << std::endl);
+            }
+        }
+    }
+
     void malloc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t size = getRegU32(ctx, 4); // $a0
         const uint32_t guestAddr = runtime ? runtime->guestMalloc(size) : 0u;
+        logGuestAllocation("malloc", ctx, size, 0u, guestAddr);
         setReturnU32(ctx, guestAddr);
     }
 
@@ -59,6 +76,7 @@ namespace ps2_stubs
         const uint32_t alignment = getRegU32(ctx, 4); // $a0
         const uint32_t size = getRegU32(ctx, 5);      // $a1
         const uint32_t guestAddr = runtime ? runtime->guestMalloc(size, alignment) : 0u;
+        logGuestAllocation("memalign", ctx, size, alignment, guestAddr);
         setReturnU32(ctx, guestAddr);
     }
 
@@ -1150,6 +1168,17 @@ namespace ps2_stubs
         if (format_addr != 0)
         {
             std::string rendered = formatPs2StringWithVaList(rdram, runtime, formatOwned.c_str(), va_list_addr);
+            {
+                static std::mutex seenMutex;
+                static std::unordered_set<std::string> seenFormats;
+                std::lock_guard<std::mutex> lock(seenMutex);
+                if (seenFormats.size() < 32u && seenFormats.insert(formatOwned).second)
+                {
+                    RUNTIME_LOG("[vsprintf] ra=0x" << std::hex << getRegU32(ctx, 31) << std::dec << " format=\""
+                                                   << sanitizeForLog(formatOwned) << "\" -> \""
+                                                   << sanitizeForLog(rendered) << "\"" << std::endl);
+                }
+            }
             if (rendered.size() >= kSafeVsprintfBytes)
             {
                 rendered.resize(kSafeVsprintfBytes - 1);
