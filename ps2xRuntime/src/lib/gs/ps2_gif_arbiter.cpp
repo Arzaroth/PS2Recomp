@@ -1,5 +1,6 @@
 #include "runtime/gs/ps2_gif_arbiter.h"
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 
 GifArbiter::GifArbiter(ProcessPacketFn processFn)
@@ -17,6 +18,8 @@ bool GifArbiter::isImagePacket(const uint8_t *data, uint32_t sizeBytes)
     const uint8_t flg = static_cast<uint8_t>((tagLo >> 58) & 0x3u);
     return flg == 2u;
 }
+
+extern std::atomic<uint32_t> g_gsDumpGifPath;
 
 void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool path2DirectHl)
 {
@@ -56,7 +59,9 @@ void GifArbiter::drain()
         auto &pkt = m_queue[i];
         if (!pkt.data.empty())
         {
+            g_gsDumpGifPath.store(static_cast<uint32_t>(pkt.pathId), std::memory_order_relaxed);
             m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
+            g_gsDumpGifPath.store(0u, std::memory_order_relaxed);
         }
     }
     m_queue.clear();

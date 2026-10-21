@@ -16,6 +16,19 @@ namespace
             return std::numeric_limits<int32_t>::min();
         return static_cast<int32_t>(scaled);
     }
+
+    // MAX/MINI compare raw sign-magnitude bit patterns and pass the chosen operand through unchanged, so
+    // denormals (often integer data, e.g. colors unpacked by VIF) and exponent-255 values survive.
+    int64_t vuMinMaxKey(float value)
+    {
+        uint32_t bits = 0u;
+        std::memcpy(&bits, &value, sizeof(bits));
+        const int64_t magnitude = static_cast<int64_t>(bits & 0x7FFFFFFFu);
+        return (bits & 0x80000000u) != 0u ? -magnitude : magnitude;
+    }
+
+    float vuMax(float a, float b) { return vuMinMaxKey(a) > vuMinMaxKey(b) ? a : b; }
+    float vuMini(float a, float b) { return vuMinMaxKey(a) < vuMinMaxKey(b) ? a : b; }
 }
 
 // ============================================================================
@@ -99,9 +112,9 @@ void VU1Interpreter::execUpper(uint32_t instr)
     case 0x12:
     case 0x13: // MAXbc
     {
-        float bc = broadcast(vt, op & 3);
+        const float bc = m_state.vf[ft][op & 3];
         for (int c = 0; c < 4; c++)
-            result[c] = (vs[c] > bc) ? vs[c] : bc;
+            result[c] = vuMax(m_state.vf[fs][c], bc);
         applyDest(vd, result, dest);
         return;
     }
@@ -110,9 +123,9 @@ void VU1Interpreter::execUpper(uint32_t instr)
     case 0x16:
     case 0x17: // MINIbc
     {
-        float bc = broadcast(vt, op & 3);
+        const float bc = m_state.vf[ft][op & 3];
         for (int c = 0; c < 4; c++)
-            result[c] = (vs[c] < bc) ? vs[c] : bc;
+            result[c] = vuMini(m_state.vf[fs][c], bc);
         applyDest(vd, result, dest);
         return;
     }
@@ -134,7 +147,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
         return;
     case 0x1D: // MAXi
         for (int c = 0; c < 4; c++)
-            result[c] = (vs[c] > i) ? vs[c] : i;
+            result[c] = vuMax(m_state.vf[fs][c], m_state.i);
         applyDest(vd, result, dest);
         return;
     case 0x1E: // MULi
@@ -144,7 +157,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
         return;
     case 0x1F: // MINIi
         for (int c = 0; c < 4; c++)
-            result[c] = (vs[c] < i) ? vs[c] : i;
+            result[c] = vuMini(m_state.vf[fs][c], m_state.i);
         applyDest(vd, result, dest);
         return;
     case 0x20: // ADDq
@@ -204,7 +217,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
         return;
     case 0x2B: // MAX
         for (int c = 0; c < 4; c++)
-            result[c] = (vs[c] > vt[c]) ? vs[c] : vt[c];
+            result[c] = vuMax(m_state.vf[fs][c], m_state.vf[ft][c]);
         applyDest(vd, result, dest);
         return;
     case 0x2C: // SUB
@@ -226,7 +239,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
         return;
     case 0x2F: // MINI
         for (int c = 0; c < 4; c++)
-            result[c] = (vs[c] < vt[c]) ? vs[c] : vt[c];
+            result[c] = vuMini(m_state.vf[fs][c], m_state.vf[ft][c]);
         applyDest(vd, result, dest);
         return;
 
@@ -372,9 +385,14 @@ void VU1Interpreter::execUpper(uint32_t instr)
                 result[c] = vs[c] * q;
             applyFmacDestAcc(result, dest);
             return;
-        case 0x1D: // ABS
+        case 0x1D: // ABS (clears the sign bit; the magnitude bits pass through)
             for (int c = 0; c < 4; c++)
-                result[c] = std::fabs(vs[c]);
+            {
+                uint32_t bits = 0u;
+                std::memcpy(&bits, &m_state.vf[fs][c], sizeof(bits));
+                bits &= 0x7FFFFFFFu;
+                std::memcpy(&result[c], &bits, sizeof(bits));
+            }
             applyDest(vtDest, result, dest);
             return;
         case 0x1E: // MULAi
