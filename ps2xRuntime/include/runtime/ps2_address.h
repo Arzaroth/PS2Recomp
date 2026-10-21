@@ -47,7 +47,8 @@ static inline constexpr bool Ps2IsPhysicalSpecialAddress(uint32_t physAddr)
            Ps2AddressInRange(physAddr, PS2_SCRATCHPAD_BASE, PS2_SCRATCHPAD_SIZE) ||
            Ps2AddressInRange(physAddr, PS2_IO_BASE, PS2_IO_SIZE) ||
            Ps2AddressInRange(physAddr, PS2_GS_PRIV_REG_BASE, PS2_GS_PRIV_REG_SIZE) ||
-           (physAddr >= PS2_VU0_DATA_BASE && physAddr < (PS2_VU1_CODE_BASE + PS2_VU1_CODE_SIZE));
+           // The VU0/VU1 micro and data memories (0x11000000-0x1100FFFF) are not RDRAM.
+           (physAddr >= PS2_VU0_CODE_BASE && physAddr < (PS2_VU1_DATA_BASE + PS2_VU1_DATA_SIZE));
 }
 
 static inline constexpr bool Ps2IsSpecialAddress(uint32_t addr)

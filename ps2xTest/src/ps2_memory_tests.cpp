@@ -179,6 +179,24 @@ void register_ps2_memory_tests()
             t.Equals(mem.read32(0x00103000u), 0x2468ACE0u, "writes through 0x3010 alias should land in base RDRAM");
         });
 
+        tc.Run("recompiled code routes every VU memory window to the slow path", [](TestCase &t)
+        {
+            // READ/WRITE macros only reach VU memory through the special-address path; anything else
+            // is masked into RDRAM (0x1100E000 would read RDRAM 0x0100E000).
+            t.IsTrue(Ps2IsSpecialAddress(PS2_VU0_CODE_BASE), "VU0 micro memory must be special");
+            t.IsTrue(Ps2IsSpecialAddress(PS2_VU0_DATA_BASE), "VU0 data memory must be special");
+            t.IsTrue(Ps2IsSpecialAddress(PS2_VU1_CODE_BASE), "VU1 micro memory must be special");
+            t.IsTrue(Ps2IsSpecialAddress(PS2_VU1_DATA_BASE), "VU1 data memory must be special");
+            t.IsTrue(Ps2IsSpecialAddress(PS2_VU1_DATA_BASE + PS2_VU1_DATA_SIZE - 16u), "the last VU1 data qword must be special");
+            t.IsFalse(Ps2IsSpecialAddress(0x0100E000u), "RDRAM must stay on the fast path");
+
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            mem.getVU1Data()[0x2000] = 0x5Au;
+            t.Equals(static_cast<uint32_t>(_mm_cvtsi128_si32(mem.read128(PS2_VU1_DATA_BASE + 0x2000u)) & 0xFFu), 0x5Au,
+                     "a quadword load from 0x1100E000 should read VU1 data memory");
+        });
+
         tc.Run("translateAddress handles kseg and uncached aliases", [](TestCase &t)
         {
             PS2Memory mem;
