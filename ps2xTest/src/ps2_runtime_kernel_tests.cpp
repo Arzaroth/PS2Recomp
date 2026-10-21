@@ -716,6 +716,35 @@ void register_ps2_runtime_kernel_tests()
                      "ChangeThreadPriority should reject priority 128");
         });
 
+        tc.Run("ChangeThreadPriority returns the previous priority", [](TestCase &t)
+        {
+            TestEnv env;
+            EeScheduler &ee = env.runtime.eeScheduler();
+            ee.reset(env.rdram.data(), env.ctx);
+            ee.bindMainContextForSyscall(env.ctx, env.rdram.data());
+
+            const int id = ee.createThread(EeThreadCreateParams{0u, K_SCHED_HIGH, 0x24000u, 0x800u, 0u, 20, 0u});
+
+            R5900Context lower{};
+            setRegU32(lower, 4, static_cast<uint32_t>(id));
+            setRegU32(lower, 5, 30u);
+            ChangeThreadPriority(env.rdram.data(), &lower, &env.runtime);
+            t.Equals(getRegS32(lower, 2), 20, "ChangeThreadPriority should return the priority it replaced");
+
+            R5900Context restore{};
+            setRegU32(restore, 4, static_cast<uint32_t>(id));
+            setRegU32(restore, 5, static_cast<uint32_t>(getRegS32(lower, 2)));
+            ChangeThreadPriority(env.rdram.data(), &restore, &env.runtime);
+            t.Equals(getRegS32(restore, 2), 30, "restoring with the returned value should report the raised priority");
+            t.Equals(ee.thread(id)->currentPriority, 20, "the saved priority should be restored");
+
+            R5900Context invalid{};
+            setRegU32(invalid, 4, static_cast<uint32_t>(id));
+            setRegU32(invalid, 5, 128u);
+            ChangeThreadPriority(env.rdram.data(), &invalid, &env.runtime);
+            t.Equals(getRegS32(invalid, 2), -403, "an illegal priority should still return KE_ILLEGAL_PRIORITY");
+        });
+
         tc.Run("thread lifecycle, nested suspend, WAIT-SUSPEND, and wakeup count are centralized", [](TestCase &t)
         {
             TestEnv env;
