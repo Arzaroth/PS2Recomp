@@ -215,6 +215,9 @@ static_assert(sizeof(GSRegisters) == (20u * sizeof(uint64_t)), "GSRegisters layo
 static_assert(alignof(GSRegisters) == alignof(uint64_t), "GSRegisters alignment must remain 64-bit");
 static_assert(std::atomic<uint64_t>::is_always_lock_free, "GS CSR atomic must be lock-free on all supported targets");
 
+// CSR SIGNAL (bit0) / FINISH (bit1) 0->1 transitions raised by the GS, consumed as INTC cause 0 edges.
+inline std::atomic<uint32_t> g_gsCsrRaisedEdges{0};
+
 // PS2 VIF (VPU Interface) registers
 struct VIFRegisters
 {

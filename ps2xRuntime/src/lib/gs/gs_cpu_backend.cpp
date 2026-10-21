@@ -11,8 +11,13 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
+#include <mutex>
 #include <fstream>
 #include <iostream>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 #include <stdexcept>
 
 using namespace GSInternal;
@@ -292,13 +297,10 @@ namespace
         return psm == GS_PSM_T8 || psm == GS_PSM_T8H;
     }
 
-    uint8_t lerpChannel(uint8_t c00, uint8_t c10, uint8_t c01, uint8_t c11, float fx, float fy)
-    {
-        const float top = static_cast<float>(c00) + (static_cast<float>(c10) - static_cast<float>(c00)) * fx;
-        const float bottom = static_cast<float>(c01) + (static_cast<float>(c11) - static_cast<float>(c01)) * fx;
-        return clampU8(static_cast<int>(std::lround(top + (bottom - top) * fy)));
-    }
 }
+
+// Bumped whenever texture page caches must be dropped; each thread's cache compares against it.
+static std::atomic<uint64_t> g_texturePageCacheGeneration{1u};
 
 namespace
 {
@@ -408,6 +410,111 @@ namespace
                         source.data() + sourceY * kHostFrameWidth * 4u,
                         width * 4u);
         }
+    }
+
+    // Interlaced FRAME mode (SMODE2 INT=1, FFMD=1) shows the same framebuffer lines in both fields,
+    // so the buffer holds only (DH+1)/2 lines; scale them back up to the display height.
+    void applyFrameModeLineDouble(std::vector<uint8_t> &pixels, uint32_t width, uint32_t sourceHeight, uint32_t targetHeight)
+    {
+        if (pixels.empty() || width == 0u || sourceHeight == 0u || targetHeight <= sourceHeight)
+            return;
+        for (uint32_t y = targetHeight; y-- > 0u;)
+        {
+            const uint32_t sourceY = std::min<uint32_t>((y * sourceHeight) / targetHeight, sourceHeight - 1u);
+            std::memmove(pixels.data() + y * kHostFrameWidth * 4u,
+                         pixels.data() + sourceY * kHostFrameWidth * 4u,
+                         width * 4u);
+        }
+    }
+
+    // Games in interlaced FRAME mode often alternate a sub-line offset every frame (one field draws
+    // half a line lower) so a TV interleaves the fields; on a progressive display the picture then
+    // shimmers up and down. While consecutive frames differ only by such a small amount, present the
+    // average of the newest frame and the previous distinct one, which is identical every frame. Real
+    // motion (larger differences) and long-static images are presented unblended.
+    void applyFrameModeStabilize(std::vector<uint8_t> &pixels, uint32_t width, uint32_t sourceHeight, uint32_t targetHeight)
+    {
+        if (pixels.empty() || width == 0u || sourceHeight < 4u || targetHeight <= sourceHeight)
+            return;
+
+        constexpr uint32_t kStaticPresentsBeforeUnblend = 8u;
+        constexpr uint32_t kMaxMeanDifference = 6u; // per sampled pixel, sum of RGB, after level removal
+
+        const size_t rowBytes = kHostFrameWidth * 4u;
+        const size_t usedBytes = rowBytes * sourceHeight;
+        std::vector<uint8_t> other;
+        bool recentlyChanged = false;
+        {
+            static std::mutex historyMutex;
+            static std::vector<uint8_t> latest, previous;
+            static uint32_t historyWidth = 0u, historyHeight = 0u;
+            static uint32_t presentsSinceChange = 0u;
+            std::lock_guard<std::mutex> lock(historyMutex);
+            if (historyWidth != width || historyHeight != sourceHeight)
+            {
+                latest.clear();
+                previous.clear();
+                historyWidth = width;
+                historyHeight = sourceHeight;
+            }
+            if (latest.size() != usedBytes || std::memcmp(latest.data(), pixels.data(), usedBytes) != 0)
+            {
+                previous.swap(latest);
+                latest.assign(pixels.begin(), pixels.begin() + static_cast<std::ptrdiff_t>(usedBytes));
+                presentsSinceChange = 0u;
+            }
+            else if (presentsSinceChange < kStaticPresentsBeforeUnblend)
+            {
+                ++presentsSinceChange;
+            }
+            recentlyChanged = presentsSinceChange < kStaticPresentsBeforeUnblend;
+            if (recentlyChanged && previous.size() == usedBytes)
+                other = previous;
+        }
+
+        if (!other.empty())
+        {
+            auto level = [&](const uint8_t *frame)
+            {
+                uint64_t sum = 0u, count = 0u;
+                for (uint32_t y = 0; y < sourceHeight; y += 2u)
+                    for (uint32_t x = 0; x < width; x += 4u, ++count)
+                    {
+                        const uint8_t *p = frame + y * rowBytes + x * 4u;
+                        sum += p[0] + p[1] + p[2];
+                    }
+                return count ? static_cast<int64_t>(sum / count) : 0;
+            };
+            const int64_t levelCurrent = level(pixels.data());
+            const int64_t levelOther = level(other.data());
+            // Compare the change since the previous frame with what shifting this image by one line
+            // costs: a field offset (up to a line) stays within that, real motion usually does not.
+            uint64_t difference = 0u, oneLineShift = 0u, samples = 0u;
+            for (uint32_t y = 0; y + 1u < sourceHeight; y += 2u)
+                for (uint32_t x = 0; x < width; x += 4u, ++samples)
+                {
+                    const uint8_t *a = pixels.data() + y * rowBytes + x * 4u;
+                    const uint8_t *below = a + rowBytes;
+                    const uint8_t *b = other.data() + y * rowBytes + x * 4u;
+                    difference += static_cast<uint64_t>(std::llabs((int64_t(a[0]) + a[1] + a[2] - levelCurrent) -
+                                                                   (int64_t(b[0]) + b[1] + b[2] - levelOther)));
+                    oneLineShift += static_cast<uint64_t>(std::llabs((int64_t(a[0]) + a[1] + a[2]) -
+                                                                     (int64_t(below[0]) + below[1] + below[2])));
+                }
+            const uint64_t allowed = std::max<uint64_t>(samples * kMaxMeanDifference, oneLineShift + oneLineShift / 2u);
+            if (samples != 0u && difference <= allowed)
+            {
+                for (uint32_t y = 0; y < sourceHeight; ++y)
+                {
+                    uint8_t *dst = pixels.data() + y * rowBytes;
+                    const uint8_t *src = other.data() + y * rowBytes;
+                    for (uint32_t i = 0; i < width * 4u; ++i)
+                        dst[i] = static_cast<uint8_t>((uint32_t(dst[i]) + src[i] + 1u) >> 1u);
+                }
+            }
+        }
+
+        applyFrameModeLineDouble(pixels, width, sourceHeight, targetHeight);
     }
 
     void normalizePresentationAlpha(std::vector<uint8_t> &pixels, uint32_t width, uint32_t height)
@@ -533,8 +640,9 @@ void GSCpuBackend::Reset()
 void GSCpuBackend::ResetUnlocked()
 {
     m_clut.fill(0u);
+    ++m_clutGeneration;
     m_clutCbp.fill(0u);
-    m_texturePageCache.Invalidate();
+    g_texturePageCacheGeneration.fetch_add(1u, std::memory_order_acq_rel);
     m_transfer = {};
     m_transfer.direction = 3u;
     m_transferState = {};
@@ -634,6 +742,256 @@ void GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &t
             m_clut[destination + 256u] = static_cast<uint16_t>(raw >> 16u);
         }
     }
+    ++m_clutGeneration;
+}
+
+namespace
+{
+    // Small pool that splits the rows of large primitives; the calling thread works too.
+    class RowWorkerPool
+    {
+    public:
+        static RowWorkerPool &instance()
+        {
+            static RowWorkerPool pool;
+            return pool;
+        }
+
+        bool available() const noexcept { return !m_threads.empty(); }
+
+        void run(int y0, int y1, const std::function<void(int)> &row)
+        {
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                m_row = &row;
+                m_end = y1;
+                m_next.store(y0, std::memory_order_relaxed);
+                m_pending = static_cast<uint32_t>(m_threads.size());
+                ++m_generation;
+            }
+            m_wake.notify_all();
+            work();
+            std::unique_lock<std::mutex> lock(m_mutex);
+            m_done.wait(lock, [this]() { return m_pending == 0u; });
+            m_row = nullptr;
+        }
+
+    private:
+        static constexpr int kRowsPerChunk = 4;
+
+        RowWorkerPool()
+        {
+            const unsigned hardware = std::max(1u, std::thread::hardware_concurrency());
+            const unsigned workers = std::min(7u, hardware > 4u ? hardware / 2u - 1u : 0u);
+            for (unsigned i = 0; i < workers; ++i)
+                m_threads.emplace_back([this]()
+                                       {
+                                           GSMem::t_deferPageWriteTracking = true;
+                                           loop();
+                                       });
+        }
+
+        ~RowWorkerPool()
+        {
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                m_stop = true;
+            }
+            m_wake.notify_all();
+            for (std::thread &thread : m_threads)
+                thread.join();
+        }
+
+        void work()
+        {
+            for (;;)
+            {
+                const int first = m_next.fetch_add(kRowsPerChunk, std::memory_order_relaxed);
+                if (first > m_end)
+                    return;
+                const int last = std::min(first + kRowsPerChunk - 1, m_end);
+                for (int y = first; y <= last; ++y)
+                    (*m_row)(y);
+            }
+        }
+
+        void loop()
+        {
+            uint64_t seen = 0u;
+            for (;;)
+            {
+                {
+                    std::unique_lock<std::mutex> lock(m_mutex);
+                    m_wake.wait(lock, [&]() { return m_stop || m_generation != seen; });
+                    if (m_stop)
+                        return;
+                    seen = m_generation;
+                }
+                work();
+                std::lock_guard<std::mutex> lock(m_mutex);
+                if (--m_pending == 0u)
+                    m_done.notify_one();
+            }
+        }
+
+        std::vector<std::thread> m_threads;
+        std::mutex m_mutex;
+        std::condition_variable m_wake;
+        std::condition_variable m_done;
+        const std::function<void(int)> *m_row = nullptr;
+        std::atomic<int> m_next{0};
+        int m_end = 0;
+        uint32_t m_pending = 0u;
+        uint64_t m_generation = 0u;
+        bool m_stop = false;
+    };
+
+    // Marks the frame/Z buffer pages of the scissor rows as written (see t_deferPageWriteTracking).
+    void markRenderTargetPagesWritten(const GSFrameReg &frame, const GSZbufReg &zbuf, int scissorY0, int scissorY1)
+    {
+        auto pageHeight = [](uint32_t psm)
+        {
+            switch (psm)
+            {
+            case GS_PSM_CT16:
+            case GS_PSM_CT16S:
+            case GS_PSM_Z16:
+            case GS_PSM_Z16S:
+                return 64;
+            default:
+                return 32;
+            }
+        };
+        const uint32_t pagesPerRow = std::max<uint32_t>(frame.fbw, 1u);
+        auto mark = [&](uint32_t basePage, uint32_t psm)
+        {
+            const int rowHeight = pageHeight(psm);
+            const int firstRow = std::max(scissorY0, 0) / rowHeight;
+            const int lastRow = std::max(scissorY1, 0) / rowHeight;
+            for (int row = firstRow; row <= lastRow; ++row)
+                for (uint32_t column = 0; column < pagesPerRow; ++column)
+                {
+                    const uint32_t page = (basePage + static_cast<uint32_t>(row) * pagesPerRow + column) %
+                                          static_cast<uint32_t>(GSMem::WRITE_TRACK_PAGE_COUNT);
+                    ++GSMem::g_pageWriteGeneration[page];
+                }
+        };
+        mark(frame.fbp, frame.psm);
+        mark(zbuf.zbp, zbuf.psm);
+    }
+
+    bool hasPixelDistinctLayout(uint32_t psm)
+    {
+        switch (psm)
+        {
+        case GS_PSM_CT32:
+        case GS_PSM_CT24:
+        case GS_PSM_CT16:
+        case GS_PSM_CT16S:
+        case GS_PSM_Z32:
+        case GS_PSM_Z24:
+        case GS_PSM_Z16:
+        case GS_PSM_Z16S:
+            return true;
+        default:
+            return false;
+        }
+    }
+}
+
+void GSCpuBackend::ForEachRow(const GSDrawState &state, int y0, int y1, int width, const std::function<void(int)> &row)
+{
+    constexpr int64_t kMinParallelPixels = 2048;
+    const auto &ctx = state.context;
+    const bool parallel = y1 - y0 >= 8 &&
+                          static_cast<int64_t>(y1 - y0 + 1) * std::max(width, 1) >= kMinParallelPixels &&
+                          hasPixelDistinctLayout(ctx.frame.psm) && hasPixelDistinctLayout(ctx.zbuf.psm) &&
+                          RowWorkerPool::instance().available();
+    if (!parallel)
+    {
+        for (int y = y0; y <= y1; ++y)
+            row(y);
+        return;
+    }
+    RowWorkerPool::instance().run(y0, y1, row);
+}
+
+void GSCpuBackend::PrepareTexelCache(const GSDrawState &state)
+{
+    const auto &tex = state.context.tex0;
+    TexelCacheKey key{};
+    key.tbp0 = tex.tbp0;
+    key.tbw = tex.tbw;
+    key.psm = tex.psm;
+    key.cpsm = tex.cpsm;
+    key.csm = tex.csm;
+    key.csa = tex.csa;
+    key.width = state.textureWidth;
+    key.height = state.textureHeight;
+    key.texa = static_cast<uint32_t>(state.texa.ta0) | (static_cast<uint32_t>(state.texa.ta1) << 8u) |
+               (state.texa.aem ? 0x10000u : 0u);
+    key.clutGeneration = m_clutGeneration;
+
+    // VRAM pages holding the texture: whole page rows of the buffer width from the base page, plus
+    // one page of slack for a base that is not page aligned.
+    uint32_t pageWidth = 64u, pageHeight = 32u;
+    switch (tex.psm)
+    {
+    case GS_PSM_CT16:
+    case GS_PSM_CT16S:
+    case GS_PSM_Z16:
+    case GS_PSM_Z16S:
+        pageHeight = 64u;
+        break;
+    case GS_PSM_T8:
+        pageWidth = 128u;
+        pageHeight = 64u;
+        break;
+    case GS_PSM_T4:
+        pageWidth = 128u;
+        pageHeight = 128u;
+        break;
+    default:
+        break;
+    }
+    const uint32_t bufferWidth = std::max<uint32_t>(1u, tex.tbw) * 64u;
+    const uint32_t pagesPerRow = std::max<uint32_t>(1u, (bufferWidth + pageWidth - 1u) / pageWidth);
+    const uint32_t pageRows = (key.height + pageHeight - 1u) / pageHeight;
+    const uint32_t firstPage = tex.tbp0 / static_cast<uint32_t>(GSMem::BLOCKS_PER_PAGE);
+    const uint32_t pageCount = std::min<uint32_t>(pagesPerRow * pageRows + 1u,
+                                                  static_cast<uint32_t>(GSMem::WRITE_TRACK_PAGE_COUNT));
+
+    bool valid = key == m_texelCacheKey && m_texelCachePages.size() == pageCount;
+    for (uint32_t i = 0; valid && i < pageCount; ++i)
+    {
+        const uint32_t page = (firstPage + i) % static_cast<uint32_t>(GSMem::WRITE_TRACK_PAGE_COUNT);
+        valid = m_texelCachePages[i].first == page &&
+                m_texelCachePages[i].second == GSMem::g_pageWriteGeneration[page];
+    }
+
+    if (!valid)
+    {
+        const size_t texels = static_cast<size_t>(key.width) * key.height;
+        if (m_texelCache.size() != texels)
+        {
+            m_texelCache.assign(texels, 0u);
+            m_texelCacheStamp.assign(texels, 0u);
+            m_texelCacheEpoch = 0u;
+        }
+        if (++m_texelCacheEpoch == 0u)
+        {
+            std::fill(m_texelCacheStamp.begin(), m_texelCacheStamp.end(), 0u);
+            m_texelCacheEpoch = 1u;
+        }
+        m_texelCacheKey = key;
+        m_texelCachePages.resize(pageCount);
+        for (uint32_t i = 0; i < pageCount; ++i)
+        {
+            const uint32_t page = (firstPage + i) % static_cast<uint32_t>(GSMem::WRITE_TRACK_PAGE_COUNT);
+            m_texelCachePages[i] = {page, GSMem::g_pageWriteGeneration[page]};
+        }
+    }
+    m_texelCacheOwner = &state;
 }
 
 void GSCpuBackend::Flush()
@@ -644,7 +1002,7 @@ void GSCpuBackend::Flush()
 void GSCpuBackend::TextureFlush()
 {
     std::lock_guard<std::mutex> lock(m_mutex);
-    m_texturePageCache.Invalidate();
+    g_texturePageCacheGeneration.fetch_add(1u, std::memory_order_acq_rel);
 }
 
 void GSCpuBackend::Sync(GSSyncReason)
@@ -670,7 +1028,19 @@ uint32_t GSCpuBackend::ReadTextureVramUnlocked(uint32_t psm, uint32_t base, uint
     if (!m_vram)
         return 0u;
 
-    return GSMem::ReadTexture(m_texturePageCache, m_vram, psm, base, bw, x, y);
+    // Rows of one primitive may be rasterized on several threads; each keeps its own page copy and
+    // drops it whenever the backend invalidates (or a different backend instance uses the thread).
+    thread_local GSMem::TexturePageCache t_pageCache;
+    thread_local const GSCpuBackend *t_pageCacheOwner = nullptr;
+    thread_local uint64_t t_pageCacheGeneration = 0u;
+    const uint64_t generation = g_texturePageCacheGeneration.load(std::memory_order_acquire);
+    if (t_pageCacheOwner != this || t_pageCacheGeneration != generation)
+    {
+        t_pageCache.Invalidate();
+        t_pageCacheOwner = this;
+        t_pageCacheGeneration = generation;
+    }
+    return GSMem::ReadTexture(t_pageCache, m_vram, psm, base, bw, x, y);
 }
 
 void GSCpuBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
@@ -817,6 +1187,23 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
                       << std::dec << std::endl;
         }
     });
+
+    if (state.prim.tme)
+        PrepareTexelCache(state);
+    else
+        m_texelCacheOwner = nullptr;
+
+    struct DeferredPageTracking
+    {
+        const GSDrawState &state;
+        DeferredPageTracking(const GSDrawState &drawState) : state(drawState) { GSMem::t_deferPageWriteTracking = true; }
+        ~DeferredPageTracking()
+        {
+            GSMem::t_deferPageWriteTracking = false;
+            markRenderTargetPagesWritten(state.context.frame, state.context.zbuf, state.context.scissor.y0,
+                                         state.context.scissor.y1);
+        }
+    } deferredPageTracking(state);
 
     switch (state.prim.type)
     {
@@ -1083,11 +1470,9 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
         texVf = t * invQ * static_cast<float>(texH);
     }
 
-    auto samplePoint = [&](int sampleU, int sampleV) -> uint32_t
+    const bool useTexelCache = m_texelCacheOwner == &state;
+    auto decodeTexel = [&](int sampleU, int sampleV) -> uint32_t
     {
-        sampleU = wrapTextureCoordinate(sampleU, texW, wrapU, minU, maxU);
-        sampleV = wrapTextureCoordinate(sampleV, texH, wrapV, minV, maxV);
-
         u32 out = ReadTextureVramUnlocked(tex.psm, tex.tbp0, tex.tbw, sampleU, sampleV);
 
         switch (tex.psm)
@@ -1113,6 +1498,22 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
         return 0xFFFF00FFu;
     };
 
+    auto samplePoint = [&](int sampleU, int sampleV) -> uint32_t
+    {
+        sampleU = wrapTextureCoordinate(sampleU, texW, wrapU, minU, maxU);
+        sampleV = wrapTextureCoordinate(sampleV, texH, wrapV, minV, maxV);
+        if (!useTexelCache || sampleU < 0 || sampleV < 0 || sampleU >= texW || sampleV >= texH)
+            return decodeTexel(sampleU, sampleV);
+        const size_t index = static_cast<size_t>(sampleV) * static_cast<size_t>(texW) + static_cast<size_t>(sampleU);
+        std::atomic_ref<uint32_t> stamp(m_texelCacheStamp[index]);
+        if (stamp.load(std::memory_order_acquire) == m_texelCacheEpoch)
+            return std::atomic_ref<uint32_t>(m_texelCache[index]).load(std::memory_order_relaxed);
+        const uint32_t texel = decodeTexel(sampleU, sampleV);
+        std::atomic_ref<uint32_t>(m_texelCache[index]).store(texel, std::memory_order_relaxed);
+        stamp.store(m_texelCacheEpoch, std::memory_order_release);
+        return texel;
+    };
+
     if (!state.linearFilter)
     {
         return samplePoint(static_cast<int>(texUf), static_cast<int>(texVf));
@@ -1120,43 +1521,34 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
 
     const float sampleU = texUf - 0.5f;
     const float sampleV = texVf - 0.5f;
-    const int u0 = static_cast<int>(std::floor(sampleU));
-    const int v0 = static_cast<int>(std::floor(sampleV));
-    const int u1 = u0 + 1;
-    const int v1 = v0 + 1;
-    const float fx = sampleU - static_cast<float>(u0);
-    const float fy = sampleV - static_cast<float>(v0);
+    // Truncate-then-adjust floor (std::floor/std::lround are out-of-line CRT calls on this hot path).
+    int u0 = static_cast<int>(sampleU);
+    int v0 = static_cast<int>(sampleV);
+    if (sampleU < static_cast<float>(u0))
+        --u0;
+    if (sampleV < static_cast<float>(v0))
+        --v0;
+    const uint32_t fx = static_cast<uint32_t>((sampleU - static_cast<float>(u0)) * 256.0f) & 0x1FFu;
+    const uint32_t fy = static_cast<uint32_t>((sampleV - static_cast<float>(v0)) * 256.0f) & 0x1FFu;
 
     const uint32_t c00 = samplePoint(u0, v0);
-    const uint32_t c10 = samplePoint(u1, v0);
-    const uint32_t c01 = samplePoint(u0, v1);
-    const uint32_t c11 = samplePoint(u1, v1);
+    const uint32_t c10 = samplePoint(u0 + 1, v0);
+    const uint32_t c01 = samplePoint(u0, v0 + 1);
+    const uint32_t c11 = samplePoint(u0 + 1, v0 + 1);
 
-    const uint8_t r = lerpChannel(static_cast<uint8_t>(c00 & 0xFFu),
-                                  static_cast<uint8_t>(c10 & 0xFFu),
-                                  static_cast<uint8_t>(c01 & 0xFFu),
-                                  static_cast<uint8_t>(c11 & 0xFFu),
-                                  fx, fy);
-    const uint8_t g = lerpChannel(static_cast<uint8_t>((c00 >> 8) & 0xFFu),
-                                  static_cast<uint8_t>((c10 >> 8) & 0xFFu),
-                                  static_cast<uint8_t>((c01 >> 8) & 0xFFu),
-                                  static_cast<uint8_t>((c11 >> 8) & 0xFFu),
-                                  fx, fy);
-    const uint8_t b = lerpChannel(static_cast<uint8_t>((c00 >> 16) & 0xFFu),
-                                  static_cast<uint8_t>((c10 >> 16) & 0xFFu),
-                                  static_cast<uint8_t>((c01 >> 16) & 0xFFu),
-                                  static_cast<uint8_t>((c11 >> 16) & 0xFFu),
-                                  fx, fy);
-    const uint8_t a = lerpChannel(static_cast<uint8_t>((c00 >> 24) & 0xFFu),
-                                  static_cast<uint8_t>((c10 >> 24) & 0xFFu),
-                                  static_cast<uint8_t>((c01 >> 24) & 0xFFu),
-                                  static_cast<uint8_t>((c11 >> 24) & 0xFFu),
-                                  fx, fy);
-
-    return static_cast<uint32_t>(r) |
-           (static_cast<uint32_t>(g) << 8) |
-           (static_cast<uint32_t>(b) << 16) |
-           (static_cast<uint32_t>(a) << 24);
+    // 8.8 fixed-point bilinear blend of all four channels.
+    const uint32_t w00 = (256u - fx) * (256u - fy);
+    const uint32_t w10 = fx * (256u - fy);
+    const uint32_t w01 = (256u - fx) * fy;
+    const uint32_t w11 = fx * fy;
+    uint32_t result = 0u;
+    for (uint32_t shift = 0u; shift < 32u; shift += 8u)
+    {
+        const uint32_t channel = ((c00 >> shift) & 0xFFu) * w00 + ((c10 >> shift) & 0xFFu) * w10 +
+                                 ((c01 >> shift) & 0xFFu) * w01 + ((c11 >> shift) & 0xFFu) * w11;
+        result |= std::min<uint32_t>((channel + 32768u) >> 16u, 255u) << shift;
+    }
+    return result;
 }
 
 void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
@@ -1212,10 +1604,12 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
         float u0f, v0f, u1f, v1f;
         if (state.prim.fst)
         {
-            u0f = static_cast<float>(v0.u >> 4);
-            v0f = static_cast<float>(v0.v >> 4);
-            u1f = static_cast<float>(v1.u >> 4);
-            v1f = static_cast<float>(v1.v >> 4);
+            // UV registers are 12.4 fixed point; keep the fraction (games use sub-texel offsets,
+            // e.g. per-field half-texel shifts when copying an interlaced frame with bilinear filtering).
+            u0f = static_cast<float>(v0.u) / 16.0f;
+            v0f = static_cast<float>(v0.v) / 16.0f;
+            u1f = static_cast<float>(v1.u) / 16.0f;
+            v1f = static_cast<float>(v1.v) / 16.0f;
         }
         else
         {
@@ -1234,7 +1628,7 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
         if (spriteH < 1.0f)
             spriteH = 1.0f;
 
-        for (int y = drawY0; y <= drawY1; ++y)
+        const std::function<void(int)> rasterRow = [&](int y)
         {
             float ty = (static_cast<float>(y - unclippedY0) + 0.5f) / spriteH;
             float texVf = v0f + (v1f - v0f) * ty;
@@ -1265,13 +1659,17 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
                 const TextureCombineResult color = combineTexture(tex, r, g, b, a, tr, tg, tb, ta);
                 WritePixel(state, x, y, z1, color.r, color.g, color.b, color.a, v1.fog);
             }
-        }
+        };
+        ForEachRow(state, drawY0, drawY1, drawX1 - drawX0 + 1, rasterRow);
     }
     else
     {
-        for (int y = drawY0; y <= drawY1; ++y)
+        const std::function<void(int)> fillRow = [&](int y)
+        {
             for (int x = drawX0; x <= drawX1; ++x)
                 WritePixel(state, x, y, z1, r, g, b, a, v1.fog);
+        };
+        ForEachRow(state, drawY0, drawY1, drawX1 - drawX0 + 1, fillRow);
     }
 }
 
@@ -1311,7 +1709,7 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
     const float invAbsDenom = 1.0f / std::fabs(denom);
     constexpr float kEdgeEpsilon = 1.0e-4f;
 
-    for (int y = minY; y <= maxY; ++y)
+    const std::function<void(int)> rasterRow = [&](int y)
     {
         float py = static_cast<float>(y) + 0.5f;
         for (int x = minX; x <= maxX; ++x)
@@ -1390,7 +1788,8 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
             const uint8_t fog = clampU8(static_cast<int>(v0.fog * w0 + v1.fog * w1 + v2.fog * w2));
             WritePixel(state, x, y, static_cast<u32>(z + 0.5), r, g, b, a, fog);
         }
-    }
+    };
+    ForEachRow(state, minY, maxY, maxX - minX + 1, rasterRow);
 }
 
 void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch)
@@ -1871,6 +2270,14 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
     uint32_t width1 = 0u, height1 = 0u, width2 = 0u, height2 = 0u;
     decodeDisplaySize(request.display1, width1, height1);
     decodeDisplaySize(request.display2, width2, height2);
+    const bool frameModeInterlace = smode2.interlaced && smode2.frameMode;
+    const uint32_t displayHeight1 = height1;
+    const uint32_t displayHeight2 = height2;
+    if (frameModeInterlace)
+    {
+        height1 = (height1 + 1u) / 2u;
+        height2 = (height2 + 1u) / 2u;
+    }
     const bool valid1 = pmode.enableCrt1 && hasDisplaySetup(request.display1, displayFrame1);
     const bool valid2 = pmode.enableCrt2 && hasDisplaySetup(request.display2, displayFrame2);
     if (!valid1 && !valid2)
@@ -1958,6 +2365,12 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
             normalizePresentationAlpha(result.pixels, result.width, result.height);
             if (fieldMode)
                 applyFieldPresentation(result.pixels, result.width, result.height, oddField);
+            if (frameModeInterlace)
+            {
+                const uint32_t displayHeight = std::max(displayHeight1, displayHeight2);
+                applyFrameModeStabilize(result.pixels, result.width, result.height, displayHeight);
+                result.height = displayHeight;
+            }
             result.displayFbp = displayFrame1.fbp;
             result.sourceFbp = selected1.fbp;
             return result;
@@ -1973,6 +2386,12 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
         return {};
     if (fieldMode)
         applyFieldPresentation(result.pixels, result.width, result.height, oddField);
+    if (frameModeInterlace)
+    {
+        const uint32_t displayHeight = valid1 ? displayHeight1 : displayHeight2;
+        applyFrameModeStabilize(result.pixels, result.width, result.height, displayHeight);
+        result.height = displayHeight;
+    }
     normalizePresentationAlpha(result.pixels, result.width, result.height);
     result.displayFbp = displayFrame.fbp;
     result.sourceFbp = selected.fbp;

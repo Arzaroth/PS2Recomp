@@ -1433,6 +1433,7 @@ namespace
         {
             ps2_syscalls::dispatchDmacHandlersForCause(rdram, runtime, completedCause);
         }
+        runtime->pollGsInterrupt(rdram);
 
         return 0;
     }

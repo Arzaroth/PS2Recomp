@@ -1,5 +1,6 @@
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/gs_cpu_backend.h"
+#include "runtime/gs/ps2_gs_memory.h"
 #include "ps2_log.h"
 #include "runtime/ps2_memory.h"
 #include <atomic>
@@ -1065,6 +1066,9 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
     writeRegisterUnlocked(regAddr, value);
 }
 
+// Defined in ps2_runtime.cpp: wakes the EE scheduler so GS interrupts are dispatched promptly.
+void ps2NotifyGsCsrEdge();
+
 void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
 {
     const bool interestingReg =
@@ -1470,7 +1474,11 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
             uint32_t lo = static_cast<uint32_t>(m_privRegs->siglblid & 0xFFFFFFFF);
             lo = (lo & ~mask) | (id & mask);
             m_privRegs->siglblid = (m_privRegs->siglblid & 0xFFFFFFFF00000000ULL) | lo;
-            m_privRegs->csr.fetch_or(0x1);
+            if ((m_privRegs->csr.fetch_or(0x1) & 0x1) == 0)
+            {
+                g_gsCsrRaisedEdges.fetch_or(0x1);
+                ps2NotifyGsCsrEdge();
+            }
         }
         break;
     }
@@ -1481,8 +1489,11 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
             m_backend->Flush();
             m_backend->Sync(GSSyncReason::Finish);
         }
-        if (m_privRegs)
-            m_privRegs->csr.fetch_or(0x2);
+        if (m_privRegs && (m_privRegs->csr.fetch_or(0x2) & 0x2) == 0)
+        {
+            g_gsCsrRaisedEdges.fetch_or(0x2);
+            ps2NotifyGsCsrEdge();
+        }
         break;
     }
     case GS_REG_LABEL:
@@ -1653,7 +1664,10 @@ void GS::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)
             m_backend->SnapshotVram(localMemory);
             const size_t bytes = std::min<size_t>(localMemory.size(), m_localMemorySize);
             if (bytes != 0u)
+            {
                 std::memcpy(m_localMemoryStorage, localMemory.data(), bytes);
+                GSMem::MarkAllPagesWritten();
+            }
         }
     }
 

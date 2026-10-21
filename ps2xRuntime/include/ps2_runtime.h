@@ -386,6 +386,8 @@ public:
     uint32_t reserveAsyncCallbackStack(uint32_t size, uint32_t alignment = 16u);
 
     void drainCompletedDmacHandlers(uint8_t *rdram);
+    // Raise INTC cause 0 (GS) for unmasked CSR SIGNAL/FINISH rising edges recorded by the GS.
+    void pollGsInterrupt(uint8_t *rdram);
 
     void requestStop();
     bool isStopRequested() const;
