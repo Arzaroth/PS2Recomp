@@ -760,6 +760,37 @@ ps2x::iop::DebugSnapshot PS2Runtime::iopDebugSnapshot() const
     return m_iopSubsystem->debugSnapshot();
 }
 
+static void dumpRuntimeState(std::ostream &out, const EeKernelSnapshot &ee, const ps2x::iop::DebugSnapshot &iop)
+{
+    static constexpr const char *kStatus[] = {"run", "ready", "wait", "wait+susp", "susp", "dormant"};
+    static constexpr const char *kWait[] = {"-", "sleep", "sema", "evflag", "vsync", "external", "mpeg"};
+    std::ostringstream text;
+    text << "[state] ee cycle=" << ee.eeCycle << " running=" << ee.runningThreadId << '\n';
+    for (const EeThreadSnapshot &thread : ee.threads)
+    {
+        text << "[state]   thread " << thread.id << ' ' << kStatus[static_cast<size_t>(thread.status)]
+             << " wait=" << kWait[static_cast<size_t>(thread.waitReason)] << ':' << thread.waitId
+             << std::hex << " pc=0x" << thread.pc << " ra=0x" << thread.ra << " entry=0x" << thread.entry
+             << std::dec << " prio=" << thread.currentPriority << '\n';
+    }
+    for (const EeSemaphoreSnapshot &sema : ee.semaphores)
+    {
+        if (sema.waiters != 0)
+            text << "[state]   sema " << sema.id << " count=" << sema.count << " waiters=" << sema.waiters << '\n';
+    }
+    for (const EeEventFlagSnapshot &flag : ee.eventFlags)
+    {
+        if (flag.waiters != 0)
+            text << "[state]   evflag " << flag.id << std::hex << " bits=0x" << flag.bits << std::dec
+                 << " waiters=" << flag.waiters << '\n';
+    }
+    text << "[state] iop cycles=" << iop.emulatorCycles << " insns=" << iop.emulatorInstructions
+         << " threads=" << iop.emulatorThreads << " rpc=" << iop.emulatorRpcServers << '\n';
+    for (const std::string &line : iop.diagnostics)
+        text << "[state]   " << line << '\n';
+    out << text.str() << std::flush;
+}
+
 uint32_t PS2Runtime::allocateIopMemory(uint32_t size, uint32_t alignment)
 {
     return m_iopSubsystem ? m_iopSubsystem->allocateMemory(size, alignment) : 0u;
@@ -2617,8 +2648,21 @@ void PS2Runtime::run()
         gameThreadFinished.store(true, std::memory_order_release); });
 
     uint64_t tick = 0;
+    double stateDumpPeriod = 0.0;
+    if (const char *period = std::getenv("PS2X_STATE_DUMP"); period && *period)
+    {
+        stateDumpPeriod = std::max(0.25, std::atof(period));
+    }
+    auto nextStateDump = std::chrono::steady_clock::now();
     while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
     {
+        if (stateDumpPeriod > 0.0 && std::chrono::steady_clock::now() >= nextStateDump)
+        {
+            nextStateDump = std::chrono::steady_clock::now() +
+                            std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                std::chrono::duration<double>(stateDumpPeriod));
+            dumpRuntimeState(std::cerr, m_eeScheduler->snapshot(), iopDebugSnapshot());
+        }
         PS2_IF_AGRESSIVE_LOGS({
             tick++;
             if ((tick % 120) == 0)
