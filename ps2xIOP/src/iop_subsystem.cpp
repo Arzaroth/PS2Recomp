@@ -272,6 +272,8 @@ namespace ps2x::iop
         {
             snapshot.diagnostics.push_back(m_impl->lastError);
         }
+        for (std::string &line : m_impl->emulator.describeThreads())
+            snapshot.diagnostics.push_back(std::move(line));
 
         for (const auto &service : m_impl->coreServices)
         {

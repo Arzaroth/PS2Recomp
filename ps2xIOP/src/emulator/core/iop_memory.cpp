@@ -1,5 +1,7 @@
 #include "iop_memory.h"
 
+#include "iop_sio2.h"
+
 #include <algorithm>
 #include <cstring>
 
@@ -196,6 +198,12 @@ namespace ps2x::iop::detail
                            { return value != 0u; });
     }
 
+    bool IopMemory::isRamRange(uint32_t address, size_t size) const
+    {
+        const uint32_t phys = physicalAddress(address);
+        return phys <= RamSize && size <= RamSize - phys;
+    }
+
     void IopMemory::markOwned(uint32_t address, size_t size)
     {
         if (address > RamSize || size > RamSize - address)
@@ -213,6 +221,8 @@ namespace ps2x::iop::detail
 
     uint32_t IopMemory::readHardware32(uint32_t address) const
     {
+        if (m_sio2 && IopSio2::handles(address))
+            return m_sio2->read32(address);
         const auto value = m_hardware.find(address);
         if (value != m_hardware.end())
             return value->second;
@@ -231,6 +241,11 @@ namespace ps2x::iop::detail
 
     void IopMemory::writeHardware32(uint32_t address, uint32_t value)
     {
+        if (m_sio2 && IopSio2::handles(address))
+        {
+            m_sio2->write32(address, value);
+            return;
+        }
         switch (address)
         {
         case 0x1F801070u:

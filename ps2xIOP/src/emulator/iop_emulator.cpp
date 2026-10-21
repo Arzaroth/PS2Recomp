@@ -8,6 +8,7 @@
 #include "core/iop_kernel.h"
 #include "imports/iop_loadcore.h"
 #include "core/iop_memory.h"
+#include "core/iop_sio2.h"
 #include "services/iop_module_loader.h"
 #include "services/iop_rpc.h"
 #include "imports/iop_stdio.h"
@@ -41,6 +42,7 @@ namespace ps2x::iop::detail
         constexpr uint32_t kCallStackCapacity = (kCallStackLimit - kCallStackBase) / kCallStackSize;
         constexpr uint64_t kCdvdCompletionCycles = 128u;
         constexpr uint32_t kMaxSifCommandPacket = 112u;
+        constexpr uint64_t kSifDmaCompletionCycles = 128u;
         constexpr uint32_t kSifCommandHandlerBudget = 100000u;
 
         uint32_t physicalAddress(uint32_t address)
@@ -121,8 +123,12 @@ namespace ps2x::iop::detail
               ioman(memory),
               cpuCore(memory),
               imports(memory),
-              loadcore(memory, imports)
+              loadcore(memory, imports),
+              sio2(memory)
         {
+            memory.setSio2(&sio2);
+            sio2.setPadStateReader([this](uint8_t *state, size_t size)
+                                   { return host.readPadState(0, state, size); });
             reset();
         }
 
@@ -141,6 +147,8 @@ namespace ps2x::iop::detail
             pendingGuestCallbacks.clear();
             pendingSifCommands.clear();
             sifCommandBuffer = 0u;
+            sio2.reset();
+            dmaRequests = {};
             nextModuleId = 1;
             moduleCursor = kModuleLoadBase;
             totalCycles = 0;
@@ -333,9 +341,16 @@ namespace ps2x::iop::detail
                 return ImportDisposition::Handled;
             if (iequals(call.library, "sifman"))
             {
-                return rpc.dispatchSifManImport(call.ordinal, cpu)
-                           ? ImportDisposition::Handled
-                           : ImportDisposition::Missing;
+                const uint32_t callback = cpu.gpr[6];
+                const uint32_t argument = cpu.gpr[7];
+                if (!rpc.dispatchSifManImport(call.ordinal, cpu))
+                    return ImportDisposition::Missing;
+                // sceSifSetDmaIntr: the transfer completes at once; its callback runs like the
+                // DMA completion interrupt (Dbc_Manager releases its DMA semaphore there).
+                if (call.ordinal == 32u && cpu.gpr[2] != 0u && callback != 0u)
+                    pendingGuestCallbacks.emplace(totalCycles + kSifDmaCompletionCycles,
+                                                  ScheduledGuestCallback{callback, cpu.gpr[28], argument});
+                return ImportDisposition::Handled;
             }
             if (iequals(call.library, "vblank") && vblank.dispatchImport(call.ordinal, cpu, totalCycles))
                 return ImportDisposition::Handled;
@@ -343,7 +358,7 @@ namespace ps2x::iop::detail
                 return ImportDisposition::Handled;
             if (iequals(call.library, "dmacman"))
             {
-                setV0(0);
+                dispatchDmacImport(call.ordinal, cpu);
                 return ImportDisposition::Handled;
             }
             if (iequals(call.library, "stdio") && stdio.dispatchImport(call.ordinal, cpu))
@@ -568,6 +583,34 @@ namespace ps2x::iop::detail
             servicingGuestCallbacks = false;
         }
 
+        // dmacman: only the SIO2 channels move data (dmac_request stores the transfer,
+        // dmac_transfer runs it); the other calls succeed without effect.
+        void dispatchDmacImport(uint16_t ordinal, CpuState &cpu)
+        {
+            const uint32_t channel = cpu.gpr[4];
+            switch (ordinal)
+            {
+            case 28: // dmac_request(channel, address, words per block, blocks, direction)
+                if (channel < dmaRequests.size())
+                {
+                    const uint32_t blocks = std::max<uint32_t>(cpu.gpr[7], 1u);
+                    dmaRequests[channel] = {cpu.gpr[5], cpu.gpr[6] * blocks * 4u};
+                }
+                cpu.gpr[2] = 1u;
+                return;
+            case 32: // dmac_transfer(channel)
+                if (channel == IopSio2::DmaInChannel)
+                    sio2.dmaToDevice(dmaRequests[channel].address, dmaRequests[channel].bytes);
+                else if (channel == IopSio2::DmaOutChannel)
+                    sio2.armDmaFromDevice(dmaRequests[channel].address, dmaRequests[channel].bytes);
+                cpu.gpr[2] = 0u;
+                return;
+            default:
+                cpu.gpr[2] = 0u;
+                return;
+            }
+        }
+
         bool queueSifCommand(uint32_t cid, const void *packet, uint32_t size)
         {
             if (!packet || size < 16u || size > kMaxSifCommandPacket)
@@ -772,6 +815,13 @@ namespace ps2x::iop::detail
         std::map<int, Module> modules;
         std::map<int, uint64_t> pendingDmaInterrupts;
         std::multimap<uint64_t, ScheduledGuestCallback> pendingGuestCallbacks;
+        IopSio2 sio2;
+        struct DmaRequest
+        {
+            uint32_t address = 0u;
+            uint32_t bytes = 0u;
+        };
+        std::array<DmaRequest, 16> dmaRequests{};
         std::deque<PendingSifCommand> pendingSifCommands;
         uint32_t sifCommandBuffer = 0u;
         bool servicingSifCommands = false;
@@ -903,6 +953,11 @@ namespace ps2x::iop::detail
     uint32_t IopEmulator::loadedModuleCount() const noexcept
     {
         return static_cast<uint32_t>(m_impl->modules.size());
+    }
+
+    std::vector<std::string> IopEmulator::describeThreads() const
+    {
+        return m_impl->kernel.describeThreads();
     }
 
     uint32_t IopEmulator::threadCount() const noexcept

@@ -40,7 +40,9 @@ namespace ps2x::iop::detail
             m_sifInitialized = true;
             setV0(0u);
             return true;
-        case 7: // sceSifSetDma
+        case 7:  // sceSifSetDma(descriptors, count)
+        case 32: // sceSifSetDmaIntr(descriptors, count, callback, argument): the emulator calls
+                 // the completion callback (see IopEmulator's sifman dispatch)
         {
             constexpr uint32_t kDescriptorSize = 16u;
             constexpr uint32_t kMaxDescriptors = 32u;
@@ -79,8 +81,11 @@ namespace ps2x::iop::detail
                     continue;
 
                 const uint32_t size = static_cast<uint32_t>(signedSize);
-                if (!m_memory.ownsRamRange(source, size))
+                if (!m_memory.isRamRange(source, size))
                 {
+                    char message[128];
+                    std::snprintf(message, sizeof(message), "[IOP] sceSifSetDma: bad IOP source 0x%x (%u bytes)", source, size);
+                    m_host.log(LogLevel::Warning, message);
                     setV0(0u);
                     return true;
                 }
@@ -98,6 +103,10 @@ namespace ps2x::iop::detail
                 const PendingTransfer &transfer = pending[i];
                 if (!m_host.readGuest(transfer.destination, scratch.data(), transfer.size))
                 {
+                    char message[128];
+                    std::snprintf(message, sizeof(message), "[IOP] sceSifSetDma: bad EE destination 0x%x (source 0x%x, %u bytes)",
+                                  transfer.destination, transfer.source, transfer.size);
+                    m_host.log(LogLevel::Warning, message);
                     setV0(0u);
                     return true;
                 }
@@ -188,7 +197,7 @@ namespace ps2x::iop::detail
             const int32_t signedExtraSize = static_cast<int32_t>(m_memory.read32(stackPointer + 20u));
 
             if (packetAddress == 0u || packetSize < kHeaderSize || packetSize > kMaxPacketSize ||
-                !m_memory.ownsRamRange(packetAddress, packetSize))
+                !m_memory.isRamRange(packetAddress, packetSize))
             {
                 setV0(0u);
                 return true;
@@ -206,7 +215,7 @@ namespace ps2x::iop::detail
             {
                 extraSize = static_cast<uint32_t>(signedExtraSize);
                 if (extraSource == 0u || extraDestination == 0u ||
-                    !m_memory.ownsRamRange(extraSource, extraSize) ||
+                    !m_memory.isRamRange(extraSource, extraSize) ||
                     !m_host.writeGuest(extraDestination, m_memory.ram().data() + IopMemory::physicalAddress(extraSource), extraSize))
                 {
                     setV0(0u);

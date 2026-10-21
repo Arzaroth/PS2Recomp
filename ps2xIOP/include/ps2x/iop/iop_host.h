@@ -130,6 +130,16 @@ namespace ps2x::iop
             return false;
         }
 
+        // 32-byte pad state of a controller port in libpad's layout ([2..3] buttons, active low;
+        // [4..7] right and left sticks). The default reports no input.
+        virtual bool readPadState(int port, uint8_t *state, size_t size)
+        {
+            (void)port;
+            (void)state;
+            (void)size;
+            return false;
+        }
+
         virtual void log(LogLevel level, std::string_view message) = 0;
     };
 }
