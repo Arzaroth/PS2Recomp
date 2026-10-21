@@ -11,6 +11,7 @@
 #include "Kernel/Stubs/Audio.h"
 #include "Kernel/Stubs/GS.h"
 #include "Kernel/Stubs/MPEG.h"
+#include "Kernel/Syscalls/RPC.h"
 #include "ps2_host_backend.h"
 #include "ps2_iop_host.h"
 #include "ps2x/iop/iop_subsystem.h"
@@ -27,6 +28,7 @@
 #include <chrono>
 #include "runtime/ps2_vu1_trace.h"
 #include <thread>
+#include <memory>
 #include <unordered_map>
 #include <sstream>
 
@@ -760,12 +762,61 @@ ps2x::iop::DebugSnapshot PS2Runtime::iopDebugSnapshot() const
     return m_iopSubsystem->debugSnapshot();
 }
 
-static void dumpRuntimeState(std::ostream &out, const EeKernelSnapshot &ee, const ps2x::iop::DebugSnapshot &iop)
+namespace
+{
+    constexpr size_t kCallTraceSlots = PS2_RAM_SIZE / 4u;
+
+    std::atomic<uint32_t> *callTraceCounters()
+    {
+        static std::unique_ptr<std::atomic<uint32_t>[]> counters = []() -> std::unique_ptr<std::atomic<uint32_t>[]>
+        {
+            const char *enabled = std::getenv("PS2X_CALL_TRACE");
+            if (!enabled || !*enabled || std::strcmp(enabled, "0") == 0)
+                return nullptr;
+            return std::make_unique<std::atomic<uint32_t>[]>(kCallTraceSlots);
+        }();
+        return counters.get();
+    }
+
+    void countGuestCall(uint32_t targetPc)
+    {
+        if (std::atomic<uint32_t> *counters = callTraceCounters())
+            counters[(targetPc & PS2_RAM_MASK) >> 2u].fetch_add(1u, std::memory_order_relaxed);
+    }
+
+    void dumpHottestCalls(std::ostringstream &text)
+    {
+        std::atomic<uint32_t> *counters = callTraceCounters();
+        if (!counters)
+            return;
+        std::vector<std::pair<uint32_t, uint32_t>> hot;
+        for (size_t slot = 0; slot < kCallTraceSlots; ++slot)
+        {
+            if (const uint32_t calls = counters[slot].exchange(0u, std::memory_order_relaxed))
+                hot.emplace_back(calls, static_cast<uint32_t>(slot << 2u));
+        }
+        const size_t shown = std::min<size_t>(hot.size(), 512u);
+        std::partial_sort(hot.begin(), hot.begin() + static_cast<std::ptrdiff_t>(shown), hot.end(),
+                          [](const auto &lhs, const auto &rhs) { return lhs.first > rhs.first; });
+        text << "[state] calls: " << hot.size() << " distinct targets since last dump\n";
+        for (size_t index = 0; index < shown; ++index)
+            text << "[state]   0x" << std::hex << hot[index].second << std::dec << " x" << hot[index].first << '\n';
+    }
+}
+
+static void dumpRuntimeState(std::ostream &out, PS2Memory &memory, const EeKernelSnapshot &ee,
+                             const ps2x::iop::DebugSnapshot &iop)
 {
     static constexpr const char *kStatus[] = {"run", "ready", "wait", "wait+susp", "susp", "dormant"};
     static constexpr const char *kWait[] = {"-", "sleep", "sema", "evflag", "vsync", "external", "mpeg"};
     std::ostringstream text;
     text << "[state] ee cycle=" << ee.eeCycle << " running=" << ee.runningThreadId << '\n';
+    const GSRegisters &gs = memory.gs();
+    text << "[state] dma=" << memory.dmaStartCount() << " gif=" << memory.gifCopyCount()
+         << " gsw=" << memory.gsWriteCount() << " vif=" << memory.vifWriteCount() << std::hex
+         << " pmode=0x" << gs.pmode << " dispfb1=0x" << gs.dispfb1 << " display1=0x" << gs.display1
+         << " dispfb2=0x" << gs.dispfb2 << " display2=0x" << gs.display2 << " bgcolor=0x" << gs.bgcolor
+         << std::dec << '\n';
     for (const EeThreadSnapshot &thread : ee.threads)
     {
         text << "[state]   thread " << thread.id << ' ' << kStatus[static_cast<size_t>(thread.status)]
@@ -788,6 +839,8 @@ static void dumpRuntimeState(std::ostream &out, const EeKernelSnapshot &ee, cons
          << " threads=" << iop.emulatorThreads << " rpc=" << iop.emulatorRpcServers << '\n';
     for (const std::string &line : iop.diagnostics)
         text << "[state]   " << line << '\n';
+    ps2_syscalls::describeSifRpcHistory(text);
+    dumpHottestCalls(text);
     out << text.str() << std::flush;
 }
 
@@ -1566,6 +1619,8 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
 {
     ctx->pc = targetPc;
     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
+    if (isCall)
+        countGuestCall(targetPc);
 
     // Every inter-function transfer is also a deterministic EE safe point.
     // Backward edges inside generated functions use eeCheckpointDue(), while
@@ -2661,7 +2716,7 @@ void PS2Runtime::run()
             nextStateDump = std::chrono::steady_clock::now() +
                             std::chrono::duration_cast<std::chrono::steady_clock::duration>(
                                 std::chrono::duration<double>(stateDumpPeriod));
-            dumpRuntimeState(std::cerr, m_eeScheduler->snapshot(), iopDebugSnapshot());
+            dumpRuntimeState(std::cerr, m_memory, m_eeScheduler->snapshot(), iopDebugSnapshot());
         }
         PS2_IF_AGRESSIVE_LOGS({
             tick++;

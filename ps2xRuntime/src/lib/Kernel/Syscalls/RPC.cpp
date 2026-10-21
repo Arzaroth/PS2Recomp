@@ -3,6 +3,9 @@
 #include "../../ps2_iop_transport.h"
 
 #include <array>
+#include <map>
+#include <string>
+#include <tuple>
 
 namespace ps2_syscalls
 {
@@ -251,6 +254,41 @@ namespace ps2_syscalls
         event.result = 0;
         pushSifRpcDebugEventLocked(event);
         setReturnS32(ctx, 0);
+    }
+
+    void describeSifRpcHistory(std::ostream &out)
+    {
+        struct Row
+        {
+            uint32_t count = 0;
+            uint64_t lastSeq = 0;
+            uint32_t lastPc = 0;
+        };
+        std::map<std::tuple<std::string, uint32_t, uint32_t, int32_t>, Row> rows;
+        uint64_t nextSeq = 0;
+        {
+            std::lock_guard<std::mutex> lock(g_rpc_mutex);
+            nextSeq = g_sif_rpc_debug_next_seq;
+            for (const SifRpcDebugEvent &event : g_sif_rpc_debug_history)
+            {
+                if (event.seq == 0u)
+                    continue;
+                Row &row = rows[{event.op ? event.op : "?", event.sid, event.rpcNum, event.result}];
+                ++row.count;
+                if (event.seq > row.lastSeq)
+                {
+                    row.lastSeq = event.seq;
+                    row.lastPc = event.pc;
+                }
+            }
+        }
+        out << "[state] sif rpc events=" << nextSeq << " (recent " << kSifRpcDebugHistoryCount << " grouped)\n";
+        for (const auto &[key, row] : rows)
+        {
+            out << "[state]   " << std::get<0>(key) << std::hex << " sid=0x" << std::get<1>(key) << " rpc=0x"
+                << std::get<2>(key) << std::dec << " result=" << std::get<3>(key) << " x" << row.count
+                << " lastSeq=" << row.lastSeq << std::hex << " pc=0x" << row.lastPc << std::dec << '\n';
+        }
     }
 
     void SifBindRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

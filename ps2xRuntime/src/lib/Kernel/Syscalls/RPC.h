@@ -2,8 +2,11 @@
 
 #include "ps2_syscalls.h"
 
+#include <ostream>
+
 namespace ps2_syscalls
 {
+    void describeSifRpcHistory(std::ostream &out);
     void SifStopModule(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void SifLoadModule(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void SifInitRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
