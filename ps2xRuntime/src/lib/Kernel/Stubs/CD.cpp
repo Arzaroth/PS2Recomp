@@ -346,6 +346,14 @@ namespace ps2_stubs
 
         if (ok)
         {
+            static uint32_t readLogCount = 0;
+            if (readLogCount < 64 || (readLogCount % 256u) == 0u)
+            {
+                RUNTIME_LOG("[sceCdRead:ok] #" << readLogCount << " lbn=0x" << std::hex << selected.lbn
+                                               << " sectors=0x" << selected.sectors << " buf=0x" << selected.buf
+                                               << " ra=0x" << getRegU32(ctx, 31) << std::dec << std::endl);
+            }
+            ++readLogCount;
             g_cdStreamingLbn = selected.lbn + selected.sectors;
             setReturnS32(ctx, 1); // command accepted/success
             // The read completes immediately here; report it like the drive interrupt would.

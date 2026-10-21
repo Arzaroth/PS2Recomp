@@ -6,6 +6,7 @@
 #include "ps2x/iop/iop_host.h"
 #include "ps2x/iop/ps2_path.h"
 
+#include <cstdio>
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -698,7 +699,16 @@ namespace ps2x::iop::detail
                 }
             }
 
-            if (!read || !memory.writeRam(destination, bytes.data(), bytes.size()))
+            const bool ok = read && memory.writeRam(destination, bytes.data(), bytes.size());
+            if (readLogCount < 64u || (readLogCount % 256u) == 0u || !ok)
+            {
+                char line[128];
+                std::snprintf(line, sizeof(line), "[IOP cdvd] read #%u lsn=0x%x sectors=0x%x dst=0x%x %s",
+                              readLogCount, lsn, sectors, destination, ok ? "ok" : "FAILED");
+                host.log(LogLevel::Info, line);
+            }
+            ++readLogCount;
+            if (!ok)
             {
                 lastError = kCdvdErrorRead;
                 return false;
@@ -706,6 +716,8 @@ namespace ps2x::iop::detail
             lastError = kCdvdErrorNone;
             return true;
         }
+
+        uint32_t readLogCount = 0u;
 
         IopHost &host;
         IopMemory &memory;

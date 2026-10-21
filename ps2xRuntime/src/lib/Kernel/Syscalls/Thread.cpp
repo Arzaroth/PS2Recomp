@@ -230,7 +230,11 @@ namespace ps2_syscalls
             param->initial_priority,
             param->option,
         };
-        setReturnS32(ctx, scheduler(rdram, ctx, runtime).createThread(decoded));
+        const int created = scheduler(rdram, ctx, runtime).createThread(decoded);
+        RUNTIME_LOG("[CreateThread] id=" << created << std::hex << " entry=0x" << param->func << " stack=0x"
+                                         << param->stack << " size=0x" << param->stack_size << std::dec
+                                         << " prio=" << param->initial_priority << std::endl);
+        setReturnS32(ctx, created);
     }
 
     void DeleteThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -268,6 +272,9 @@ namespace ps2_syscalls
         }
         if (!runtime->hasFunction(target->entry))
         {
+            std::cerr << "[StartThread] thread " << id << " entry 0x" << std::hex << target->entry
+                      << " is not a recompiled function (caller ra=0x" << getRegU32(ctx, 31) << ")" << std::dec
+                      << std::endl;
             setReturnS32(ctx, KE_ERROR);
             return;
         }
@@ -405,23 +412,41 @@ namespace ps2_syscalls
         CancelWakeupThread(rdram, ctx, runtime);
     }
 
+    namespace
+    {
+        void logPriorityCall(const char *name, R5900Context *ctx)
+        {
+            static uint32_t count = 0;
+            if (count++ < 64u)
+            {
+                RUNTIME_LOG("[" << name << "] a0=" << static_cast<int32_t>(getRegU32(ctx, 4))
+                                << " a1=" << static_cast<int32_t>(getRegU32(ctx, 5)) << std::hex << " ra=0x"
+                                << getRegU32(ctx, 31) << std::dec << std::endl);
+            }
+        }
+    }
+
     void ChangeThreadPriority(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        logPriorityCall("ChangeThreadPriority", ctx);
         changePriorityImpl(rdram, ctx, runtime, false);
     }
 
     void iChangeThreadPriority(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        logPriorityCall("iChangeThreadPriority", ctx);
         changePriorityImpl(rdram, ctx, runtime, true);
     }
 
     void RotateThreadReadyQueue(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        logPriorityCall("RotateThreadReadyQueue", ctx);
         rotateReadyQueueImpl(rdram, ctx, runtime, false);
     }
 
     void iRotateThreadReadyQueue(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        logPriorityCall("iRotateThreadReadyQueue", ctx);
         rotateReadyQueueImpl(rdram, ctx, runtime, true);
     }
 
