@@ -11,6 +11,8 @@
 
 namespace ps2x::iop::detail
 {
+    class IopSio2;
+
     class IopMemory
     {
     public:
@@ -53,6 +55,8 @@ namespace ps2x::iop::detail
         [[nodiscard]] bool writeRam(uint32_t address, const void *source, size_t size);
         [[nodiscard]] bool zeroRam(uint32_t address, size_t size);
         [[nodiscard]] bool ownsRamRange(uint32_t address, size_t size) const;
+        // Whole range inside IOP RAM, written or not (what a DMA can read).
+        [[nodiscard]] bool isRamRange(uint32_t address, size_t size) const;
         [[nodiscard]] bool isHardwareAddress(uint32_t address) const;
         [[nodiscard]] std::string readString(uint32_t address, size_t limit = 1024u) const;
 
@@ -74,6 +78,10 @@ namespace ps2x::iop::detail
         void setInterruptControl(uint32_t value) noexcept { m_interruptControl = value & 1u; }
 
         [[nodiscard]] std::optional<DmaStart> takeDmaStart() noexcept;
+        // Raise irq after delayCycles (delivered through the same path as DMA completions).
+        void requestInterrupt(int irq, uint64_t delayCycles) noexcept { m_dmaStart = DmaStart{irq, delayCycles}; }
+        // SIO2 controller registers are forwarded to this device (owned by the emulator).
+        void setSio2(IopSio2 *sio2) noexcept { m_sio2 = sio2; }
         [[nodiscard]] std::span<const uint8_t> ram() const noexcept { return m_ram; }
 
         [[nodiscard]] static uint32_t physicalAddress(uint32_t address) noexcept;
@@ -95,5 +103,6 @@ namespace ps2x::iop::detail
         uint32_t m_interruptMask = 0;
         uint32_t m_interruptControl = 1;
         std::optional<DmaStart> m_dmaStart;
+        IopSio2 *m_sio2 = nullptr;
     };
 }

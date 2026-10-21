@@ -517,6 +517,12 @@ bool PS2IopHostAdapter::sendSifCommand(uint32_t commandId,
                                          packetSize);
 }
 
+bool PS2IopHostAdapter::readPadState(int port, uint8_t *state, size_t size)
+{
+    // The IOP's emulated SIO2 DualShock 2 reads the same host input as the EE libpad HLE.
+    return m_runtime.padBackend().readState(port, 0, state, size);
+}
+
 void PS2IopHostAdapter::log(ps2x::iop::LogLevel level, std::string_view message)
 {
     const char *prefix = "[ps2xIOP]";

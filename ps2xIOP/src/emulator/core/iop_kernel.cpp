@@ -1,5 +1,8 @@
 #include "iop_kernel.h"
 
+#include <cstdio>
+#include <iterator>
+
 #include "iop_memory.h"
 #include "../iop_emulator_const.h"
 
@@ -16,6 +19,24 @@ namespace ps2x::iop::detail
             const uint32_t mask = alignment - 1u;
             return (value + mask) & ~mask;
         }
+    }
+
+    std::vector<std::string> IopKernel::describeThreads() const
+    {
+        static constexpr const char *kStates[] = {"dormant", "ready", "running", "sleep", "delay",
+                                                  "sema", "evflag", "suspended", "dead"};
+        std::vector<std::string> lines;
+        for (const auto &[id, thread] : m_threads)
+        {
+            const auto state = static_cast<size_t>(thread.state);
+            char line[160];
+            std::snprintf(line, sizeof(line), "iop thread %d %s pc=0x%x ra=0x%x entry=0x%x prio=%u wait=%d bits=0x%x wake=%llu",
+                          id, state < std::size(kStates) ? kStates[state] : "?", thread.cpu.pc, thread.cpu.gpr[31],
+                          thread.entry, thread.priority, thread.waitId, thread.waitBits,
+                          static_cast<unsigned long long>(thread.wakeCycle));
+            lines.emplace_back(line);
+        }
+        return lines;
     }
 
     IopKernel::IopKernel(IopMemory &memory) noexcept

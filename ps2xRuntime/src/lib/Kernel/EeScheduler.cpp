@@ -112,6 +112,7 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     m_insideInterrupt = false;
     m_pendingEeTimerInterrupts = 0u;
     m_eeCycle = 0u;
+    m_iopEeCycles = 0u;
     m_sliceEndCycle = kDefaultTimeSliceCycles;
     m_stopRequested.store(false, std::memory_order_release);
     m_checkpointPending.store(false, std::memory_order_release);
@@ -394,6 +395,7 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
     m_eeCycle += elapsed;
     m_pendingEeTimerInterrupts |= m_runtime.memory().advanceEeTimers(elapsed);
     m_runtime.advanceIopEeCycles(elapsed);
+    m_iopEeCycles += elapsed;
     if (m_pendingEeTimerInterrupts != 0u)
     {
         m_checkpointPending.store(true, std::memory_order_release);
@@ -1870,7 +1872,21 @@ void EeScheduler::processEvent(const EeEvent &event)
         requestStop();
         break;
     case EeEventType::VBlankStart:
+    {
         ++m_vsyncTick;
+        // The IOP clock only advances with the EE cycles the recompiled code accounts, far
+        // fewer than real time, while vblanks follow the host's 60 Hz. Catch the IOP up to the
+        // end of its matching vblank so its vblank-paced threads (SIO2 pad and memory card
+        // drivers wait on WaitVblankStart/End) run once per frame.
+        constexpr uint64_t kIopClockHz = 36'864'000ull;
+        constexpr uint64_t kEeCyclesPerIopCycle = 8ull;
+        constexpr uint64_t kIopVblankCycles = (kIopClockHz * 1001ull + 30'000ull) / 60'000ull;
+        const uint64_t target = (m_vsyncTick * kIopVblankCycles + kIopVblankCycles / 16ull + 1ull) * kEeCyclesPerIopCycle;
+        if (target > m_iopEeCycles)
+        {
+            m_runtime.advanceIopEeCycles(target - m_iopEeCycles);
+            m_iopEeCycles = target;
+        }
         m_runtime.memory().gs().vsyncTick.store(m_vsyncTick, std::memory_order_release);
         if ((m_vsyncTick & 1u) != 0u)
         {
@@ -1905,6 +1921,7 @@ void EeScheduler::processEvent(const EeEvent &event)
         }
         dispatchIrq(false, 2u);
         break;
+    }
     case EeEventType::ExternalWake:
         completeExternalWait(event.id, event.value, KE_OK);
         break;
