@@ -483,7 +483,11 @@ namespace ps2_stubs
         // NTSC-style fields at ~59.94 Hz to keep MPEG timing yet (29.97 fps).
         constexpr uint64_t kDefaultPictureIntervalQ32 = 2ull * kPictureClockOne;
         constexpr size_t kMpegTimingScanLimit = 4096u;
-        constexpr size_t kMaxDecodedPicturesAhead = 8u;
+        // Decode lead before sceMpegDemuxPss/Ring stops consuming. The real libmpeg buffers
+        // the compressed video, not decoded pictures, so games may demux seconds ahead:
+        // Valkyrie Profile 2 waits for 512 KiB of movie audio (about 2.7 s, 80 pictures at
+        // 30 fps) before fetching its first picture. 128 pictures cost ~150 MB at 640x448.
+        constexpr size_t kMaxDecodedPicturesAhead = 128u;
 
         struct MpegPlaybackState
         {
