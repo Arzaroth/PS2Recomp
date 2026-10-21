@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -2183,6 +2184,10 @@ void PS2DebugPanel::initialize()
     {
         rlImGuiSetup(true);
         m_initialized = true;
+        if (const char *visible = std::getenv("PS2X_DEBUG_UI"); visible && std::strcmp(visible, "0") == 0)
+        {
+            m_visible = false;
+        }
     }
 #endif
 }
