@@ -1,6 +1,13 @@
 #include "runtime/ps2_pad.h"
 #include "ps2_host_backend.h"
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
 
 namespace
 {
@@ -23,6 +30,70 @@ namespace
     constexpr uint16_t PAD_L1 = 0x0400u;
     constexpr uint16_t PAD_R2 = 0x0200u;
     constexpr uint16_t PAD_L2 = 0x0100u;
+
+    struct ScriptedPress
+    {
+        double at = 0.0;
+        uint16_t mask = 0u;
+    };
+
+    uint16_t scriptedButtonMask(std::string_view name)
+    {
+        static constexpr std::pair<std::string_view, uint16_t> kNames[] = {
+            {"up", PAD_UP}, {"down", PAD_DOWN}, {"left", PAD_LEFT}, {"right", PAD_RIGHT},
+            {"start", PAD_START}, {"select", PAD_SELECT}, {"cross", PAD_CROSS}, {"circle", PAD_CIRCLE},
+            {"square", PAD_SQUARE}, {"triangle", PAD_TRIANGLE}, {"l1", PAD_L1}, {"r1", PAD_R1},
+            {"l2", PAD_L2}, {"r2", PAD_R2}, {"l3", PAD_L3}, {"r3", PAD_R3}};
+        for (const auto &[candidate, mask] : kNames)
+        {
+            if (candidate == name)
+                return mask;
+        }
+        return 0u;
+    }
+
+    // PS2X_PAD_SCRIPT="8:cross,10.5:start": hold each button for a quarter second at that many
+    // seconds after the first pad read.
+    uint16_t scriptedButtons()
+    {
+        static const std::vector<ScriptedPress> presses = []
+        {
+            std::vector<ScriptedPress> parsed;
+            const char *script = std::getenv("PS2X_PAD_SCRIPT");
+            std::string_view rest = script ? script : "";
+            while (!rest.empty())
+            {
+                const size_t comma = rest.find(',');
+                const std::string_view entry = rest.substr(0, comma);
+                rest = comma == std::string_view::npos ? std::string_view{} : rest.substr(comma + 1);
+                const size_t colon = entry.find(':');
+                if (colon == std::string_view::npos)
+                    continue;
+                const uint16_t mask = scriptedButtonMask(entry.substr(colon + 1));
+                if (mask != 0u)
+                    parsed.push_back({std::atof(std::string(entry.substr(0, colon)).c_str()), mask});
+            }
+            return parsed;
+        }();
+        if (presses.empty())
+            return 0u;
+
+        static const auto start = std::chrono::steady_clock::now();
+        const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        static uint16_t previous = 0u;
+        uint16_t held = 0u;
+        for (const ScriptedPress &press : presses)
+        {
+            if (now >= press.at && now < press.at + 0.25)
+                held |= press.mask;
+        }
+        if (held != previous)
+        {
+            std::fprintf(stderr, "[pad-script] t=%.2f buttons=0x%04x\n", now, held);
+            previous = held;
+        }
+        return held;
+    }
 }
 
 bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t size)
@@ -119,6 +190,7 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
             clearBit(PAD_SELECT);
     }
 
+    btns &= static_cast<uint16_t>(~scriptedButtons());
     data[2] = static_cast<uint8_t>(btns & 0xFF);
     data[3] = static_cast<uint8_t>(btns >> 8);
     return true;
