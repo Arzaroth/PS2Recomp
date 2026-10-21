@@ -144,6 +144,13 @@ namespace
                (static_cast<uint32_t>(is & 0xFu) << 11);
     }
 
+    uint32_t makeVuJalr(uint8_t it, uint8_t is)
+    {
+        return (0x25u << 25) |
+               (static_cast<uint32_t>(it & 0xFu) << 16) |
+               (static_cast<uint32_t>(is & 0xFu) << 11);
+    }
+
     uint32_t makeVuIbne(uint8_t is, uint8_t it, int16_t imm)
     {
         return (0x29u << 25) |
@@ -1080,13 +1087,13 @@ void register_ps2_vu1_tests()
                      "the flag-driven branch should arrive at its target");
         });
 
-        tc.Run("JR shares the one-instruction VI branch visibility rule", [](TestCase &t)
+        tc.Run("JR reads the VI value written by the previous instruction", [](TestCase &t)
         {
             Vu1Fixture fx;
             t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
 
             writeVuInstructionPair(
-                fx.code, 0u, makeVuIaddiu(1u, 0u, 2),
+                fx.code, 0u, makeVuIaddiu(1u, 0u, 4),
                 kVuUpperNop);
             writeVuInstructionPair(
                 fx.code, 8u, makeVuJr(1u),
@@ -1102,19 +1109,42 @@ void register_ps2_vu1_tests()
                 kVuUpperNop);
 
             VU1Interpreter vu1;
-            vu1.state().vi[1] = 4;
+            vu1.state().vi[1] = 2;
             vu1.execute(fx.code, PS2_VU1_CODE_SIZE,
                         fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem,
                         0u, 0u, 0u, 4u);
 
-            t.Equals(vu1.state().vi[1], 2,
-                     "the pending IALU write should still commit normally");
+            t.Equals(vu1.state().vi[1], 4,
+                     "the IALU write should commit normally");
             t.Equals(vu1.state().vi[2], 2,
                      "JR should execute exactly one delay-slot pair");
             t.Equals(vu1.state().vi[3], 0,
                      "JR should skip the sequential instruction after its delay slot");
             t.Equals(vu1.state().vi[4], 4,
-                     "JR immediately after a VI write should branch using the previous VI value");
+                     "JR immediately after a VI write should branch using the new VI value");
+        });
+
+        tc.Run("JALR reads the VI value written by the previous instruction", [](TestCase &t)
+        {
+            Vu1Fixture fx;
+            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
+
+            // VP2 calls its loader this way: IADDIU vi1, vi0, target; JALR vi15, vi1.
+            writeVuInstructionPair(fx.code, 0u, makeVuIaddiu(1u, 0u, 4), kVuUpperNop);
+            writeVuInstructionPair(fx.code, 8u, makeVuJalr(15u, 1u), kVuUpperNop);
+            writeVuInstructionPair(fx.code, 16u, makeVuIaddiu(2u, 0u, 2), kVuUpperNop);
+            writeVuInstructionPair(fx.code, 24u, makeVuIaddiu(3u, 0u, 3), kVuUpperNop);
+            writeVuInstructionPair(fx.code, 32u, makeVuIaddiu(4u, 0u, 4), kVuUpperNop);
+
+            VU1Interpreter vu1;
+            vu1.state().vi[1] = 3;
+            vu1.execute(fx.code, PS2_VU1_CODE_SIZE,
+                        fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem,
+                        0u, 0u, 0u, 4u);
+
+            t.Equals(vu1.state().vi[15], 3, "JALR should link the address after its delay slot");
+            t.Equals(vu1.state().vi[3], 0, "JALR should not jump to the previous VI value");
+            t.Equals(vu1.state().vi[4], 4, "JALR should jump to the freshly written VI value");
         });
 
         tc.Run("MPG upload invalidates cached VU1 decode before MSCAL", [](TestCase &t)
@@ -1227,6 +1257,39 @@ void register_ps2_vu1_tests()
                 }
                 t.IsTrue(payloadOk, "wrapped payload should be copied from start of VU1 memory");
             }
+        });
+
+        tc.Run("XGKICK transfers a FLG 3 GIF tag as IMAGE", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            std::vector<std::vector<uint8_t>> captured;
+            mem.setGifPacketCallback([&](const uint8_t *data, uint32_t sizeBytes)
+            {
+                captured.emplace_back(data, data + sizeBytes);
+            });
+
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+
+            uint8_t *vuCode = mem.getVU1Code();
+            uint8_t *vuData = mem.getVU1Data();
+            std::memset(vuCode, 0, PS2_VU1_CODE_SIZE);
+            std::memset(vuData, 0, PS2_VU1_DATA_SIZE);
+
+            // FLG 3 ("disable") moves NLOOP qwords like IMAGE.
+            const uint64_t tag = makeGifTag(2u, 3u, 0u, true);
+            std::memcpy(vuData, &tag, sizeof(tag));
+            writeVuInstructionPair(vuCode, 0u, makeVuLowerSpecial(0x6Cu, 0u), kVuUpperNop);
+
+            VU1Interpreter vu1;
+            vu1.execute(vuCode, PS2_VU1_CODE_SIZE, vuData, PS2_VU1_DATA_SIZE, gs, &mem, 0u, 0u, 0u, 16u);
+
+            t.Equals(captured.size(), static_cast<size_t>(1u), "XGKICK should emit the FLG 3 packet");
+            if (!captured.empty())
+                t.Equals(captured[0].size(), static_cast<size_t>(48u), "the packet should hold the tag and NLOOP qwords");
         });
 
         tc.Run("XGKICK observes stores committed before a future PATH1 qword", [](TestCase &t)

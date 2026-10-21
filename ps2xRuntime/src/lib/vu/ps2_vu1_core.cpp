@@ -905,14 +905,8 @@ void VU1Interpreter::progressXgkick()
                 tagBytes += static_cast<uint64_t>(nloop) * nreg * 16u;
             else if (format == 1u)
                 tagBytes += ((static_cast<uint64_t>(nloop) * nreg + 1u) & ~1ull) * 8u;
-            else if (format == 2u)
+            else // IMAGE; FLG 3 ("disable") behaves as IMAGE on the GS
                 tagBytes += static_cast<uint64_t>(nloop) * 16u;
-            else
-            {
-                reportReservedInstruction(false, 0xFFFFFFF8u);
-                m_xgkick.active = false;
-                return;
-            }
 
             if (tagBytes > XgkickPipeline::kBufferSize - qwordOffset)
             {
@@ -1850,6 +1844,18 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             break;
     }
 
+    // Small budgets are deliberate time slices; a run-to-completion budget that expires means a
+    // runaway program.
+    if (!programEnded && m_cycle >= budgetEnd && maxCycles >= (1u << 20))
+    {
+        static uint32_t s_budgetWarnings = 0u;
+        if (s_budgetWarnings < 8u)
+        {
+            ++s_budgetWarnings;
+            std::fprintf(stderr, "[VU%u] program still running after %u cycles at pc=0x%x\n",
+                         m_unit == Unit::VU1 ? 1u : 0u, maxCycles, m_state.pc);
+        }
+    }
     if (programEnded)
     {
         flushPipelines();
