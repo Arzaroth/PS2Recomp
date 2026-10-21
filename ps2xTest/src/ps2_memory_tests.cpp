@@ -289,6 +289,20 @@ void register_ps2_memory_tests()
             t.Equals(mem.readIORegister(kTimerBases[1] + 0x30u), 0x3456u, "Timer1 HOLD should be 16-bit");
         });
 
+        tc.Run("EE Timer3 counts H-BLANKs from reset without raising interrupts", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            constexpr uint32_t kTimer3Count = 0x10001800u;
+            constexpr uint32_t kTimer3Mode = 0x10001810u;
+            constexpr uint64_t kEeCyclesPerHblank = 294912000ull / 15734ull + 1ull;
+
+            t.Equals(mem.readIORegister(kTimer3Mode), 0x83u, "Timer3 should start counting H-BLANKs");
+            t.Equals(mem.advanceEeTimers(kEeCyclesPerHblank * 3u), 0u, "Timer3 should not raise TIM3 on its own");
+            t.Equals(mem.readIORegister(kTimer3Count), 3u, "Timer3 should advance one count per H-BLANK");
+        });
+
         tc.Run("EE Timer2 compare and overflow flags raise INTC_TIM2 and clear on write-one", [](TestCase &t)
         {
             PS2Memory mem;
