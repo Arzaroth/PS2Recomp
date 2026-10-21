@@ -692,6 +692,30 @@ void register_ps2_runtime_kernel_tests()
                       "the scheduler must publish guest execution only around the active guest call");
         });
 
+        tc.Run("EE thread priorities span 0 through 127", [](TestCase &t)
+        {
+            TestEnv env;
+            EeScheduler &ee = env.runtime.eeScheduler();
+            ee.reset(env.rdram.data(), env.ctx);
+
+            const int highest = ee.createThread(EeThreadCreateParams{0, K_SCHED_A, 0x20000u, 0x800u, 0, 0, 0});
+            t.IsTrue(highest > 0, "CreateThread should accept priority 0");
+            t.IsTrue(ee.createThread(EeThreadCreateParams{0, K_SCHED_A, 0x21000u, 0x800u, 0, 127, 0}) > 0,
+                     "CreateThread should accept priority 127");
+            t.Equals(ee.createThread(EeThreadCreateParams{0, K_SCHED_A, 0x22000u, 0x800u, 0, 128, 0}), -403,
+                     "CreateThread should reject priority 128");
+            t.Equals(ee.createThread(EeThreadCreateParams{0, K_SCHED_A, 0x23000u, 0x800u, 0, -1, 0}), -403,
+                     "CreateThread should reject a negative priority");
+
+            int oldPriority = -1;
+            t.Equals(ee.changePriority(highest, 16, false, oldPriority), 0, "ChangeThreadPriority should succeed");
+            t.Equals(oldPriority, 0, "the previous priority should be reported");
+            t.Equals(ee.changePriority(highest, 0, false, oldPriority), 0,
+                     "ChangeThreadPriority should accept priority 0");
+            t.Equals(ee.changePriority(highest, 128, false, oldPriority), -403,
+                     "ChangeThreadPriority should reject priority 128");
+        });
+
         tc.Run("thread lifecycle, nested suspend, WAIT-SUSPEND, and wakeup count are centralized", [](TestCase &t)
         {
             TestEnv env;
