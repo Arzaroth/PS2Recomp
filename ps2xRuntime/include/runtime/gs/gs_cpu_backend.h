@@ -47,7 +47,8 @@ private:
     void DrawLine(const GSPrimitiveBatch &batch);
     void WritePixel(const GSDrawState &state, int x, int y, int z, uint8_t r, uint8_t g, uint8_t b, uint8_t a, uint8_t fog);
     uint32_t SampleTexture(const GSDrawState &state, float s, float t, float q, uint16_t u, uint16_t v);
-    uint32_t LookupCLUT(const GSDrawState &state, uint8_t index, uint8_t cpsm, uint8_t csm, uint8_t csa, uint8_t sourcePsm);
+    uint32_t LookupCLUT(const GSDrawState &state, uint8_t index, uint8_t cpsm, uint8_t csm, uint8_t csa, uint8_t sourcePsm,
+                        const uint16_t *clut);
 
     void PerformLocalToLocalTransfer();
     void PerformLocalToHostTransfer();
@@ -92,16 +93,58 @@ private:
         uint32_t clutGeneration = 0;
         bool operator==(const TexelCacheKey &) const = default;
     };
-    void PrepareTexelCache(const GSDrawState &state);
+    // A decoded-texel cache for one texture, with the CLUT as it was when the slot was prepared (queued
+    // primitives keep sampling with it after later CLUT loads).
+    struct TexelCacheSlot
+    {
+        TexelCacheKey key{};
+        std::vector<std::pair<uint32_t, uint32_t>> pages; // (page, write generation)
+        std::array<uint16_t, 512> clut{};
+        std::vector<uint32_t> texels;
+        std::vector<uint32_t> stamps;
+        uint32_t epoch = 1u;
+        uint64_t lastUse = 0u;
+        bool valid = false;
+        bool complete = false; // every texel decoded: independent of VRAM from then on
+    };
+    uint32_t DecodeTexel(const GSDrawState &state, int u, int v, const uint16_t *clut);
+    void SnapshotTexelSlot(TexelCacheSlot &slot, const GSDrawState &state);
+    // Larger textures (screen copies) are not snapshotted; uploads into them flush the batch instead.
+    static constexpr size_t kMaxSnapshotTexels = 256u * 256u;
+    static constexpr size_t kTexelCacheSlots = 16u;
+    // Returns the slot holding `state`'s texture, or nullptr when every slot is in use by the queued batch.
+    TexelCacheSlot *PrepareTexelCache(const GSDrawState &state);
     // Runs row(y) for y in [y0, y1]; splits large primitives across worker threads when every pixel
     // write lands in its own bytes (16/32-bit frame and Z formats).
     void ForEachRow(const GSDrawState &state, int y0, int y1, int width, const std::function<void(int)> &row);
-    TexelCacheKey m_texelCacheKey{};
-    const GSDrawState *m_texelCacheOwner = nullptr;
-    std::vector<uint32_t> m_texelCache;
-    std::vector<uint32_t> m_texelCacheStamp;
-    uint32_t m_texelCacheEpoch = 1u;
-    std::vector<std::pair<uint32_t, uint32_t>> m_texelCachePages; // (page, write generation)
+    // Consecutive triangles/sprites sharing a texture are queued and rasterized together by row bands
+    // across the worker pool; flushed before any other VRAM, CLUT or transfer operation.
+    static constexpr size_t kMaxDeferredPrimitives = 512u;
+    std::vector<GSPrimitiveBatch> m_deferred;
+
+    bool CanDefer(const GSPrimitiveBatch &batch) const;
+    bool m_deferralEnabled = false;
+
+public:
+    // Batched (banded, reordered) rasterization: opt-in with PS2X_GS_BATCH=1 until it passes PS2X_GS_SHADOW_CHECK
+    // everywhere (a rare texture-page mismatch remains); always off for the shadow reference GS.
+    void setDeferralEnabled(bool enabled) { m_deferralEnabled = enabled; }
+
+private:
+    // Whether queued primitives read (texture) or write (frame/Z) any VRAM page in [firstPage, endPage).
+    bool DeferredTouchesPages(uint32_t firstPage, uint32_t endPage, bool includeTextures,
+                              bool includeTargets = true) const;
+    // Flushes the queue when a host->local or local->local transfer conflicts with it.
+    void FlushDeferredForTransferUnlocked(const GSTransferCommand &command);
+    void FlushDeferredUnlocked();
+    std::array<TexelCacheSlot, kTexelCacheSlots> m_texelSlots;
+    uint64_t m_texelSlotClock = 0u;
+    uint32_t m_batchSlotMask = 0u;           // slots referenced by queued primitives
+    std::vector<int8_t> m_deferredSlots;     // slot of each queued primitive, -1 when untextured
+    const GSDrawState *m_texelCacheOwner = nullptr; // primitive drawn outside a batch, using m_serialSlot
+    TexelCacheSlot *m_serialSlot = nullptr;
+    // Texel-cache slot of the queued primitive this thread is rasterizing (nullptr outside batches).
+    static thread_local TexelCacheSlot *t_texelSlot;
     uint32_t m_clutGeneration = 0u;
 
     GSTransferCommand m_transfer{};
