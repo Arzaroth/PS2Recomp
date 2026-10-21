@@ -25,6 +25,13 @@ public:
     void stopAll();
     void setAudioReady(bool ready) { m_audioReady = ready; }
 
+    // SPU2 output of the IOP emulator: interleaved stereo frames at 48 kHz of emulated time,
+    // played through one raylib stream that follows the emulation speed.
+    void pushSpu2Frames(const int16_t *frames, size_t count);
+    // Before CloseAudioDevice.
+    void closeSpu2Stream();
+    struct Spu2Stream;
+
 private:
     struct DecodedSample
     {
@@ -34,6 +41,11 @@ private:
 
     struct Impl;
     std::unique_ptr<Impl> m_impl;
+    struct Spu2StreamDeleter
+    {
+        void operator()(Spu2Stream *stream) const;
+    };
+    std::unique_ptr<Spu2Stream, Spu2StreamDeleter> m_spu2;
     bool m_audioReady = false;
     uint32_t m_mostRecentSampleKey = 0;
     std::vector<DecodedSample> m_loadOrderSamples;

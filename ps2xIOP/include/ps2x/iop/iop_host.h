@@ -140,6 +140,14 @@ namespace ps2x::iop
             return false;
         }
 
+        // SPU2 output: interleaved 16-bit stereo frames at 48 kHz of emulated time. The default
+        // discards them.
+        virtual void submitAudio(const int16_t *frames, size_t count)
+        {
+            (void)frames;
+            (void)count;
+        }
+
         virtual void log(LogLevel level, std::string_view message) = 0;
     };
 }

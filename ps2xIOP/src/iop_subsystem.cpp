@@ -274,6 +274,8 @@ namespace ps2x::iop
         }
         for (std::string &line : m_impl->emulator.describeThreads())
             snapshot.diagnostics.push_back(std::move(line));
+        for (std::string &line : m_impl->emulator.describeSpu2())
+            snapshot.diagnostics.push_back(std::move(line));
 
         for (const auto &service : m_impl->coreServices)
         {

@@ -1,6 +1,7 @@
 #include "iop_memory.h"
 
 #include "iop_sio2.h"
+#include "iop_spu2.h"
 
 #include <algorithm>
 #include <cstring>
@@ -53,6 +54,8 @@ namespace ps2x::iop::detail
             return m_ram[phys];
         if (phys >= ScratchBase && phys < ScratchBase + ScratchSize)
             return m_scratch[phys - ScratchBase];
+        if (m_spu2 && IopSpu2::handles(phys))
+            return static_cast<uint8_t>(m_spu2->read16(phys & ~1u) >> ((phys & 1u) * 8u));
         const uint32_t value = readHardware32(phys & ~3u);
         return static_cast<uint8_t>(value >> ((phys & 3u) * 8u));
     }
@@ -66,6 +69,8 @@ namespace ps2x::iop::detail
             std::memcpy(&value, m_ram.data() + phys, sizeof(value));
             return value;
         }
+        if (m_spu2 && (phys & 1u) == 0u && IopSpu2::handles(phys))
+            return m_spu2->read16(phys);
         return static_cast<uint16_t>(read8(address) | (static_cast<uint16_t>(read8(address + 1u)) << 8u));
     }
 
@@ -107,6 +112,13 @@ namespace ps2x::iop::detail
             m_scratch[phys - ScratchBase] = value;
             return;
         }
+        if (m_spu2 && IopSpu2::handles(phys))
+        {
+            const uint32_t shift = (phys & 1u) * 8u;
+            const uint16_t current = m_spu2->read16(phys & ~1u);
+            m_spu2->write16(phys & ~1u, static_cast<uint16_t>((current & ~(0xFFu << shift)) | (static_cast<uint32_t>(value) << shift)));
+            return;
+        }
         const uint32_t aligned = phys & ~3u;
         uint32_t current = readHardware32(aligned);
         const uint32_t shift = (phys & 3u) * 8u;
@@ -121,6 +133,11 @@ namespace ps2x::iop::detail
         {
             std::memcpy(m_ram.data() + phys, &value, sizeof(value));
             markOwned(phys, sizeof(value));
+            return;
+        }
+        if (m_spu2 && (phys & 1u) == 0u && IopSpu2::handles(phys))
+        {
+            m_spu2->write16(phys, value);
             return;
         }
         write8(address, static_cast<uint8_t>(value));
@@ -223,6 +240,10 @@ namespace ps2x::iop::detail
     {
         if (m_sio2 && IopSio2::handles(address))
             return m_sio2->read32(address);
+        if (m_spu2 && IopSpu2::handles(address))
+            return m_spu2->read16(address) | (static_cast<uint32_t>(m_spu2->read16(address + 2u)) << 16u);
+        if (m_spu2 && IopSpu2::handlesDma(address))
+            return m_spu2->readDma32(address);
         const auto value = m_hardware.find(address);
         if (value != m_hardware.end())
             return value->second;
@@ -244,6 +265,17 @@ namespace ps2x::iop::detail
         if (m_sio2 && IopSio2::handles(address))
         {
             m_sio2->write32(address, value);
+            return;
+        }
+        if (m_spu2 && IopSpu2::handles(address))
+        {
+            m_spu2->write16(address, static_cast<uint16_t>(value));
+            m_spu2->write16(address + 2u, static_cast<uint16_t>(value >> 16u));
+            return;
+        }
+        if (m_spu2 && IopSpu2::handlesDma(address))
+        {
+            m_spu2->writeDma32(address, value);
             return;
         }
         switch (address)

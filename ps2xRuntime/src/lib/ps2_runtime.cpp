@@ -548,6 +548,7 @@ PS2Runtime::~PS2Runtime()
 #else
         if (IsAudioDeviceReady())
         {
+            m_audioBackend.closeSpu2Stream();
             CloseAudioDevice();
             m_audioBackend.setAudioReady(false);
         }

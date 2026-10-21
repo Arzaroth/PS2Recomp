@@ -5,6 +5,8 @@
 #include "emulator/imports/iop_imports.h"
 #include "emulator/imports/iop_loadcore.h"
 #include "emulator/imports/iop_timrman.h"
+#include "emulator/imports/iop_vblank.h"
+#include "emulator/iop_emulator_const.h"
 #include "emulator/services/iop_rpc.h"
 #include "ps2x/iop/iop_host.h"
 
@@ -326,12 +328,63 @@ namespace
                expect(executor.lastGp == 0x89AB0u, "timer callback lost the registering module GP") &&
                expect(timrman.nextEventCycle(1000u) == 300u, "timer callback return did not rearm compare");
     }
+
+    // RegisterVblankHandler: handlers run at each VBlank start with their argument and GP (Sony's
+    // sound drivers wake their streaming threads this way); returning 0 releases them.
+    bool testVblankHandlers()
+    {
+        IopMemory memory;
+        IopKernel kernel(memory);
+        IopVblank vblank(kernel);
+        IopCpuState cpu{};
+
+        cpu.gpr[4] = 0u; // VBlank start
+        cpu.gpr[5] = 64u;
+        cpu.gpr[6] = 0x12340u;
+        cpu.gpr[7] = 0x45670u;
+        cpu.gpr[28] = 0x89AB0u;
+        if (!expect(vblank.dispatchImport(8u, cpu, 100u), "RegisterVblankHandler was not handled") ||
+            !expect(cpu.gpr[2] == 0u, "RegisterVblankHandler failed") ||
+            !expect(vblank.dispatchImport(8u, cpu, 100u) && static_cast<int32_t>(cpu.gpr[2]) == -104,
+                    "registering the same handler twice did not fail") ||
+            !expect(vblank.nextEventCycle(UINT64_MAX) == kVblankPeriodCycles, "the first VBlank is not the next field"))
+            return false;
+
+        RecordingExecutor executor;
+        executor.callbackResult = 1u;
+        vblank.serviceDue(kVblankPeriodCycles - 1u, executor);
+        if (!expect(executor.calls == 0u, "VBlank handler ran before the VBlank"))
+            return false;
+        vblank.serviceDue(kVblankPeriodCycles, executor);
+        if (!expect(executor.calls == 1u, "VBlank handler did not run") ||
+            !expect(executor.lastAddress == 0x12340u && executor.lastArgument == 0x45670u && executor.lastGp == 0x89AB0u,
+                    "VBlank handler called with the wrong function, argument or GP") ||
+            !expect(vblank.nextEventCycle(UINT64_MAX) == 2u * kVblankPeriodCycles, "VBlank handler was not rearmed"))
+            return false;
+
+        // Several fields late: one call, then the next field.
+        vblank.serviceDue(5u * kVblankPeriodCycles + 10u, executor);
+        if (!expect(executor.calls == 2u, "a late VBlank was delivered more than once") ||
+            !expect(vblank.nextEventCycle(UINT64_MAX) == 6u * kVblankPeriodCycles, "a late VBlank did not resync"))
+            return false;
+
+        executor.callbackResult = 0u;
+        vblank.serviceDue(6u * kVblankPeriodCycles, executor);
+        if (!expect(executor.calls == 3u, "VBlank handler did not run") ||
+            !expect(vblank.nextEventCycle(UINT64_MAX) == UINT64_MAX, "a handler returning 0 stayed registered"))
+            return false;
+
+        cpu.gpr[4] = 1u; // VBlank end
+        cpu.gpr[5] = 0x12340u;
+        return expect(vblank.dispatchImport(9u, cpu, 0u) && static_cast<int32_t>(cpu.gpr[2]) == -105,
+                      "releasing an unknown handler did not fail");
+    }
 }
 
 int main()
 {
     if (!testLoadcoreRebootLibraryMode() || !testCdvdSpecialControl() || !testCdvdSearchFile() ||
-        !testTimrmanPeriodicCallback())
+        !testTimrmanPeriodicCallback() || !testVblankHandlers())
         return 1;
     std::cout << "ps2xIOP import tests passed\n";
     return 0;
