@@ -4,6 +4,7 @@
 #include "ps2_stubs.h"
 #include "ps2_syscalls.h"
 #include "runtime/gs/gs_frontend.h"
+#include "runtime/gs/gs_cpu_backend.h"
 #include "runtime/ee_scheduler.h"
 #include "runtime/gs/ps2_gs_memory.h"
 #include "runtime/gs/ps2_gs_psmct32.h"
@@ -902,6 +903,145 @@ void register_ps2_gs_tests()
             std::memcpy(&highAlphaPixel, vram.data(), sizeof(highAlphaPixel));
             t.Equals(highAlphaPixel, 0x803F3F3Fu,
                      "with PABE enabled, high-alpha source pixels should still use the configured ALPHA blend");
+        });
+
+        tc.Run("asynchronous rasterization leaves VRAM identical to immediate drawing", [](TestCase &t)
+        {
+            // Overlapping blended and depth-tested primitives over 64 rows, so every worker's
+            // row stripes take part, plus bilinear textured sprites and triangles.
+            constexpr uint32_t kTexBlock = 128u;
+            constexpr uint64_t kFrame = (1ull << 16) | (static_cast<uint64_t>(GS_PSM_CT32) << 24);
+            constexpr uint64_t kZbuf = 100ull | (static_cast<uint64_t>(GS_PSM_Z24) << 24);
+            constexpr uint64_t kScissor = (63ull << 16) | (63ull << 48);
+            constexpr uint64_t kTest = (1ull << 16) | (2ull << 17); // ZTE, ZTST = GEQUAL
+            constexpr uint64_t kAlphaBlend = 0x44ull;                // (Cs - Cd) * As + Cd
+            constexpr uint64_t kTex0 = static_cast<uint64_t>(kTexBlock) | (1ull << 14) |
+                                       (static_cast<uint64_t>(GS_PSM_CT32) << 20) |
+                                       (4ull << 26) | (4ull << 30) | (1ull << 34);
+            constexpr uint64_t kTex1Linear = (1ull << 5) | (1ull << 6);
+
+            auto xyz = [](uint32_t x, uint32_t y, uint32_t z)
+            {
+                return static_cast<uint64_t>(x << 4) | (static_cast<uint64_t>(y << 4) << 16) |
+                       (static_cast<uint64_t>(z) << 32);
+            };
+            auto uv = [](uint32_t u, uint32_t v)
+            {
+                return static_cast<uint64_t>(u << 4) | (static_cast<uint64_t>(v << 4) << 16);
+            };
+
+            auto drawScene = [&](std::vector<uint8_t> &vram, bool async) -> uint32_t
+            {
+                GSCpuBackend::SetAsyncRasterization(async);
+                for (uint32_t y = 0u; y < 16u; ++y)
+                    for (uint32_t x = 0u; x < 16u; ++x)
+                        writeReferencePSMCT32Pixel(vram, kTexBlock, 1u, x, y,
+                                                   0x80000000u | (x * 16u) | ((y * 16u) << 8) | (((x ^ y) * 16u) << 16));
+
+                GS gs;
+                gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+                gs.writeRegister(GS_REG_FRAME_1, kFrame);
+                gs.writeRegister(GS_REG_ZBUF_1, kZbuf);
+                gs.writeRegister(GS_REG_SCISSOR_1, kScissor);
+                gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
+                gs.writeRegister(GS_REG_TEST_1, kTest);
+                gs.writeRegister(GS_REG_ALPHA_1, kAlphaBlend);
+                gs.writeRegister(GS_REG_TEX0_1, kTex0);
+                gs.writeRegister(GS_REG_TEX1_1, kTex1Linear);
+
+                // Gouraud, blended triangles at increasing depth.
+                for (uint32_t i = 0u; i < 6u; ++i)
+                {
+                    gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_TRIANGLE) | (1ull << 3) | (1ull << 6));
+                    gs.writeRegister(GS_REG_RGBAQ, 0x40000000ull | (0x20ull * i) | 0x8000ull);
+                    gs.writeRegister(GS_REG_XYZ2, xyz(i * 7u, 0u, 100u + i * 10u));
+                    gs.writeRegister(GS_REG_RGBAQ, 0x60000000ull | 0xFF0000ull);
+                    gs.writeRegister(GS_REG_XYZ2, xyz(63u, i * 9u, 100u + i * 10u));
+                    gs.writeRegister(GS_REG_RGBAQ, 0x7F000000ull | 0x00FF00ull);
+                    gs.writeRegister(GS_REG_XYZ2, xyz(i * 3u, 63u, 140u - i * 5u));
+                }
+
+                // Bilinear textured sprite, scaled up (fractional texel weights).
+                gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_SPRITE) | (1ull << 4) | (1ull << 8));
+                gs.writeRegister(GS_REG_RGBAQ, 0x80808080ull);
+                gs.writeRegister(GS_REG_UV, uv(0u, 0u));
+                gs.writeRegister(GS_REG_XYZ2, xyz(8u, 8u, 200u));
+                gs.writeRegister(GS_REG_UV, uv(16u, 16u));
+                gs.writeRegister(GS_REG_XYZ2, xyz(56u, 56u, 200u));
+
+                // Blended, textured triangle over everything.
+                gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_TRIANGLE) | (1ull << 4) | (1ull << 6) | (1ull << 8));
+                gs.writeRegister(GS_REG_RGBAQ, 0x40806040ull);
+                gs.writeRegister(GS_REG_UV, uv(0u, 0u));
+                gs.writeRegister(GS_REG_XYZ2, xyz(2u, 60u, 250u));
+                gs.writeRegister(GS_REG_UV, uv(16u, 0u));
+                gs.writeRegister(GS_REG_XYZ2, xyz(60u, 30u, 250u));
+                gs.writeRegister(GS_REG_UV, uv(0u, 16u));
+                gs.writeRegister(GS_REG_XYZ2, xyz(20u, 2u, 250u));
+
+                // Upload over the texture the primitives above sample, then sample the new
+                // texels (an upload queued behind reads of its destination).
+                gs.writeRegister(GS_REG_BITBLTBUF, (static_cast<uint64_t>(kTexBlock) << 32) | (1ull << 48) |
+                                                       (static_cast<uint64_t>(GS_PSM_CT32) << 56));
+                gs.writeRegister(GS_REG_TRXPOS, 0ull);
+                gs.writeRegister(GS_REG_TRXREG, 16ull | (16ull << 32));
+                gs.writeRegister(GS_REG_TRXDIR, 0ull);
+                std::vector<uint8_t> image;
+                appendU64(image, makeGifTag(64u, GIF_FMT_IMAGE, 0u, true));
+                appendU64(image, 0ull);
+                for (uint32_t i = 0u; i < 256u; ++i)
+                {
+                    const uint32_t texel = 0x80000000u | (i * 0x010203u);
+                    image.insert(image.end(), reinterpret_cast<const uint8_t *>(&texel), reinterpret_cast<const uint8_t *>(&texel) + 4u);
+                }
+                gs.processGIFPacket(image.data(), static_cast<uint32_t>(image.size()));
+                gs.writeRegister(GS_REG_TEXFLUSH, 0ull);
+                gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_SPRITE) | (1ull << 4) | (1ull << 8));
+                gs.writeRegister(GS_REG_RGBAQ, 0x80808080ull);
+                gs.writeRegister(GS_REG_UV, uv(0u, 0u));
+                gs.writeRegister(GS_REG_XYZ2, xyz(40u, 0u, 280u));
+                gs.writeRegister(GS_REG_UV, uv(16u, 16u));
+                gs.writeRegister(GS_REG_XYZ2, xyz(64u, 24u, 280u));
+
+                // Render to texture: draw into an offscreen buffer, then sample it (the queue
+                // orders this with a barrier).
+                gs.writeRegister(GS_REG_FRAME_1, 8ull | (1ull << 16) | (static_cast<uint64_t>(GS_PSM_CT32) << 24));
+                gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
+                gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_TRIANGLE) | (1ull << 3));
+                gs.writeRegister(GS_REG_RGBAQ, 0x800000FFull);
+                gs.writeRegister(GS_REG_XYZ2, xyz(0u, 0u, 0u));
+                gs.writeRegister(GS_REG_RGBAQ, 0x8000FF00ull);
+                gs.writeRegister(GS_REG_XYZ2, xyz(63u, 0u, 0u));
+                gs.writeRegister(GS_REG_RGBAQ, 0x80FF0000ull);
+                gs.writeRegister(GS_REG_XYZ2, xyz(0u, 31u, 0u));
+                gs.writeRegister(GS_REG_FRAME_1, kFrame);
+                gs.writeRegister(GS_REG_TEXFLUSH, 0ull);
+                gs.writeRegister(GS_REG_TEX0_1, 256ull | (1ull << 14) | (static_cast<uint64_t>(GS_PSM_CT32) << 20) |
+                                                    (6ull << 26) | (5ull << 30) | (1ull << 34));
+                gs.writeRegister(GS_REG_TEX1_1, 0ull);
+                gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_SPRITE) | (1ull << 4) | (1ull << 8));
+                gs.writeRegister(GS_REG_RGBAQ, 0x80808080ull);
+                gs.writeRegister(GS_REG_UV, uv(0u, 0u));
+                gs.writeRegister(GS_REG_XYZ2, xyz(0u, 40u, 300u));
+                gs.writeRegister(GS_REG_UV, uv(64u, 32u));
+                gs.writeRegister(GS_REG_XYZ2, xyz(64u, 64u, 300u));
+
+                // Reading through the frontend waits for queued drawing.
+                const uint32_t corner = gs.ReadVram(GS_PSM_CT32, 0u, 1u, 32u, 32u);
+                GSCpuBackend::SetAsyncRasterization(false);
+                return corner;
+            };
+
+            std::vector<uint8_t> immediate(PS2_GS_VRAM_SIZE, 0u);
+            std::vector<uint8_t> async(PS2_GS_VRAM_SIZE, 0u);
+            const uint32_t immediateCenter = drawScene(immediate, false);
+            const uint32_t asyncCenter = drawScene(async, true);
+
+            t.Equals(asyncCenter, immediateCenter, "a VRAM read through the backend should see all queued drawing");
+            t.IsTrue(immediateCenter != 0u, "the scene should cover the framebuffer center");
+            t.IsTrue(readReferencePSMCT32Pixel(immediate, 0u, 1u, 2u, 41u) != 0u,
+                     "the sprite should copy the offscreen triangle into the framebuffer");
+            t.IsTrue(immediate == async, "worker threads should produce exactly the immediate rasterizer's VRAM");
         });
 
         tc.Run("FBA forces the framebuffer alpha high bit on CT32 writes", [](TestCase &t)

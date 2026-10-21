@@ -257,8 +257,11 @@ elseif(WIN32)
     include(ExternalProject)
 
     set(FFMPEG_PREBUILT_TAG "n7.1-241205")
+    # A URL or a local file (file:///...): lets another build directory reuse an archive
+    # that is already downloaded.
     set(FFMPEG_PREBUILT_URL
-        "https://github.com/System233/ffmpeg-msvc-prebuilt/releases/download/${FFMPEG_PREBUILT_TAG}/ffmpeg-${FFMPEG_PREBUILT_TAG}-lgpl-amd64-shared.zip")
+        "https://github.com/System233/ffmpeg-msvc-prebuilt/releases/download/${FFMPEG_PREBUILT_TAG}/ffmpeg-${FFMPEG_PREBUILT_TAG}-lgpl-amd64-shared.zip"
+        CACHE STRING "FFmpeg prebuilt archive (Windows)")
 
     set(FFMPEG_PREFIX_DIR "${CMAKE_BINARY_DIR}/ThirdParty/ffmpeg-prefix")
     set(FFMPEG_SOURCE_DIR "${FFMPEG_PREFIX_DIR}/src/ffmpeg_external")
