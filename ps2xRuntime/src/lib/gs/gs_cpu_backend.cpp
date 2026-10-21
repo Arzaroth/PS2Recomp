@@ -9,12 +9,17 @@
 #include <atomic>
 #include <algorithm>
 #include <cmath>
+#include <cstdarg>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <thread>
+#include <chrono>
+#include <set>
+#include <string>
+#include <tuple>
 #if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
 #endif
@@ -974,6 +979,7 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
         return;
     if (s_asyncRasterization.load(std::memory_order_relaxed))
         StartWorkersUnlocked();
+    DumpUpdateUnlocked();
     DrawPrimitive(batch);
 }
 
@@ -982,6 +988,10 @@ void GSCpuBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
     std::lock_guard<std::mutex> lock(m_mutex);
     if (!m_vram || (!isFourBitIndexedPsm(tex0.psm) && !isEightBitIndexedPsm(tex0.psm)))
         return;
+    if (m_dumpRemaining != 0u)
+        DumpLog("LOADCLUT cld=%u cbp=%u cpsm=0x%x csm=%u csa=%u psm=0x%x cbw=%u cou=%u cov=%u", unsigned(tex0.cld), unsigned(tex0.cbp),
+                unsigned(tex0.cpsm), unsigned(tex0.csm), unsigned(tex0.csa), unsigned(tex0.psm), unsigned(texclut.cbw),
+                unsigned(texclut.cou), unsigned(texclut.cov));
 
     switch (tex0.cld)
     {
@@ -1111,7 +1121,9 @@ void GSCpuBackend::TextureFlush()
 {
     std::lock_guard<std::mutex> lock(m_mutex);
     m_texturePageCaches[0].Invalidate();
-    if (m_workerCount == 0u)
+    if (m_dumpRemaining != 0u)
+        DumpLog("TEXFLUSH");
+    if (m_workerCount == 0u || m_dumpRemaining != 0u)
         return;
     // Workers drop their cached pages when they reach this point of the queue.
     QueuedPrimitive &item = ReserveQueueSlotUnlocked();
@@ -1165,6 +1177,11 @@ void GSCpuBackend::WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, u
 void GSCpuBackend::SnapshotVram(std::vector<uint8_t> &out) const
 {
     std::lock_guard<std::mutex> lock(m_mutex);
+    if (m_dumpRemaining != 0u)
+    {
+        DumpLog("PRESENT (VRAM snapshot)");
+        ++m_dumpPresents;
+    }
     DrainUnlocked();
     if (!m_vram || m_vramSize == 0u)
     {
@@ -1295,11 +1312,15 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
         }
     });
 
-    if (m_workerCount == 0u)
+    if (m_dumpRemaining != 0u)
+        DumpPrimitiveUnlocked(batch);
+    if (m_workerCount == 0u || m_dumpRemaining != 0u)
     {
         const PixelPipeline pixel = MakePixelPipeline(state);
         const TextureSampler texture = MakeTextureSampler(state);
         DrawWith(batch, RasterContext{&pixel, &texture, &m_texturePageCaches[0], 0u, 1u});
+        if (m_dumpRemaining != 0u && --m_dumpRemaining == 0u)
+            DumpFinishUnlocked();
         return;
     }
 
@@ -2340,7 +2361,11 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
     const uint32_t firstPixel = m_transferState.copiedPixels;
     const uint32_t totalPixels = m_transferState.totalPixels;
     uint32_t consumed = 0u;
-    if (m_workerCount == 0u)
+    if (m_dumpRemaining != 0u)
+        DumpLog("UPLOAD dbp=%u dbw=%u dpsm=0x%x pos=%u,%u size=%ux%u first=%u bytes=%u", unsigned(m_transfer.bitbltbuf.dbp),
+                unsigned(m_transfer.bitbltbuf.dbw), unsigned(m_transfer.bitbltbuf.dpsm), unsigned(m_transfer.trxpos.dsax),
+                unsigned(m_transfer.trxpos.dsay), unsigned(m_transfer.trxreg.rrw), unsigned(m_transfer.trxreg.rrh), firstPixel, sizeBytes);
+    if (m_workerCount == 0u || m_dumpRemaining != 0u)
     {
         consumed = WriteUploadPixels(m_transfer, firstPixel, totalPixels, data, sizeBytes, nullptr, true);
     }
@@ -2877,4 +2902,158 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
     result.displayFbp = displayFrame.fbp;
     result.sourceFbp = selected.fbp;
     return result;
+}
+
+// ---------------------------------------------------------------- frame dump (diagnosis)
+
+void GSCpuBackend::DumpUpdateUnlocked()
+{
+    if (m_dumpState == 2u)
+        return;
+    if (m_dumpState == 0u)
+    {
+        const char *dir = std::getenv("PS2X_GS_DUMP");
+        if (!dir || !*dir)
+        {
+            m_dumpState = 2u;
+            return;
+        }
+        m_dumpDir = dir;
+        const char *after = std::getenv("PS2X_GS_DUMP_AFTER");
+        m_dumpStart = std::chrono::steady_clock::now() + std::chrono::milliseconds(static_cast<int64_t>((after ? std::atof(after) : 0.0) * 1000.0));
+        m_dumpState = 1u;
+    }
+    if (m_dumpRemaining != 0u || std::chrono::steady_clock::now() < m_dumpStart)
+        return;
+    // Start: finish queued work, then draw immediately (VRAM is exact at each primitive).
+    DrainUnlocked();
+    for (GSMem::TexturePageCache &cache : m_texturePageCaches)
+        cache.Invalidate();
+    for (DecodedTextureCache &cache : m_decodedCaches)
+        cache.Invalidate();
+    if (FILE *f = std::fopen((m_dumpDir + "/vram_before.bin").c_str(), "wb"))
+    {
+        std::fwrite(m_vram, 1, GSMem::MEMORY_SIZE, f);
+        std::fclose(f);
+    }
+    m_dumpLog = std::fopen((m_dumpDir + "/prims.txt").c_str(), "w");
+    m_dumpRemaining = 4000u;
+    m_dumpState = 2u;
+}
+
+void GSCpuBackend::DumpLog(const char *format, ...) const
+{
+    if (!m_dumpLog)
+        return;
+    va_list args;
+    va_start(args, format);
+    std::vfprintf(m_dumpLog, format, args);
+    va_end(args);
+    std::fputc('\n', m_dumpLog);
+}
+
+void GSCpuBackend::DumpPrimitiveUnlocked(const GSPrimitiveBatch &batch)
+{
+    const GSDrawState &state = batch.state;
+    const auto &ctx = state.context;
+    const auto &tex = ctx.tex0;
+    // During the second dumped frame, save the target after each group of primitives (same
+    // target and texture), to see the frame being composed.
+    const uint64_t group = (static_cast<uint64_t>(ctx.frame.fbp) << 40u) ^ (static_cast<uint64_t>(state.prim.tme ? tex.tbp0 + 1u : 0u) << 8u) ^
+                           (static_cast<uint64_t>(ctx.alpha & 0xFFu)) ^ (static_cast<uint64_t>(state.prim.abe) << 63u);
+    if (m_dumpPresents == 1u && m_dumpGroupValid && group != m_dumpGroup)
+    {
+        const GSFrameReg &frame = m_dumpGroupFrame;
+        const uint32_t width = std::min<uint32_t>(m_dumpGroupScissorX1 + 1u, 1024u);
+        const uint32_t height = std::min<uint32_t>(m_dumpGroupScissorY1 + 1u, 1024u);
+        std::vector<uint32_t> pixels(static_cast<size_t>(width) * height);
+        const uint32_t base = GSInternal::framePageBaseToBlock(frame.fbp);
+        for (uint32_t y = 0; y < height; ++y)
+            for (uint32_t x = 0; x < width; ++x)
+            {
+                uint32_t value = ReadVramUnlocked(frame.psm, base, std::max<uint32_t>(frame.fbw, 1u), x, y);
+                if (bitsPerPixel(frame.psm) == 16)
+                    value = Rgba5551ToRgba8888(static_cast<u16>(value));
+                else if (frame.psm == GS_PSM_CT24)
+                    value |= 0x80000000u;
+                pixels[static_cast<size_t>(y) * width + x] = value;
+            }
+        char name[96];
+        std::snprintf(name, sizeof(name), "/snap_%04u_fbp%u_%ux%u.rgba", m_dumpSnapshots++, unsigned(frame.fbp), width, height);
+        if (FILE *f = std::fopen((m_dumpDir + name).c_str(), "wb"))
+        {
+            std::fwrite(pixels.data(), 4, pixels.size(), f);
+            std::fclose(f);
+        }
+        DumpLog("SNAP %s", name + 1);
+    }
+    m_dumpGroup = group;
+    m_dumpGroupValid = true;
+    m_dumpGroupFrame = ctx.frame;
+    m_dumpGroupScissorX1 = ctx.scissor.x1;
+    m_dumpGroupScissorY1 = ctx.scissor.y1;
+    const uint32_t count = std::min<uint32_t>(primitiveVertexCount(state.prim.type), batch.vertexCount);
+    char vertices[512];
+    int length = 0;
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        const GSVertex &v = batch.vertices[i];
+        length += std::snprintf(vertices + length, sizeof(vertices) - length, " v%u=(%.1f,%.1f z=%.0f rgba=%02x%02x%02x%02x uv=%u,%u stq=%.4f,%.4f,%.4f)", i,
+                                v.x - (ctx.xyoffset.ofx >> 4), v.y - (ctx.xyoffset.ofy >> 4), v.z, v.r, v.g, v.b, v.a, v.u >> 4, v.v >> 4, v.s, v.t, v.q);
+    }
+    int textureIndex = -1;
+    if (state.prim.tme)
+    {
+        // Decode each distinct texture once, as the sampler sees it (CLUT and TEXA applied).
+        TextureSampler sampler = MakeTextureSampler(state);
+        const auto key = std::make_tuple(tex.tbp0, tex.tbw, tex.psm, sampler.texW, sampler.texH, tex.cpsm, tex.csm, tex.csa, m_clutSerial, state.texa.ta0, state.texa.ta1, state.texa.aem);
+        auto it = m_dumpTextures.find(key);
+        if (it == m_dumpTextures.end())
+        {
+            const int index = static_cast<int>(m_dumpTextures.size());
+            it = m_dumpTextures.emplace(key, index).first;
+            std::vector<uint32_t> texels(static_cast<size_t>(sampler.texW) * sampler.texH);
+            GSMem::TexturePageCache fresh;
+            for (int y = 0; y < sampler.texH; ++y)
+                for (int x = 0; x < sampler.texW; ++x)
+                    texels[static_cast<size_t>(y) * sampler.texW + x] = FetchTexel(sampler, fresh, x, y);
+            char name[64];
+            std::snprintf(name, sizeof(name), "/tex_%04d_%dx%d.rgba", index, sampler.texW, sampler.texH);
+            if (FILE *f = std::fopen((m_dumpDir + name).c_str(), "wb"))
+            {
+                std::fwrite(texels.data(), 4, texels.size(), f);
+                std::fclose(f);
+            }
+        }
+        textureIndex = it->second;
+    }
+    DumpLog("PRIM #%u type=%u iip=%u tme=%u fge=%u abe=%u fst=%u ctxt=%u frame=(fbp=%u fbw=%u psm=0x%x msk=%08x) zbuf=(zbp=%u psm=0x%x zmsk=%u) "
+            "scissor=%u,%u-%u,%u test=0x%llx alpha=0x%llx fba=%u pabe=%u tex%d=(tbp0=%u tbw=%u psm=0x%x tw=%u th=%u tcc=%u tfx=%u cbp=%u cpsm=0x%x csm=%u csa=%u) "
+            "lin=%u clamp=0x%llx texa=%u/%u/%u%s",
+            4000u - m_dumpRemaining, unsigned(state.prim.type), unsigned(state.prim.iip), unsigned(state.prim.tme), unsigned(state.prim.fge), unsigned(state.prim.abe),
+            unsigned(state.prim.fst), unsigned(state.prim.ctxt), unsigned(ctx.frame.fbp), unsigned(ctx.frame.fbw), unsigned(ctx.frame.psm), unsigned(ctx.frame.fbmsk),
+            unsigned(ctx.zbuf.zbp), unsigned(ctx.zbuf.psm), unsigned(ctx.zbuf.zmask), unsigned(ctx.scissor.x0), unsigned(ctx.scissor.y0), unsigned(ctx.scissor.x1),
+            unsigned(ctx.scissor.y1), (unsigned long long)ctx.test, (unsigned long long)ctx.alpha, unsigned(ctx.fba & 1u), unsigned(state.pabe), textureIndex,
+            unsigned(tex.tbp0), unsigned(tex.tbw), unsigned(tex.psm), unsigned(tex.tw), unsigned(tex.th), unsigned(tex.tcc), unsigned(tex.tfx), unsigned(tex.cbp),
+            unsigned(tex.cpsm), unsigned(tex.csm), unsigned(tex.csa), unsigned(state.linearFilter), (unsigned long long)ctx.clamp, unsigned(state.texa.ta0),
+            unsigned(state.texa.ta1), unsigned(state.texa.aem), vertices);
+}
+
+void GSCpuBackend::DumpFinishUnlocked()
+{
+    if (FILE *f = std::fopen((m_dumpDir + "/vram_after.bin").c_str(), "wb"))
+    {
+        std::fwrite(m_vram, 1, GSMem::MEMORY_SIZE, f);
+        std::fclose(f);
+    }
+    if (m_dumpLog)
+    {
+        std::fclose(m_dumpLog);
+        m_dumpLog = nullptr;
+    }
+    // Workers were idle meanwhile; their caches predate the dumped drawing.
+    for (GSMem::TexturePageCache &cache : m_texturePageCaches)
+        cache.Invalidate();
+    for (DecodedTextureCache &cache : m_decodedCaches)
+        cache.Invalidate();
 }

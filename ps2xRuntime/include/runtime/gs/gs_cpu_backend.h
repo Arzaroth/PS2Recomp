@@ -5,6 +5,11 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <map>
+#include <string>
+#include <tuple>
 #include <condition_variable>
 #include <memory>
 #include <mutex>
@@ -93,6 +98,14 @@ private:
     void DrawQueued(const QueuedPrimitive &item, uint32_t index);
     void DrawWith(const GSPrimitiveBatch &batch, const RasterContext &raster);
     void WorkerMain(uint32_t index);
+
+    // PS2X_GS_DUMP=<dir>, PS2X_GS_DUMP_AFTER=<seconds>: after that delay, the next 4000
+    // primitives are drawn immediately and logged with their state (prims.txt), each distinct
+    // texture decoded as sampled (tex_N_WxH.rgba), with VRAM before and after.
+    void DumpUpdateUnlocked();
+    void DumpLog(const char *format, ...) const;
+    void DumpPrimitiveUnlocked(const GSPrimitiveBatch &batch);
+    void DumpFinishUnlocked();
     uint32_t LookupCLUT(const GSDrawState &state, const std::array<uint16_t, 512> &clut, uint8_t index, uint8_t cpsm, uint8_t csm, uint8_t csa, uint8_t sourcePsm);
 
     void PerformLocalToLocalTransfer();
@@ -149,6 +162,19 @@ private:
     std::condition_variable m_workCv;
     std::atomic<uint32_t> m_sleepingWorkers{0};
     std::atomic<bool> m_stopWorkers{false};
+    uint32_t m_dumpState = 0; // 0 unchecked, 1 armed, 2 done or disabled
+    uint32_t m_dumpRemaining = 0;
+    std::string m_dumpDir;
+    std::chrono::steady_clock::time_point m_dumpStart{};
+    FILE *m_dumpLog = nullptr;
+    mutable uint32_t m_dumpPresents = 0;
+    uint32_t m_dumpSnapshots = 0;
+    uint64_t m_dumpGroup = 0;
+    bool m_dumpGroupValid = false;
+    GSFrameReg m_dumpGroupFrame{};
+    uint32_t m_dumpGroupScissorX1 = 0;
+    uint32_t m_dumpGroupScissorY1 = 0;
+    std::map<std::tuple<uint32_t, uint32_t, uint32_t, int, int, uint32_t, uint32_t, uint32_t, uint64_t, uint32_t, uint32_t, uint32_t>, int> m_dumpTextures;
     static std::atomic<bool> s_asyncRasterization;
 
     GSTransferCommand m_transfer{};
