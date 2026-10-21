@@ -85,6 +85,7 @@ PS2AudioBackend::PS2AudioBackend() : m_impl(std::make_unique<Impl>())
 
 PS2AudioBackend::~PS2AudioBackend()
 {
+    closeSpu2Stream();
     if (m_impl)
         stopAll();
 }

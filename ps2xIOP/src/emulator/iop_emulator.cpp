@@ -9,6 +9,7 @@
 #include "imports/iop_loadcore.h"
 #include "core/iop_memory.h"
 #include "core/iop_sio2.h"
+#include "core/iop_spu2.h"
 #include "services/iop_module_loader.h"
 #include "services/iop_rpc.h"
 #include "imports/iop_stdio.h"
@@ -124,9 +125,16 @@ namespace ps2x::iop::detail
               cpuCore(memory),
               imports(memory),
               loadcore(memory, imports),
-              sio2(memory)
+              sio2(memory),
+              spu2(memory)
         {
             memory.setSio2(&sio2);
+            memory.setSpu2(&spu2);
+            spu2.setClock(&totalCycles);
+            spu2.setInterruptSink([this](int irq)
+                                  { pendingDmaInterrupts[irq] = totalCycles; });
+            spu2.setOutputSink([this](const int16_t *frames, size_t count)
+                               { host.submitAudio(frames, count); });
             sio2.setPadStateReader([this](uint8_t *state, size_t size)
                                    { return host.readPadState(0, state, size); });
             reset();
@@ -142,12 +150,14 @@ namespace ps2x::iop::detail
             cdvd.reset();
             intrman.reset();
             timrman.reset();
+            vblank.reset();
             ioman.reset();
             pendingDmaInterrupts.clear();
             pendingGuestCallbacks.clear();
             pendingSifCommands.clear();
             sifCommandBuffer = 0u;
             sio2.reset();
+            spu2.reset();
             dmaRequests = {};
             nextModuleId = 1;
             moduleCursor = kModuleLoadBase;
@@ -436,6 +446,8 @@ namespace ps2x::iop::detail
             {
                 if (!step(cpu))
                     break;
+                if (totalCycles >= spu2.nextEventCycle())
+                    spu2.advanceTo(totalCycles);
                 if (!servicingDmaInterrupts && !pendingDmaInterrupts.empty())
                     servicePendingDmaInterrupts();
                 if (!servicingGuestCallbacks && !pendingGuestCallbacks.empty())
@@ -667,10 +679,12 @@ namespace ps2x::iop::detail
                 const uint64_t target = totalCycles + cycles;
                 while (totalCycles < target)
                 {
+                    spu2.advanceTo(totalCycles);
                     servicePendingDmaInterrupts();
                     servicePendingSifCommands();
                     servicePendingGuestCallbacks();
                     timrman.serviceDue(totalCycles, *this);
+                    vblank.serviceDue(totalCycles, *this);
                     IopThread *next = kernel.beginNextReady(totalCycles);
                     if (!next)
                     {
@@ -680,6 +694,8 @@ namespace ps2x::iop::detail
                         if (!pendingGuestCallbacks.empty())
                             nextWake = std::min(nextWake, pendingGuestCallbacks.begin()->first);
                         nextWake = timrman.nextEventCycle(nextWake);
+                        nextWake = vblank.nextEventCycle(nextWake);
+                        nextWake = std::min(nextWake, spu2.nextEventCycle());
                         totalCycles = std::max(totalCycles + 1u, std::min(target, nextWake));
                         continue;
                     }
@@ -816,6 +832,7 @@ namespace ps2x::iop::detail
         std::map<int, uint64_t> pendingDmaInterrupts;
         std::multimap<uint64_t, ScheduledGuestCallback> pendingGuestCallbacks;
         IopSio2 sio2;
+        IopSpu2 spu2;
         struct DmaRequest
         {
             uint32_t address = 0u;
@@ -964,6 +981,11 @@ namespace ps2x::iop::detail
     std::vector<std::string> IopEmulator::describeThreads() const
     {
         return m_impl->kernel.describeThreads();
+    }
+
+    std::vector<std::string> IopEmulator::describeSpu2() const
+    {
+        return m_impl->spu2.describe();
     }
 
     uint32_t IopEmulator::threadCount() const noexcept

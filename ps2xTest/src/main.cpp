@@ -20,6 +20,7 @@ void register_ps2_recompiler_tests();
 void register_ps2_runtime_expansion_tests();
 void register_ps2_float_semantics_tests();
 void register_ps2_overlay_module_tests();
+void register_audio_stretch_tests();
 void reset_ps2_test_function_table();
 
 int main()
@@ -44,6 +45,7 @@ int main()
     register_ps2_runtime_expansion_tests();
     register_ps2_float_semantics_tests();
     register_ps2_overlay_module_tests();
+    register_audio_stretch_tests();
     int res = MiniTest::Run();
     std::cout.flush();
     std::cerr.flush();

@@ -590,6 +590,10 @@ namespace ps2_stubs
         constexpr uint32_t kMpegStrM2V = 0u;
         constexpr uint32_t kMpegStrPCM = 1u;
         constexpr uint32_t kMpegStrADPCM = 2u;
+        // sceMpegStrDATA: private stream 1 packets of one channel, their
+        // 4-byte sub-header included. Valkyrie Profile 2 takes its movie audio this way.
+        constexpr uint32_t kMpegStrDATA = 4u;
+        constexpr uint32_t kAnyStreamId = 0xFFFFFFFFu;
         constexpr uint8_t kMpegPackHeader = 0xBAu;
         constexpr uint8_t kMpegSystemHeader = 0xBBu;
         constexpr uint8_t kMpegProgramEnd = 0xB9u;
@@ -1170,7 +1174,8 @@ namespace ps2_stubs
             }
         }
 
-        std::vector<MpegRegisteredCallback> matchingStreamCallbacks(uint32_t mpegAddr, uint32_t streamType)
+        std::vector<MpegRegisteredCallback> matchingStreamCallbacks(uint32_t mpegAddr, uint32_t streamType,
+                                                                    uint32_t streamId = kAnyStreamId)
         {
             std::vector<MpegRegisteredCallback> out;
             auto it = g_mpeg_stub_state.callbacksByMpeg.find(mpegAddr);
@@ -1181,7 +1186,8 @@ namespace ps2_stubs
 
             for (const MpegRegisteredCallback &callback : it->second)
             {
-                if (callback.stream && callback.type == streamType)
+                if (callback.stream && callback.type == streamType &&
+                    (streamId == kAnyStreamId || callback.streamId == streamId))
                 {
                     out.push_back(callback);
                 }
@@ -1195,7 +1201,8 @@ namespace ps2_stubs
                                       uint32_t len,
                                       std::vector<MpegStreamCallbackEvent> &callbackEvents,
                                       int64_t pts90k = -1,
-                                      int64_t dts90k = -1)
+                                      int64_t dts90k = -1,
+                                      uint32_t streamId = kAnyStreamId)
         {
             MpegStreamCallbackEvent event{};
             event.mpegAddr = mpegAddr;
@@ -1204,7 +1211,7 @@ namespace ps2_stubs
             event.len = len;
             event.pts = pts90k >= 0 ? static_cast<uint64_t>(pts90k) : 0xFFFFFFFFFFFFFFFFull;
             event.dts = dts90k >= 0 ? static_cast<uint64_t>(dts90k) : 0xFFFFFFFFFFFFFFFFull;
-            event.callbacks = matchingStreamCallbacks(mpegAddr, streamType);
+            event.callbacks = matchingStreamCallbacks(mpegAddr, streamType, streamId);
             if (!event.callbacks.empty())
             {
                 callbackEvents.push_back(std::move(event));
@@ -1400,6 +1407,20 @@ namespace ps2_stubs
                             callbackEvents,
                             pes.pts90k,
                             pes.dts90k);
+                        // DATA packets start with 0xFF, then 0x90 + channel (VP2: ff 90 00 00).
+                        if (streamId == kMpegPrivateStream1 && packetEnd - payloadStart > 4u &&
+                            buffer[payloadStart] == 0xFFu)
+                        {
+                            queueStreamCallbackEvent(
+                                mpegAddr,
+                                kMpegStrDATA,
+                                playback.pssGuestAddrs[payloadStart],
+                                static_cast<uint32_t>(packetEnd - payloadStart),
+                                callbackEvents,
+                                pes.pts90k,
+                                pes.dts90k,
+                                buffer[payloadStart + 1u] & 0x0Fu);
+                        }
                     }
                 }
 

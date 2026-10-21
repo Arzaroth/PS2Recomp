@@ -85,6 +85,7 @@ public:
                              uint32_t *resultAddress) override;
     bool sendSifCommand(uint32_t commandId, const void *packet, size_t packetSize) override;
 
+    void submitAudio(const int16_t *frames, size_t count) override;
     void log(ps2x::iop::LogLevel level, std::string_view message) override;
 
 private:

@@ -12,6 +12,7 @@
 namespace ps2x::iop::detail
 {
     class IopSio2;
+    class IopSpu2;
 
     class IopMemory
     {
@@ -82,6 +83,8 @@ namespace ps2x::iop::detail
         void requestInterrupt(int irq, uint64_t delayCycles) noexcept { m_dmaStart = DmaStart{irq, delayCycles}; }
         // SIO2 controller registers are forwarded to this device (owned by the emulator).
         void setSio2(IopSio2 *sio2) noexcept { m_sio2 = sio2; }
+        // SPU2 registers (16-bit) and DMA channels 4 and 7 are forwarded to this device.
+        void setSpu2(IopSpu2 *spu2) noexcept { m_spu2 = spu2; }
         [[nodiscard]] std::span<const uint8_t> ram() const noexcept { return m_ram; }
 
         [[nodiscard]] static uint32_t physicalAddress(uint32_t address) noexcept;
@@ -104,5 +107,6 @@ namespace ps2x::iop::detail
         uint32_t m_interruptControl = 1;
         std::optional<DmaStart> m_dmaStart;
         IopSio2 *m_sio2 = nullptr;
+        IopSpu2 *m_spu2 = nullptr;
     };
 }
