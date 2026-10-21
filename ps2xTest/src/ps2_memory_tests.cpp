@@ -216,6 +216,26 @@ void register_ps2_memory_tests()
             t.Equals(resetCount, 1u, "timer reset should restart the deterministic count window");
         });
 
+        tc.Run("EE timer busy-wait reads owe the scheduler one tick of cycles", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            constexpr uint32_t kTimer0Count = 0x10000000u;
+            constexpr uint32_t kTimer0Mode = 0x10000010u;
+            t.IsTrue(mem.writeIORegister(kTimer0Count, 0u), "timer count reset write should succeed");
+            t.IsTrue(mem.writeIORegister(kTimer0Mode, 0x82u), "BUSCLK/256 counting should start");
+
+            (void)mem.readIORegister(kTimer0Count);
+            t.Equals(mem.takeTimerSpinCycles(), uint64_t{0}, "a first read owes nothing");
+            (void)mem.readIORegister(kTimer0Count);
+            t.Equals(mem.takeTimerSpinCycles(), uint64_t{512},
+                     "re-reading an unchanged BUSCLK/256 count owes one tick of EE cycles");
+            mem.advanceEeTimers(512u);
+            (void)mem.readIORegister(kTimer0Count);
+            t.Equals(mem.takeTimerSpinCycles(), uint64_t{0}, "a changed count owes nothing");
+        });
+
         tc.Run("EE timers 0 through 3 expose independent COUNT MODE and COMP registers", [](TestCase &t)
         {
             PS2Memory mem;

@@ -16,7 +16,9 @@ extern "C"
 }
 #endif
 
+#include <chrono>
 #include <deque>
+#include <numeric>
 #include <sstream>
 #include <memory>
 
@@ -34,6 +36,25 @@ namespace ps2_stubs
             int64_t pts90k = -1;
             std::vector<uint8_t> rgba;
         };
+
+        // Decoding stands in for the IPU, which works beside the EE: the host time it takes is
+        // credited as EE cycles, otherwise VSync (which waits for both cycles and host time)
+        // and therefore movie playback slow down by the decode cost.
+        void accountHostDecodeTime(PS2Runtime *runtime, std::chrono::steady_clock::time_point start)
+        {
+            if (!runtime)
+            {
+                return;
+            }
+            const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start);
+            uint64_t cycles = static_cast<uint64_t>(elapsed.count()) * (EeScheduler::kEeClockHz / 1000000u);
+            while (cycles > 0u)
+            {
+                const uint32_t step = static_cast<uint32_t>(std::min<uint64_t>(cycles, 0x10000000u));
+                runtime->eeScheduler().accountCycles(step);
+                cycles -= step;
+            }
+        }
 
 #if PS2X_HAS_FFMPEG
         std::string ffmpegErrorString(int err)
@@ -480,8 +501,18 @@ namespace ps2_stubs
         };
 
         constexpr uint64_t kPictureClockOne = 1ull << 32u;
-        // NTSC-style fields at ~59.94 Hz to keep MPEG timing yet (29.97 fps).
+        // Two fields per picture when the stream gives no rate (29.97 fps NTSC, 25 fps PAL).
         constexpr uint64_t kDefaultPictureIntervalQ32 = 2ull * kPictureClockOne;
+        // Field (vblank) rate the picture clock counts in: follows the scheduler's video mode.
+        EeScheduler::FieldRate g_mpegFieldRate = EeScheduler::kNtscFieldRate;
+
+        void syncMpegFieldRate(PS2Runtime *runtime)
+        {
+            if (runtime)
+            {
+                g_mpegFieldRate = runtime->eeScheduler().fieldRate();
+            }
+        }
         constexpr size_t kMpegTimingScanLimit = 4096u;
         // Decode lead before sceMpegDemuxPss/Ring stops consuming. The real libmpeg buffers
         // the compressed video, not decoded pictures, so games may demux seconds ahead:
@@ -606,8 +637,8 @@ namespace ps2_stubs
 
             const uint64_t extensionNumerator = static_cast<uint64_t>(frameRateExtensionN) + 1u;
             const uint64_t extensionDenominator = static_cast<uint64_t>(frameRateExtensionD) + 1u;
-            const uint64_t denominator = 1001u * frameRateNumerator * extensionNumerator;
-            const uint64_t numerator = (60000u * frameRateDenominator * extensionDenominator) << 32u;
+            const uint64_t denominator = g_mpegFieldRate.denominator * frameRateNumerator * extensionNumerator;
+            const uint64_t numerator = (g_mpegFieldRate.numerator * frameRateDenominator * extensionDenominator) << 32u;
             return std::max(kPictureClockOne, (numerator + denominator / 2u) / denominator);
         }
 
@@ -737,13 +768,16 @@ namespace ps2_stubs
 
         uint64_t mpegPtsDeltaToVSyncQ32(uint64_t delta90k)
         {
-            // 90 kHz MPEG clock -> NTSC field clock (60000/1001 Hz):
-            // fields = pts * 60000 / (90000 * 1001) = pts * 2 / 3003.
-            constexpr uint64_t kPtsDivisor = 3003u;
+            // 90 kHz MPEG clock -> field clock: fields = pts * rate / 90000, reduced so the
+            // remainder term cannot overflow (NTSC: pts * 2 / 3003, PAL: pts / 1800).
+            const uint64_t rawDivisor = 90000u * g_mpegFieldRate.denominator;
+            const uint64_t common = std::gcd(g_mpegFieldRate.numerator, rawDivisor);
+            const uint64_t fieldsPerUnit = g_mpegFieldRate.numerator / common;
+            const uint64_t kPtsDivisor = rawDivisor / common;
             const uint64_t whole = delta90k / kPtsDivisor;
             const uint64_t remainder = delta90k % kPtsDivisor;
-            const uint64_t wholeQ32 = whole * 2u * kPictureClockOne;
-            const uint64_t remainderQ32 = ((remainder * 2u * kPictureClockOne) + kPtsDivisor / 2u) / kPtsDivisor;
+            const uint64_t wholeQ32 = whole * fieldsPerUnit * kPictureClockOne;
+            const uint64_t remainderQ32 = ((remainder * fieldsPerUnit * kPictureClockOne) + kPtsDivisor / 2u) / kPtsDivisor;
             return wholeQ32 + remainderQ32;
         }
 
@@ -1859,6 +1893,7 @@ namespace ps2_stubs
         (void)rdram;
         const uint32_t mpegAddr = getRegU32(ctx, 4);
         bool wakePictureWaiter = false;
+        const auto decodeStart = std::chrono::steady_clock::now();
         {
             std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
             MpegPlaybackState &playback = getPlaybackState(mpegAddr);
@@ -1871,6 +1906,7 @@ namespace ps2_stubs
                                 playback.streamEnded ||
                                 playback.decoderFailed;
         }
+        accountHostDecodeTime(runtime, decodeStart);
         if (wakePictureWaiter)
         {
             runtime->eeScheduler().completeExternalWait(kMpegPictureWaitType, mpegAddr, KE_OK);
@@ -1880,12 +1916,14 @@ namespace ps2_stubs
 
     void sceMpegAddBs(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        syncMpegFieldRate(runtime);
         const uint32_t mpegAddr = getRegU32(ctx, 4);
         const uint32_t dataAddr = getRegU32(ctx, 5);
         const uint32_t byteCount = getRegU32(ctx, 6);
 
         size_t copied = 0u;
         bool wakePictureWaiter = false;
+        const auto decodeStart = std::chrono::steady_clock::now();
         {
             std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
             MpegPlaybackState &playback = getPlaybackState(mpegAddr);
@@ -1905,6 +1943,7 @@ namespace ps2_stubs
             }
             wakePictureWaiter = playback.decodedFrames.size() != framesBefore || playback.streamEnded || playback.decoderFailed;
         }
+        accountHostDecodeTime(runtime, decodeStart);
 
         if (wakePictureWaiter)
         {
@@ -1990,6 +2029,7 @@ namespace ps2_stubs
 
     void sceMpegCreate(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        syncMpegFieldRate(runtime);
         const uint32_t param_1 = getRegU32(ctx, 4); // a0
         const uint32_t param_2 = getRegU32(ctx, 5); // a1
         const uint32_t param_3 = getRegU32(ctx, 6); // a2
@@ -2083,6 +2123,7 @@ namespace ps2_stubs
 
     void sceMpegDemuxPss(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        syncMpegFieldRate(runtime);
         const uint32_t mpegAddr = getRegU32(ctx, 4);
         const uint32_t dataAddr = getRegU32(ctx, 5);
         const uint32_t byteCount = getRegU32(ctx, 6);
@@ -2095,6 +2136,7 @@ namespace ps2_stubs
         uint32_t traceIdx = 0u;
         bool eofChanged = false;
         bool backpressured = false;
+        const auto decodeStart = std::chrono::steady_clock::now();
         {
             std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
             MpegPlaybackState &playback = getPlaybackState(mpegAddr);
@@ -2108,6 +2150,7 @@ namespace ps2_stubs
             decodedCount = playback.decodedFrames.size();
             traceIdx = g_mpeg_stub_state.demuxPssTraceCount++;
         }
+        accountHostDecodeTime(runtime, decodeStart);
 
         if (backpressured)
         {
@@ -2152,6 +2195,7 @@ namespace ps2_stubs
 
     void sceMpegDemuxPssRing(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        syncMpegFieldRate(runtime);
         static std::atomic<uint32_t> s_demuxRingEntryCount{0u};
         const uint32_t entryIdx = s_demuxRingEntryCount.fetch_add(1u, std::memory_order_relaxed);
         if (entryIdx < 4u)
@@ -2178,6 +2222,7 @@ namespace ps2_stubs
         uint32_t traceIdx = 0u;
         bool eofChanged = false;
         bool backpressured = false;
+        const auto decodeStart = std::chrono::steady_clock::now();
         {
             std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
             MpegPlaybackState &playback = getPlaybackState(mpegAddr);
@@ -2199,6 +2244,7 @@ namespace ps2_stubs
             decodedCount = playback.decodedFrames.size();
             traceIdx = g_mpeg_stub_state.demuxRingTraceCount++;
         }
+        accountHostDecodeTime(runtime, decodeStart);
 
         if (backpressured)
         {
@@ -2287,6 +2333,7 @@ namespace ps2_stubs
 
     void sceMpegGetPicture(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        syncMpegFieldRate(runtime);
         const uint32_t mpegAddr = getRegU32(ctx, 4);
         const uint32_t imageAddr = getRegU32(ctx, 5);
         uint32_t width = kStubMovieWidth;

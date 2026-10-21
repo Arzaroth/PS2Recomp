@@ -10,8 +10,6 @@ namespace ps2_stubs
         constexpr uint32_t kCdStreamBlocking = 1u;
         constexpr uint32_t kDvdSectorsPerSecondX1 = 675u;
         constexpr uint32_t kDvdSectorsPerSecondX4 = kDvdSectorsPerSecondX1 * 4u;
-        constexpr uint64_t kNtScFieldsPerSecondNumerator = 60000u;
-        constexpr uint64_t kNtScFieldsPerSecondDenominator = 1001u;
 
         struct CdStreamTimingState
         {
@@ -34,6 +32,12 @@ namespace ps2_stubs
         uint64_t currentCdStreamTick(PS2Runtime *runtime)
         {
             return runtime != nullptr ? runtime->eeScheduler().currentVSyncTick() : 0u;
+        }
+
+        // Vblanks per second of the tick clock above (59.94 Hz NTSC, 50 Hz PAL).
+        EeScheduler::FieldRate cdStreamFieldRate(PS2Runtime *runtime)
+        {
+            return runtime != nullptr ? runtime->eeScheduler().fieldRate() : EeScheduler::kNtscFieldRate;
         }
 
         uint32_t dvdStreamSectorsPerSecond(uint8_t spindleControl)
@@ -88,11 +92,12 @@ namespace ps2_stubs
             const uint64_t elapsedTicks = tick - g_cdStreamTiming.lastVSyncTick;
             g_cdStreamTiming.lastVSyncTick = tick;
 
-            // 59.94 Hz field clock: sectors = fields * sectors/s * 1001 / 60000.
-            const uint64_t unitsPerTick = static_cast<uint64_t>(g_cdStreamTiming.sectorsPerSecond) * kNtScFieldsPerSecondDenominator;
+            // Field clock: sectors = fields * sectors/s * denominator / numerator.
+            const EeScheduler::FieldRate rate = cdStreamFieldRate(runtime);
+            const uint64_t unitsPerTick = static_cast<uint64_t>(g_cdStreamTiming.sectorsPerSecond) * rate.denominator;
             const uint64_t accumulated = g_cdStreamTiming.productionRemainder + elapsedTicks * unitsPerTick;
-            const uint64_t elapsedProduction = accumulated / kNtScFieldsPerSecondNumerator;
-            g_cdStreamTiming.productionRemainder = accumulated % kNtScFieldsPerSecondNumerator;
+            const uint64_t elapsedProduction = accumulated / rate.numerator;
+            g_cdStreamTiming.productionRemainder = accumulated % rate.numerator;
             if (elapsedProduction == 0u)
             {
                 return;
@@ -152,11 +157,12 @@ namespace ps2_stubs
                 return now;
             }
 
-            const uint64_t requiredUnits = static_cast<uint64_t>(sectorsNeeded) * kNtScFieldsPerSecondNumerator;
+            const EeScheduler::FieldRate rate = cdStreamFieldRate(runtime);
+            const uint64_t requiredUnits = static_cast<uint64_t>(sectorsNeeded) * rate.numerator;
             const uint64_t remainingUnits = requiredUnits > g_cdStreamTiming.productionRemainder
                                                 ? requiredUnits - g_cdStreamTiming.productionRemainder
                                                 : 0u;
-            const uint64_t unitsPerTick = static_cast<uint64_t>(g_cdStreamTiming.sectorsPerSecond) * kNtScFieldsPerSecondDenominator;
+            const uint64_t unitsPerTick = static_cast<uint64_t>(g_cdStreamTiming.sectorsPerSecond) * rate.denominator;
             const uint64_t ticks = std::max<uint64_t>(1u, (remainingUnits + unitsPerTick - 1u) / unitsPerTick);
             return now + ticks;
         }

@@ -311,6 +311,9 @@ public:
     // EE timers advance from the scheduler's emulated EE-cycle clock. The
     // returned mask uses bits 0..3 for newly raised TIM0..TIM3 interrupts.
     uint32_t advanceEeTimers(uint64_t eeCycles) noexcept;
+    // EE cycles owed to timer busy-waits (see readIORegister): the scheduler accounts them so a
+    // loop polling a timer faster than it ticks finishes in game time, not in host time.
+    uint64_t takeTimerSpinCycles() noexcept { return m_timerSpinCycles.exchange(0u, std::memory_order_acq_rel); }
     [[nodiscard]] uint64_t cyclesUntilNextEeTimerInterrupt() const noexcept;
     void resetEeTimers() noexcept;
 
@@ -447,9 +450,11 @@ public:
         uint32_t compare = 0;
         uint32_t hold = 0;
         uint64_t clockRemainder = 0;
+        uint32_t lastReadCount = 0xFFFFFFFFu;
     };
 
     std::array<EeTimer, 4> m_eeTimers{};
+    std::atomic<uint64_t> m_timerSpinCycles{0u};
     bool tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr);
     void completeDmacChannel(uint32_t channelBase, uint32_t cause);
     void queueCompletedDmacCause(uint32_t cause);

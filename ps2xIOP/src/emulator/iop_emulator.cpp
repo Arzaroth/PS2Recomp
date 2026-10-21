@@ -879,11 +879,17 @@ namespace ps2x::iop::detail
 
     void IopEmulator::runEeCycles(uint64_t eeCycles) noexcept
     {
+        // The EE accounts a few dozen cycles per checkpoint: running the IOP scheduler that
+        // often cost a third of the EE thread. Batch 256 IOP cycles (about 7 us) per run.
+        constexpr uint64_t kRunBatchEeCycles = 8u * 256u;
         const uint64_t total = m_impl->eeCycleCarry + eeCycles;
-        const uint64_t iopCycles = total / 8u;
+        if (total < kRunBatchEeCycles)
+        {
+            m_impl->eeCycleCarry = total;
+            return;
+        }
         m_impl->eeCycleCarry = total % 8u;
-        if (iopCycles)
-            m_impl->runCycles(iopCycles);
+        m_impl->runCycles(total / 8u);
     }
 
     RpcResult IopEmulator::handleRpc(const RpcRequest &request)

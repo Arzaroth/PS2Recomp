@@ -402,6 +402,7 @@ bool PS2Memory::initialize(size_t ramSize)
 void PS2Memory::resetEeTimers() noexcept
 {
     m_eeTimers = {};
+    m_timerSpinCycles.store(0u, std::memory_order_release);
 }
 
 uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
@@ -2284,11 +2285,23 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
     uint32_t timerOffset = 0u;
     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
     {
-        const EeTimer &timer = m_eeTimers[timerIndex];
+        EeTimer &timer = m_eeTimers[timerIndex];
         switch (timerOffset)
         {
         case kEeTimerCountOffset:
-            return timer.count & 0xFFFFu;
+        {
+            // Reading an unchanged count means the guest polls faster than the timer ticks
+            // (a busy-wait, e.g. VP2's movie player pacing on the HBLANK counter): owe it the
+            // EE cycles of one tick so the wait ends in game time.
+            const uint32_t count = timer.count & 0xFFFFu;
+            if ((timer.mode & kEeTimerModeCue) != 0u && count == timer.lastReadCount)
+            {
+                const uint64_t clockHz = kEeTimerClockHz[timer.mode & kEeTimerModeClksMask];
+                m_timerSpinCycles.fetch_add(std::max<uint64_t>(kEeClockHz / clockHz, 1u), std::memory_order_acq_rel);
+            }
+            timer.lastReadCount = count;
+            return count;
+        }
         case kEeTimerModeOffset:
             return timer.mode & (kEeTimerModeConfigMask | kEeTimerModeStatusMask);
         case kEeTimerCompareOffset:

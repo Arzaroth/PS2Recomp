@@ -31,7 +31,6 @@ namespace
     constexpr uint32_t WEF_OR = 0x01u;
     constexpr uint32_t WEF_CLEAR = 0x10u;
     constexpr uint32_t WEF_CLEAR_ALL = 0x20u;
-    constexpr auto kVBlankPeriod = std::chrono::microseconds(16667);
     constexpr auto kVBlankDuration = std::chrono::microseconds(500);
     constexpr uint64_t kAlarmTickMicroseconds = 64u;
     constexpr uint32_t kDebugPublishDispatchInterval = 4096u;
@@ -50,7 +49,6 @@ namespace
         return std::chrono::seconds(wholeSeconds) + std::chrono::nanoseconds(remainingNanoseconds);
     }
 
-    constexpr uint64_t kVBlankPeriodCycles = microsecondsToEeCycles(16667u);
     constexpr uint64_t kVBlankDurationCycles = microsecondsToEeCycles(500u);
     constexpr uint64_t kAlarmTickCycles = microsecondsToEeCycles(kAlarmTickMicroseconds);
 
@@ -75,6 +73,7 @@ namespace
 EeScheduler::EeScheduler(PS2Runtime &runtime)
     : m_runtime(runtime)
 {
+    setFieldRate(kNtscFieldRate);
 }
 
 EeScheduler::~EeScheduler()
@@ -113,6 +112,8 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     m_pendingEeTimerInterrupts = 0u;
     m_eeCycle = 0u;
     m_iopEeCycles = 0u;
+    m_iopVblankEnd = 0u;
+    setFieldRate(kNtscFieldRate);
     m_sliceEndCycle = kDefaultTimeSliceCycles;
     m_stopRequested.store(false, std::memory_order_release);
     m_checkpointPending.store(false, std::memory_order_release);
@@ -147,10 +148,23 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     main.status = EeThreadStatus::Ready;
     m_threads.emplace(main.id, std::move(main));
     m_readyQueues[0].push_back(kMainThreadId);
-    scheduleEvent(m_eeCycle + kVBlankPeriodCycles,
-                  std::chrono::steady_clock::now() + kVBlankPeriod,
+    scheduleEvent(m_eeCycle + m_vblankPeriodCycles,
+                  std::chrono::steady_clock::now() + m_vblankPeriod,
                   EeEvent{EeEventType::VBlankStart, 0, 0});
     publishSnapshot();
+}
+
+void EeScheduler::setFieldRate(FieldRate rate) noexcept
+{
+    // Takes effect from the next scheduled vblank.
+    m_fieldRate = rate;
+    m_vblankPeriodCycles = (kEeClockHz * rate.denominator + rate.numerator / 2u) / rate.numerator;
+    m_vblankPeriod = std::chrono::nanoseconds((1'000'000'000ull * rate.denominator + rate.numerator / 2u) / rate.numerator);
+}
+
+EeScheduler::FieldRate EeScheduler::fieldRate() const noexcept
+{
+    return m_fieldRate;
 }
 
 void EeScheduler::run()
@@ -391,7 +405,7 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
 
 void EeScheduler::accountCycles(uint32_t cycles) noexcept
 {
-    const uint64_t elapsed = std::max<uint64_t>(1u, cycles);
+    const uint64_t elapsed = std::max<uint64_t>(1u, cycles) + m_runtime.memory().takeTimerSpinCycles();
     m_eeCycle += elapsed;
     m_pendingEeTimerInterrupts |= m_runtime.memory().advanceEeTimers(elapsed);
     m_runtime.advanceIopEeCycles(elapsed);
@@ -1855,8 +1869,8 @@ void EeScheduler::processDueDeadlines()
                 scheduleEvent(scheduled.deadlineCycle + kVBlankDurationCycles,
                               scheduled.hostDeadline + kVBlankDuration,
                               EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
-                scheduleEvent(scheduled.deadlineCycle + kVBlankPeriodCycles,
-                              scheduled.hostDeadline + kVBlankPeriod,
+                scheduleEvent(scheduled.deadlineCycle + m_vblankPeriodCycles,
+                              scheduled.hostDeadline + std::chrono::duration_cast<std::chrono::steady_clock::duration>(m_vblankPeriod),
                               EeEvent{EeEventType::VBlankStart, 0, 0});
             }
             processEvent(scheduled.event);
@@ -1875,13 +1889,14 @@ void EeScheduler::processEvent(const EeEvent &event)
     {
         ++m_vsyncTick;
         // The IOP clock only advances with the EE cycles the recompiled code accounts, far
-        // fewer than real time, while vblanks follow the host's 60 Hz. Catch the IOP up to the
+        // fewer than real time, while vblanks follow the host's clock. Catch the IOP up to the
         // end of its matching vblank so its vblank-paced threads (SIO2 pad and memory card
         // drivers wait on WaitVblankStart/End) run once per frame.
         constexpr uint64_t kIopClockHz = 36'864'000ull;
         constexpr uint64_t kEeCyclesPerIopCycle = 8ull;
-        constexpr uint64_t kIopVblankCycles = (kIopClockHz * 1001ull + 30'000ull) / 60'000ull;
-        const uint64_t target = (m_vsyncTick * kIopVblankCycles + kIopVblankCycles / 16ull + 1ull) * kEeCyclesPerIopCycle;
+        const uint64_t iopVblankCycles = (kIopClockHz * m_fieldRate.denominator + m_fieldRate.numerator / 2u) / m_fieldRate.numerator;
+        m_iopVblankEnd += iopVblankCycles;
+        const uint64_t target = (m_iopVblankEnd + iopVblankCycles / 16ull + 1ull) * kEeCyclesPerIopCycle;
         if (target > m_iopEeCycles)
         {
             m_runtime.advanceIopEeCycles(target - m_iopEeCycles);
