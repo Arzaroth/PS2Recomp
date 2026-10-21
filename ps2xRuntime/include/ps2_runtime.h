@@ -399,6 +399,8 @@ public:
     static uint32_t reservedMemoryBase();
 
     void drainCompletedDmacHandlers(uint8_t *rdram);
+    // Raise INTC cause 0 (GS) for unmasked CSR SIGNAL/FINISH rising edges recorded by the GS.
+    void pollGsInterrupt(uint8_t *rdram);
 
     void requestStop();
     bool isStopRequested() const;

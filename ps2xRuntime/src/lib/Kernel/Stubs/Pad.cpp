@@ -7,6 +7,7 @@ namespace ps2_stubs
     {
         constexpr uint8_t kPadModeDigital = 0x41;
         constexpr uint8_t kPadModeDualShock = 0x73;
+        constexpr uint8_t kPadModeDualShock2 = 0x79; // DualShock with pressure-sensitive buttons enabled
         constexpr uint8_t kPadAnalogCenter = 0x80;
         constexpr int32_t kPadTypeDigital = 4;
         constexpr int32_t kPadTypeDualShock = 7;
@@ -245,7 +246,9 @@ namespace ps2_stubs
         void fillPadStatus(uint8_t *data, const PadInputState &state, const PadPortState &portState)
         {
             std::memset(data, 0, 32);
-            data[1] = portState.analogMode ? kPadModeDualShock : kPadModeDigital;
+            data[1] = !portState.analogMode       ? kPadModeDigital
+                      : portState.pressureEnabled ? kPadModeDualShock2
+                                                  : kPadModeDualShock;
             data[2] = static_cast<uint8_t>(state.buttons & 0xFFu);
             data[3] = static_cast<uint8_t>((state.buttons >> 8) & 0xFFu);
             data[4] = state.rx;
@@ -530,13 +533,19 @@ namespace ps2_stubs
             setReturnS32(ctx, 0);
             return;
         case 4: // PAD_MODETABLE
+            // A DualShock 2 reports two selectable modes: digital (4) and DualShock (7).
+            // Games use this table to decide whether an analog controller is present.
             if (index == -1)
             {
-                setReturnS32(ctx, 1); // one available mode
+                setReturnS32(ctx, 2);
             }
             else if (index == 0)
             {
-                setReturnS32(ctx, currentId);
+                setReturnS32(ctx, kPadTypeDigital);
+            }
+            else if (index == 1)
+            {
+                setReturnS32(ctx, kPadTypeDualShock);
             }
             else
             {

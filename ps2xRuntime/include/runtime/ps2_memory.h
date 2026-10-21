@@ -215,6 +215,9 @@ static_assert(sizeof(GSRegisters) == (20u * sizeof(uint64_t)), "GSRegisters layo
 static_assert(alignof(GSRegisters) == alignof(uint64_t), "GSRegisters alignment must remain 64-bit");
 static_assert(std::atomic<uint64_t>::is_always_lock_free, "GS CSR atomic must be lock-free on all supported targets");
 
+// CSR SIGNAL (bit0) / FINISH (bit1) 0->1 transitions raised by the GS, consumed as INTC cause 0 edges.
+inline std::atomic<uint32_t> g_gsCsrRaisedEdges{0};
+
 // PS2 VIF (VPU Interface) registers
 struct VIFRegisters
 {
@@ -323,6 +326,9 @@ public:
 
     using Vu1MscalCallback = std::function<void(uint32_t startPC, uint32_t top, uint32_t itop)>;
     void setVu1MscalCallback(Vu1MscalCallback cb) { m_vu1MscalCallback = std::move(cb); }
+    // VIF0 MSCAL/MSCALF (start pc in bytes) and MSCNT (~0u: continue at the current pc).
+    using Vu0MscalCallback = std::function<void(uint32_t startPC)>;
+    void setVu0MscalCallback(Vu0MscalCallback cb) { m_vu0MscalCallback = std::move(cb); }
     using Vu1MscntCallback = std::function<void(uint32_t top, uint32_t itop)>;
     void setVu1MscntCallback(Vu1MscntCallback cb) { m_vu1MscntCallback = std::move(cb); }
 
@@ -404,6 +410,7 @@ public:
     GifPacketCallback m_gifPacketCallback;
     GifArbiter *m_gifArbiter = nullptr;
     Vu1MscalCallback m_vu1MscalCallback;
+    Vu0MscalCallback m_vu0MscalCallback;
     Vu1MscntCallback m_vu1MscntCallback;
 
     uint8_t *m_vu0Code = nullptr;

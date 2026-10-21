@@ -690,23 +690,30 @@ namespace ps2x::iop::detail
         cpu.yielded = true;
     }
 
-    IopThread *IopKernel::beginNextReady(uint64_t currentCycle)
+    IopThread *IopKernel::beginNextReady(uint64_t currentCycle, uint64_t *nextDelayWake)
     {
-        for (auto &[id, thread] : m_threads)
-        {
-            if (thread.state == IopThreadState::Delay && thread.wakeCycle <= currentCycle)
-                thread.state = IopThreadState::Ready;
-        }
-
+        // One pass: wake due delays, pick the best ready thread, and note the earliest pending wake.
         IopThread *next = nullptr;
+        uint64_t earliestWake = UINT64_MAX;
         for (auto &[id, thread] : m_threads)
         {
+            if (thread.state == IopThreadState::Delay)
+            {
+                if (thread.wakeCycle > currentCycle)
+                {
+                    earliestWake = std::min(earliestWake, thread.wakeCycle);
+                    continue;
+                }
+                thread.state = IopThreadState::Ready;
+            }
             if (thread.state != IopThreadState::Ready)
                 continue;
             if (next == nullptr || thread.priority < next->priority ||
                 (thread.priority == next->priority && thread.id < next->id))
                 next = &thread;
         }
+        if (nextDelayWake)
+            *nextDelayWake = earliestWake;
         if (next == nullptr)
             return nullptr;
 

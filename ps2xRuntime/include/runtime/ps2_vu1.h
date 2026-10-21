@@ -3,6 +3,7 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
 
 class GS;
 class PS2Memory;
@@ -61,6 +62,12 @@ public:
 
     VU1State &state() { return m_state; }
     const VU1State &state() const { return m_state; }
+
+    // Called with every PATH1 packet an XGKICK completes (recording and replay tooling).
+    using PacketObserver = std::function<void(const uint8_t *data, uint32_t size)>;
+    void setPacketObserver(PacketObserver observer) { m_packetObserver = std::move(observer); }
+    // For callers running code that PS2Memory does not track: drop decoded instructions after changing it.
+    void invalidateDecodedCode() { ++m_externalCodeGeneration; }
 
 private:
     enum Pipeline : uint8_t
@@ -140,43 +147,6 @@ private:
         bool valid = false;
     };
 
-    struct PendingStore
-    {
-        uint64_t readyCycle = 0;
-        uint32_t address = 0;
-        std::array<uint32_t, 4> words{};
-        uint8_t laneMask = 0;
-        bool valid = false;
-    };
-
-    struct PendingVfWrite
-    {
-        uint64_t readyCycle = 0;
-        uint64_t sequence = 0;
-        std::array<float, 4> value{};
-        uint8_t reg = 0;
-        uint8_t laneMask = 0;
-        bool valid = false;
-    };
-
-    struct PendingViWrite
-    {
-        uint64_t readyCycle = 0;
-        uint64_t sequence = 0;
-        int32_t value = 0;
-        uint8_t reg = 0;
-        bool valid = false;
-    };
-
-    struct PendingAccWrite
-    {
-        uint64_t readyCycle = 0;
-        uint64_t sequence = 0;
-        std::array<float, 4> value{};
-        uint8_t laneMask = 0;
-        bool valid = false;
-    };
-
     struct XgkickPipeline
     {
         static constexpr uint32_t kBufferSize = 0x10000u;
@@ -194,39 +164,49 @@ private:
     static constexpr uint32_t kFmacLatency = 4u;
     static constexpr uint32_t kAccForwardLatency = 1u;
     static constexpr uint32_t kMaxFlagEntries = 8u;
-    static constexpr uint32_t kMaxPendingStores = 8u;
-    static constexpr uint32_t kMaxPendingVfWrites = 16u;
-    static constexpr uint32_t kMaxPendingViWrites = 8u;
-    static constexpr uint32_t kMaxPendingAccWrites = 8u;
     static constexpr uint32_t kMaxDecodedPairs = 0x4000u / 8u;
 
     Unit m_unit;
     VU1State m_state;
     std::array<DecodedInstructionPair, kMaxDecodedPairs> m_decodedCodeCache{};
+    std::array<uint64_t, kMaxDecodedPairs> m_decodedPairStamp{};
+    DecodedInstructionPair m_uncachedDecodedPair{};
     const uint8_t *m_cachedVuCode = nullptr;
     const PS2Memory *m_cachedMemory = nullptr;
     uint32_t m_cachedCodeSize = 0;
-    uint64_t m_cachedCodeGeneration = 0;
-    bool m_decodedCodeCacheValid = false;
 
-    std::array<FlagPipelineEntry, kMaxFlagEntries> m_flagPipeline{};
+    // Earliest readyCycle pending in the flag and Q/P queues; commitReadyPipelines() skips the rest.
+    uint64_t m_nextFlagCommit = 0;
+    uint64_t m_nextScalarCommit = 0;
+    static void noteCommitCycle(uint64_t &next, uint64_t readyCycle)
+    {
+        if (readyCycle < next)
+            next = readyCycle;
+    }
+    std::array<FlagPipelineEntry, kMaxFlagEntries> m_flagPipeline{}; // ring buffer in issue order
+    uint32_t m_flagHead = 0;
+    uint32_t m_flagCount = 0;
+    FlagPipelineEntry *pushFlagEntry(bool upper, uint32_t overflowCode);
+    template <typename Fn>
+    void forEachFlagEntryIssuedThisCycle(Fn &&fn)
+    {
+        for (uint32_t index = m_flagCount; index-- > 0u;)
+        {
+            FlagPipelineEntry &entry = m_flagPipeline[(m_flagHead + index) % kMaxFlagEntries];
+            if (entry.issueCycle != m_cycle)
+                break;
+            fn(entry);
+        }
+    }
     ScalarPipelineEntry m_fdiv{};
     std::array<ScalarPipelineEntry, 2> m_efu{};
-    std::array<PendingStore, kMaxPendingStores> m_storePipeline{};
-    std::array<PendingVfWrite, kMaxPendingVfWrites> m_vfWritePipeline{};
-    std::array<PendingViWrite, kMaxPendingViWrites> m_viWritePipeline{};
-    std::array<PendingAccWrite, kMaxPendingAccWrites> m_accWritePipeline{};
-    uint64_t m_nextCommitCycle = 0; // earliest readyCycle among pending pipeline entries
     XgkickPipeline m_xgkick{};
     std::array<std::array<uint64_t, 4>, 32> m_vfReady{};
     std::array<uint64_t, 16> m_viReady{};
     std::array<uint64_t, 4> m_accReady{};
-    std::array<std::array<uint64_t, 4>, 32> m_vfLatestWrite{};
-    std::array<uint64_t, 16> m_viLatestWrite{};
-    std::array<uint64_t, 4> m_accLatestWrite{};
 
     uint64_t m_cycle = 0;
-    uint64_t m_nextWriteSequence = 0;
+    uint64_t m_lastWritebackCycle = 0;
     uint64_t m_efuResourceReady = 0;
     uint32_t m_workingClip = 0;
     uint32_t m_currentUpperInstruction = 0;
@@ -240,6 +220,8 @@ private:
     bool m_stopRequested = false;
     bool m_pendingHaltD = false;
     bool m_pendingHaltT = false;
+    PacketObserver m_packetObserver;
+    uint64_t m_externalCodeGeneration = 0;
 
     void run(uint8_t *vuCode, uint32_t codeSize,
              uint8_t *vuData, uint32_t dataSize,
@@ -251,8 +233,8 @@ private:
     static void addVfWrite(InstructionUsage &usage, uint8_t reg, uint8_t lanes);
     static uint8_t vfReadLanes(const InstructionUsage &usage, uint8_t reg);
     DecodedInstructionPair decodeInstructionPair(const uint8_t *vuCode, uint32_t pc) const;
-    DecodedInstructionPair getDecodedInstructionPairForPc(const uint8_t *vuCode, uint32_t codeSize, PS2Memory *memory, uint32_t pc);
-    void rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t codeSize, const PS2Memory *memory, uint64_t generation);
+    const DecodedInstructionPair &getDecodedInstructionPairForPc(const uint8_t *vuCode, uint32_t codeSize, PS2Memory *memory,
+                                                                 uint32_t pc);
 
     void execUpper(uint32_t instr);
     void execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSize, GS &gs, PS2Memory *memory, uint32_t upperInstr);
@@ -272,9 +254,6 @@ private:
     void queueQ(float value, uint32_t latency, uint32_t statusDi);
     void queueP(float value, uint32_t latency);
     void queueStore(uint32_t address, const uint32_t words[4], uint8_t laneMask);
-    void queueVfWrite(uint8_t reg, uint8_t laneMask, const float value[4], uint32_t latency);
-    void queueViWrite(uint8_t reg, int32_t value, uint32_t latency);
-    void queueAccWrite(uint8_t laneMask, const float value[4], uint32_t latency);
     void startXgkick(uint32_t qwordAddress);
 
     void resetScheduler();
@@ -282,7 +261,8 @@ private:
     void advanceOneCycle();
     void advanceTo(uint64_t targetCycle);
     void flushPipelines();
-    void progressXgkick();
+    void progressXgkick(uint64_t cycles);
+    void resetXgkick();
     void finishXgkick();
     uint64_t calculatePairReadyCycle(const DecodedInstructionPair &decoded) const;
     void markPairWrites(const DecodedInstructionPair &decoded);

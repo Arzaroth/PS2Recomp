@@ -26,6 +26,9 @@ public:
     // that reads VRAM must then go through the backend (which waits for queued drawing);
     // raw reads of the VRAM buffer may see primitives still being drawn.
     static void SetAsyncRasterization(bool enabled) noexcept;
+    // Keeps this backend synchronous even when asynchronous rasterization is enabled globally (the
+    // PS2X_GS_SHADOW_CHECK reference GS).
+    void DisallowAsyncRasterization() noexcept { m_asyncAllowed = false; }
 
     void Initialize(uint8_t *vram, uint32_t vramSize) override;
     void Reset() override;
@@ -49,6 +52,7 @@ public:
     GSTransferSnapshot GetTransferSnapshot() const override;
 
 private:
+    bool m_asyncAllowed = true;
     void ResetUnlocked();
     void LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &texclut);
     uint32_t ReadVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const;

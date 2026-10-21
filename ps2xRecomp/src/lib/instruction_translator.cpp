@@ -122,6 +122,16 @@ namespace ps2recomp
 
     std::string InstructionTranslator::translate(const Instruction &inst, const MemoryAccessHint &memoryHint)
     {
+        std::string code = translateUnchecked(inst, memoryHint);
+        // VU0 vf0 is hard-wired to (0, 0, 0, 1); games use it as a discard destination (e.g. VSUB into
+        // vf0 just to set flags). Undo any emitted write so later reads of vf0 stay constant.
+        if (code.find("ctx->vu0_vf[0] =") != std::string::npos || code.find("ctx->vu0_vf[0]=") != std::string::npos)
+            code += " ctx->vu0_vf[0] = _mm_setr_ps(0.0f, 0.0f, 0.0f, 1.0f);";
+        return code;
+    }
+
+    std::string InstructionTranslator::translateUnchecked(const Instruction &inst, const MemoryAccessHint &memoryHint)
+    {
         if (inst.isMMI)
         {
             return m_codeGenerator.translateMMIInstruction(inst);
