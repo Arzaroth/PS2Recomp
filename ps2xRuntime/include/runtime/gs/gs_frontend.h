@@ -13,6 +13,8 @@
 
 #include "runtime/gs/gs_backend.h"
 
+enum class GsCpuEvent : uint8_t;
+
 struct GSDebugSnapshot
 {
     GSContext ctx[2]{};
@@ -173,6 +175,9 @@ private:
         std::vector<uint8_t> bytes;
     };
     bool shouldQueue() const;
+    void postCpuEvent(GsCpuEvent event, uint64_t value, uint64_t delayCycles);
+    void postQueuedCpuEvents(const uint8_t *data, uint32_t sizeBytes);
+    void waitForGsFrames();
     void enqueue(QueuedCommand &&command);
     void workerLoop();
     bool processNativePackedGIFPacketNow(const uint8_t *data, uint32_t sizeBytes);
@@ -224,6 +229,9 @@ private:
     std::condition_variable m_queueIdle;
     std::deque<QueuedCommand> m_queue;
     size_t m_queuedBytes = 0;
+    // FINISH writes queued for / drawn by the GS thread: bounds how many frames it may lag.
+    uint64_t m_finishesQueued = 0;
+    uint64_t m_finishesDrawn = 0;
     bool m_workerBusy = false;
     bool m_stopWorker = false;
 

@@ -4,11 +4,16 @@
 #include "ps2_log.h"
 #include <atomic>
 #include <cstring>
+#include <deque>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 #include <algorithm>
 #include <string>
 #include <vector>
+
+void ps2NotifyGsCsrEdge();
+uint64_t ps2CurrentEeCycle();
 
 namespace
 {
@@ -98,6 +103,75 @@ namespace
     }
 
     constexpr uint32_t kGsCsrRegOffset = 0x1000u;
+    constexpr uint32_t kGsImrRegOffset = 0x1010u;
+
+    struct PendingGsEvent
+    {
+        GsCpuEvent event = GsCpuEvent::Signal;
+        uint32_t id = 0;
+        uint32_t mask = 0;
+        uint64_t due = 0;
+    };
+
+    std::mutex g_gsEventMutex;
+    std::deque<PendingGsEvent> g_gsPendingEvents;
+
+    uint32_t applyGsEvent(GSRegisters &regs, const PendingGsEvent &pending)
+    {
+        switch (pending.event)
+        {
+        case GsCpuEvent::Signal:
+        {
+            uint32_t lo = static_cast<uint32_t>(regs.siglblid & 0xFFFFFFFFull);
+            lo = (lo & ~pending.mask) | (pending.id & pending.mask);
+            regs.siglblid = (regs.siglblid & 0xFFFFFFFF00000000ull) | lo;
+            return (regs.csr.fetch_or(0x1ull) & 0x1ull) == 0u ? 0x1u : 0u;
+        }
+        case GsCpuEvent::Finish:
+            return (regs.csr.fetch_or(0x2ull) & 0x2ull) == 0u ? 0x2u : 0u;
+        case GsCpuEvent::Label:
+        {
+            uint32_t hi = static_cast<uint32_t>(regs.siglblid >> 32);
+            hi = (hi & ~pending.mask) | (pending.id & pending.mask);
+            regs.siglblid = (static_cast<uint64_t>(hi) << 32) | (regs.siglblid & 0xFFFFFFFFull);
+            return 0u;
+        }
+        }
+        return 0u;
+    }
+
+    // Caller holds g_gsEventMutex.
+    uint32_t drainGsEvents(GSRegisters &regs, uint64_t now)
+    {
+        uint32_t raised = 0u;
+        while (!g_gsPendingEvents.empty() && g_gsPendingEvents.front().due <= now && (regs.csr.load() & 0x1ull) == 0u)
+        {
+            raised |= applyGsEvent(regs, g_gsPendingEvents.front());
+            g_gsPendingEvents.pop_front();
+        }
+        return raised;
+    }
+
+    void acknowledgeGsSignal(GSRegisters &regs, uint64_t written)
+    {
+        if ((written & 0x200ull) != 0u)
+            ps2GsResetEvents();
+        if ((written & 0x1ull) != 0u)
+        {
+            if (const uint32_t raised = ps2GsApplyDueEvents(regs, ps2CurrentEeCycle()); raised != 0u)
+            {
+                g_gsCsrRaisedEdges.fetch_or(raised);
+                ps2NotifyGsCsrEdge();
+            }
+        }
+    }
+
+    // CSR.FIFO (bits 14-15, read-only) reads as empty: the GS consumes every packet as it arrives
+    // in emulated time. Games poll it to wait for the GS to go idle.
+    inline uint64_t readCsr(const std::atomic<uint64_t> &csr)
+    {
+        return (csr.load() & ~0xC000ull) | 0x4000ull;
+    }
 
     // Atomically apply a 32-bit write to one half (off=0 low dword, off=4 high
     // dword) of the GS CSR register. Bits 0..1 of the low dword (SIGNAL/FINISH) are
@@ -397,6 +471,25 @@ bool PS2Memory::initialize(size_t ramSize)
         cleanup();
         return false;
     }
+}
+
+uint32_t ps2GsPostEvent(GSRegisters &regs, GsCpuEvent event, uint32_t id, uint32_t mask, uint64_t due, uint64_t now)
+{
+    std::lock_guard<std::mutex> lock(g_gsEventMutex);
+    g_gsPendingEvents.push_back({event, id, mask, std::max(due, g_gsPendingEvents.empty() ? 0u : g_gsPendingEvents.back().due)});
+    return drainGsEvents(regs, now);
+}
+
+uint32_t ps2GsApplyDueEvents(GSRegisters &regs, uint64_t now)
+{
+    std::lock_guard<std::mutex> lock(g_gsEventMutex);
+    return drainGsEvents(regs, now);
+}
+
+void ps2GsResetEvents()
+{
+    std::lock_guard<std::mutex> lock(g_gsEventMutex);
+    g_gsPendingEvents.clear();
 }
 
 void PS2Memory::resetEeTimers() noexcept
@@ -751,7 +844,7 @@ uint32_t PS2Memory::read32(uint32_t address)
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
         {
-            uint64_t val = gs_regs.csr.load();
+            uint64_t val = readCsr(gs_regs.csr);
             return (uint32_t)(val >> (off * 8));
         }
         uint64_t *reg = gsRegPtr(gs_regs, address);
@@ -798,7 +891,7 @@ uint64_t PS2Memory::read64(uint32_t address)
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
         {
-            return gs_regs.csr.load();
+            return readCsr(gs_regs.csr);
         }
         uint64_t *reg = gsRegPtr(gs_regs, address);
         return reg ? *reg : 0;
@@ -963,12 +1056,16 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
             // CSR: bits 0..1 of the low dword are write-one-to-clear status bits.
             // Done as a single atomic RMW -- see writeCsrHalf's comment.
             writeCsrHalf(gs_regs.csr, off, value);
+            if (off == 0u)
+                acknowledgeGsSignal(gs_regs, value);
         }
         else if (uint64_t *reg = gsRegPtr(gs_regs, address))
         {
             uint64_t mask = 0xFFFFFFFFULL << (off * 8);
             uint64_t newVal = (*reg & ~mask) | ((uint64_t)value << (off * 8));
             *reg = newVal;
+            if (regOff == kGsImrRegOffset)
+                ps2NotifyGsCsrEdge();
         }
         return;
     }
@@ -1022,10 +1119,13 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
             // CSR: bits 0..1 are write-one-to-clear status bits. Done as a single
             // atomic RMW -- see writeCsrFull's comment.
             writeCsrFull(gs_regs.csr, value);
+            acknowledgeGsSignal(gs_regs, value);
         }
         else if (uint64_t *reg = gsRegPtr(gs_regs, address))
         {
             *reg = value;
+            if (regOff == kGsImrRegOffset)
+                ps2NotifyGsCsrEdge();
         }
         return;
     }
@@ -1172,11 +1272,15 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
         if (regOff == kGsCsrRegOffset)
         {
             writeCsrHalf(gs_regs.csr, off, value);
+            if (off == 0u)
+                acknowledgeGsSignal(gs_regs, value);
         }
         else if (uint64_t *reg = gsRegPtr(gs_regs, address))
         {
             const uint64_t mask = 0xFFFFFFFFull << (off * 8u);
             *reg = (*reg & ~mask) | (static_cast<uint64_t>(value) << (off * 8u));
+            if (regOff == kGsImrRegOffset)
+                ps2NotifyGsCsrEdge();
         }
         m_gsWriteCount.fetch_add(1, std::memory_order_relaxed);
         return true;
@@ -2339,7 +2443,7 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
         {
-            return static_cast<uint32_t>((gs_regs.csr.load() >> (off * 8u)) & 0xFFFFFFFFull);
+            return static_cast<uint32_t>((readCsr(gs_regs.csr) >> (off * 8u)) & 0xFFFFFFFFull);
         }
         if (uint64_t *reg = gsRegPtr(gs_regs, address))
         {

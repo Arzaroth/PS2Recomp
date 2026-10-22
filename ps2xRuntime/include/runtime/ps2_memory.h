@@ -218,6 +218,21 @@ static_assert(std::atomic<uint64_t>::is_always_lock_free, "GS CSR atomic must be
 // CSR SIGNAL (bit0) / FINISH (bit1) 0->1 transitions raised by the GS, consumed as INTC cause 0 edges.
 inline std::atomic<uint32_t> g_gsCsrRaisedEdges{0};
 
+// GS register writes the CPU observes (SIGNAL, FINISH, LABEL) take effect in order; the GS holds
+// everything after a SIGNAL until the CPU clears CSR.SIGNAL. Each returns the CSR event bits that
+// rose (SIGNAL 0x1, FINISH 0x2).
+enum class GsCpuEvent : uint8_t
+{
+    Signal,
+    Finish,
+    Label
+};
+// Events take effect from EE cycle `due` (the GS needs time to reach them); `now` is the current
+// EE cycle.
+uint32_t ps2GsPostEvent(GSRegisters &regs, GsCpuEvent event, uint32_t id, uint32_t mask, uint64_t due, uint64_t now);
+uint32_t ps2GsApplyDueEvents(GSRegisters &regs, uint64_t now);
+void ps2GsResetEvents();
+
 // PS2 VIF (VPU Interface) registers
 struct VIFRegisters
 {

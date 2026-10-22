@@ -546,6 +546,7 @@ private:
     DebugUiCallback m_debugUiShutdownCallback = nullptr;
     void *m_debugUiUserData = nullptr;
     bool m_debugUiInitialized = false;
+    bool m_gsIrqLine = false;
     std::mutex m_presentationOverrideMutex;
     PresentationOverride m_presentationOverride;
 

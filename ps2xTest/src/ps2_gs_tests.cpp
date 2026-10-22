@@ -423,17 +423,17 @@ void register_ps2_gs_tests()
             constexpr uint32_t kGsCsr = 0x12001000u;
             constexpr uint32_t kGsImr = 0x12001010u;
 
-            const uint64_t csrPattern = 0xA1B2C3D4E5F60718ull;
+            const uint64_t csrPattern = 0xA1B2C3D4E5F64718ull; // CSR.FIFO (bits 14-15) reads 01
             mem.write64(kGsCsr, csrPattern);
             t.Equals(mem.read64(kGsCsr), csrPattern, "64-bit CSR read should match prior 64-bit write");
             t.Equals(mem.read32(kGsCsr), static_cast<uint32_t>(csrPattern & 0xFFFFFFFFull), "CSR low dword read should match");
             t.Equals(mem.read32(kGsCsr + 4u), static_cast<uint32_t>(csrPattern >> 32), "CSR high dword read should match");
 
-            mem.write32(kGsCsr, 0x11223344u);
-            t.Equals(mem.read64(kGsCsr), 0xA1B2C3D411223344ull, "32-bit low write should preserve CSR high dword");
+            mem.write32(kGsCsr, 0x11227344u);
+            t.Equals(mem.read64(kGsCsr), 0xA1B2C3D411227344ull, "32-bit low write should preserve CSR high dword");
 
             mem.write32(kGsCsr + 4u, 0x55667788u);
-            t.Equals(mem.read64(kGsCsr), 0x5566778811223344ull, "32-bit high write should preserve CSR low dword");
+            t.Equals(mem.read64(kGsCsr), 0x5566778811227344ull, "32-bit high write should preserve CSR low dword");
 
             const uint64_t imrPattern = 0x0123456789ABCDEFull;
             mem.write64(kGsImr, imrPattern);
@@ -2374,6 +2374,7 @@ void register_ps2_gs_tests()
         {
             PS2Memory mem;
             t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            ps2GsResetEvents();
 
             GS gs;
             gs.init(mem.getGSVRAM(), static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &mem.gs());
@@ -2383,12 +2384,12 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_FINISH, 0u);
 
             t.IsTrue((mem.gs().csr & 0x1ull) != 0ull, "SIGNAL should raise CSR.SIGNAL");
-            t.IsTrue((mem.gs().csr & 0x2ull) != 0ull, "FINISH should raise CSR.FINISH");
+            t.IsTrue((mem.gs().csr & 0x2ull) == 0ull, "FINISH should wait while SIGNAL is not acknowledged");
             t.Equals(static_cast<uint32_t>(mem.gs().siglblid & 0xFFFFFFFFull), 0x11223344u, "SIGNAL should update SIGLBLID low dword");
 
             mem.write64(0x12001000u, 0x1ull);
             t.IsTrue((mem.gs().csr & 0x1ull) == 0ull, "writing CSR bit0 should acknowledge SIGNAL");
-            t.IsTrue((mem.gs().csr & 0x2ull) != 0ull, "acknowledging SIGNAL should not clear FINISH");
+            t.IsTrue((mem.gs().csr & 0x2ull) != 0ull, "acknowledging SIGNAL should let FINISH raise CSR.FINISH");
 
             mem.write32(0x12001000u, 0x2u);
             t.IsTrue((mem.gs().csr & 0x2ull) == 0ull, "writing CSR bit1 should acknowledge FINISH");

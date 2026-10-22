@@ -1924,9 +1924,16 @@ void PS2Runtime::pollGsInterrupt(uint8_t *rdram)
     (void)rdram;
     // Edges are recorded by the GS when CSR SIGNAL (bit0) / FINISH (bit1) go 0->1;
     // IMR bit8 SIGMSK / bit9 FINISHMSK (1 = masked) suppress the interrupt.
+    // The GS interrupt line is high while an unmasked event bit is set: unmasking a pending event
+    // raises it, as does a new edge even when the line stayed high in between (ack, then re-raise).
+    if (const uint32_t due = ps2GsApplyDueEvents(m_memory.gs(), m_eeScheduler->currentCycle()); due != 0u)
+        g_gsCsrRaisedEdges.fetch_or(due, std::memory_order_acq_rel);
     const uint32_t rising = g_gsCsrRaisedEdges.exchange(0u, std::memory_order_acq_rel);
-    const uint32_t unmasked = rising & ~static_cast<uint32_t>(m_memory.gs().imr >> 8) & 0x3u;
-    if (unmasked != 0u)
+    const uint32_t enabled = ~static_cast<uint32_t>(m_memory.gs().imr >> 8) & 0x3u;
+    const bool line = (static_cast<uint32_t>(m_memory.gs().csr.load(std::memory_order_acquire)) & enabled) != 0u;
+    const bool raise = (rising & enabled) != 0u || (line && !m_gsIrqLine);
+    m_gsIrqLine = line;
+    if (raise)
     {
         eeScheduler().dispatchIrq(false, 0u);
     }
@@ -2682,6 +2689,21 @@ EeScheduler &PS2Runtime::eeScheduler()
 const EeScheduler &PS2Runtime::eeScheduler() const
 {
     return *m_eeScheduler;
+}
+
+uint64_t ps2CurrentEeCycle()
+{
+    PS2Runtime *runtime = g_gsCsrEdgeRuntime.load(std::memory_order_acquire);
+    return runtime ? runtime->eeScheduler().currentCycle() : 0u;
+}
+
+bool ps2ScheduleGsInterruptCheck(uint64_t delayCycles)
+{
+    PS2Runtime *runtime = g_gsCsrEdgeRuntime.load(std::memory_order_acquire);
+    if (!runtime)
+        return false;
+    runtime->eeScheduler().scheduleGsInterruptCheck(delayCycles);
+    return true;
 }
 
 // Called by the GS (possibly on its worker thread) when CSR SIGNAL/FINISH rises.

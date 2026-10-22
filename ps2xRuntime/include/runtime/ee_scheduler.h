@@ -339,6 +339,9 @@ public:
     void dispatchIrq(bool dmac, uint32_t cause);
     void setVSyncFlag(uint32_t flagAddress, uint32_t tickAddress);
     [[nodiscard]] uint64_t currentVSyncTick() const noexcept;
+    [[nodiscard]] uint64_t currentCycle() const noexcept { return m_eeCycle; }
+    // Re-checks the GS interrupt once `delayCycles` EE cycles have passed.
+    void scheduleGsInterruptCheck(uint64_t delayCycles);
     // PS2X_EE_PROFILE=1: EE cycles accounted at each checkpoint, by the guest pc it resumes at
     // (loop heads); returns and clears the counts gathered since the last call.
     [[nodiscard]] std::vector<std::pair<uint32_t, uint64_t>> takeGuestProfile();
@@ -439,6 +442,9 @@ private:
     int m_dmacTailOrder = 1000;
     uint32_t m_enabledIntcMask = 0xFFFFFFFFu;
     uint32_t m_enabledDmacMask = 0xFFFFFFFFu;
+    // Causes raised while disabled stay pending (INTC_STAT / D_STAT) until enabled again.
+    uint32_t m_pendingIntcMask = 0u;
+    uint32_t m_pendingDmacMask = 0u;
     int m_currentThreadId = 0;
     bool m_rescheduleRequested = false;
     bool m_timeSliceExpired = false;

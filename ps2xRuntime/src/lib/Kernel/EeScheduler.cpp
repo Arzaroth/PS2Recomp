@@ -105,6 +105,8 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     m_dmacTailOrder = 1000;
     m_enabledIntcMask = 0xFFFFFFFFu;
     m_enabledDmacMask = 0xFFFFFFFFu;
+    m_pendingIntcMask = 0u;
+    m_pendingDmacMask = 0u;
     m_currentThreadId = 0;
     m_rescheduleRequested = false;
     m_timeSliceExpired = false;
@@ -444,6 +446,12 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
 
     renewTimeSlice();
     return false;
+}
+
+void EeScheduler::scheduleGsInterruptCheck(uint64_t delayCycles)
+{
+    scheduleEvent(m_eeCycle + delayCycles, std::chrono::steady_clock::now() + eeCyclesToHostDuration(delayCycles),
+                  EeEvent{EeEventType::GsInterrupt, 0u, 0u});
 }
 
 std::vector<std::pair<uint32_t, uint64_t>> EeScheduler::takeGuestProfile()
@@ -1317,9 +1325,15 @@ int EeScheduler::setIrqCauseEnabled(bool dmac, uint32_t cause, bool enabled)
     if (cause < 32u)
     {
         uint32_t &mask = dmac ? m_enabledDmacMask : m_enabledIntcMask;
+        uint32_t &pending = dmac ? m_pendingDmacMask : m_pendingIntcMask;
         if (enabled)
         {
             mask |= 1u << cause;
+            if ((pending & (1u << cause)) != 0u)
+            {
+                pending &= ~(1u << cause);
+                dispatchIrq(dmac, cause);
+            }
         }
         else
         {
@@ -1335,6 +1349,7 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
     const uint32_t mask = dmac ? m_enabledDmacMask : m_enabledIntcMask;
     if (cause < 32u && (mask & (1u << cause)) == 0u)
     {
+        (dmac ? m_pendingDmacMask : m_pendingIntcMask) |= 1u << cause;
         return;
     }
     const auto &handlers = dmac ? m_dmacHandlers : m_intcHandlers;
