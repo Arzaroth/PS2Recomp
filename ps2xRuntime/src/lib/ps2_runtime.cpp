@@ -33,6 +33,7 @@
 #include <memory>
 #include <unordered_map>
 #include <sstream>
+#include <string_view>
 
 extern std::atomic<uint32_t> g_gsDumpVu1ProgramPc;
 
@@ -548,6 +549,30 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     s_lastWidth = width;
     s_lastHeight = height;
 
+    // PS2X_FRAME_DUMP=<dir>: write the presented frame as raw RGBA every PS2X_FRAME_DUMP_EVERY seconds (default 5).
+    static const char *s_frameDumpDir = std::getenv("PS2X_FRAME_DUMP");
+    if (s_frameDumpDir && *s_frameDumpDir && !s_scratch.empty() && width != 0u && height != 0u)
+    {
+        static const double s_frameDumpEvery = []
+        {
+            const char *every = std::getenv("PS2X_FRAME_DUMP_EVERY");
+            return every && *every ? std::max(0.1, std::atof(every)) : 5.0;
+        }();
+        static auto s_nextFrameDump = std::chrono::steady_clock::now();
+        static uint32_t s_frameDumpIndex = 0u;
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= s_nextFrameDump)
+        {
+            s_nextFrameDump = now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                        std::chrono::duration<double>(s_frameDumpEvery));
+            std::ostringstream name;
+            name << s_frameDumpDir << "/frame_" << s_frameDumpIndex++ << '_' << width << 'x' << height << ".rgba";
+            std::ofstream file(name.str(), std::ios::binary);
+            file.write(reinterpret_cast<const char *>(s_scratch.data()),
+                       static_cast<std::streamsize>(std::min<size_t>(s_scratch.size(), static_cast<size_t>(width) * height * 4u)));
+        }
+    }
+
     std::fill(s_uploadBuffer.begin(), s_uploadBuffer.end(), 0u);
     if (!s_scratch.empty() && width != 0u && height != 0u)
     {
@@ -826,6 +851,47 @@ namespace
     }
 }
 
+namespace
+{
+    // PS2X_WATCH="0x4ED6E8,0x5562F8:4": guest words printed by the state dump (address[:count]).
+    void dumpWatchedWords(std::ostringstream &text, PS2Memory &memory)
+    {
+        static const std::vector<std::pair<uint32_t, uint32_t>> watches = []
+        {
+            std::vector<std::pair<uint32_t, uint32_t>> parsed;
+            const char *spec = std::getenv("PS2X_WATCH");
+            std::string_view rest = spec ? spec : "";
+            while (!rest.empty())
+            {
+                const size_t comma = rest.find(',');
+                const std::string entry(rest.substr(0, comma));
+                rest = comma == std::string_view::npos ? std::string_view{} : rest.substr(comma + 1);
+                const size_t colon = entry.find(':');
+                const uint32_t address = static_cast<uint32_t>(std::strtoul(entry.substr(0, colon).c_str(), nullptr, 0));
+                const uint32_t count = colon == std::string::npos
+                                           ? 1u
+                                           : static_cast<uint32_t>(std::strtoul(entry.substr(colon + 1).c_str(), nullptr, 0));
+                parsed.emplace_back(address & ~3u, std::max<uint32_t>(1u, std::min<uint32_t>(count, 64u)));
+            }
+            return parsed;
+        }();
+        const uint8_t *rdram = memory.getRDRAM();
+        for (const auto &[address, count] : watches)
+        {
+            text << "[state] watch 0x" << std::hex << address << ':';
+            for (uint32_t index = 0; index < count; ++index)
+            {
+                const uint32_t physical = (address + index * 4u) & PS2_RAM_MASK;
+                uint32_t word = 0;
+                if (rdram && physical + 4u <= PS2_RAM_SIZE)
+                    std::memcpy(&word, rdram + physical, sizeof(word));
+                text << ' ' << word;
+            }
+            text << std::dec << '\n';
+        }
+    }
+}
+
 static void dumpRuntimeState(std::ostream &out, PS2Memory &memory, const EeKernelSnapshot &ee,
                              const ps2x::iop::DebugSnapshot &iop)
 {
@@ -873,6 +939,7 @@ static void dumpRuntimeState(std::ostream &out, PS2Memory &memory, const EeKerne
          << " threads=" << iop.emulatorThreads << " rpc=" << iop.emulatorRpcServers << '\n';
     for (const std::string &line : iop.diagnostics)
         text << "[state]   " << line << '\n';
+    dumpWatchedWords(text, memory);
     ps2_syscalls::describeSifRpcHistory(text);
     dumpHottestCalls(text);
     out << text.str() << std::flush;
