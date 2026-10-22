@@ -1,4 +1,5 @@
 #include "ps2_runtime.h"
+#include "runtime/gs/gs_cpu_backend.h"
 #include "ps2_log.h"
 #include "ps2_stubs.h"
 #include "ps2_syscalls.h"
@@ -935,6 +936,12 @@ static void dumpRuntimeState(std::ostream &out, PS2Memory &memory, PS2Runtime &r
         for (size_t i = 0; i < profile.size() && i < 16u; ++i)
             text << std::hex << " 0x" << profile[i].first << std::dec << '=' << (profile[i].second * 1000u / std::max<uint64_t>(total, 1u)) / 10.0 << '%';
         text << '\n';
+    }
+    {
+        const GS::LagStats lag = runtime.gs().takeLagStats();
+        const auto [drainNanoseconds, drains] = GSCpuBackend::TakeDrainStats();
+        text << "[state] gs frames=" << lag.frames << " ee waited " << lag.waitNanoseconds / 1000000u << " ms for the GS thread, "
+             << drains << " raster drains took " << drainNanoseconds / 1000000u << " ms\n";
     }
     text << "[state] ee timers:" << std::hex;
     for (uint32_t i = 0; i < 4u; ++i)

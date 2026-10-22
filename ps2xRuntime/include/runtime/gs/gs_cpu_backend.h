@@ -26,6 +26,8 @@ public:
     // that reads VRAM must then go through the backend (which waits for queued drawing);
     // raw reads of the VRAM buffer may see primitives still being drawn.
     static void SetAsyncRasterization(bool enabled) noexcept;
+    // Host time callers spent waiting for the raster workers, and how many waits, since the last call.
+    static std::pair<uint64_t, uint64_t> TakeDrainStats() noexcept;
     // Keeps this backend synchronous even when asynchronous rasterization is enabled globally (the
     // PS2X_GS_SHADOW_CHECK reference GS).
     void DisallowAsyncRasterization() noexcept { m_asyncAllowed = false; }

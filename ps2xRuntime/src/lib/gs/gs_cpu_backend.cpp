@@ -2,6 +2,7 @@
 #include "runtime/gs/ps2_gs_common.h"
 #include "runtime/gs/ps2_gs_psmct16.h"
 #include "runtime/gs/ps2_gs_psmct32.h"
+#include "ThreadNaming.h"
 #include "runtime/gs/ps2_gs_psmt4.h"
 #include "runtime/gs/ps2_gs_psmt8.h"
 #include "runtime/gs/ps2_gs_memory.h"
@@ -1743,14 +1744,29 @@ void GSCpuBackend::StartWorkersUnlocked()
     std::fprintf(stderr, "[gs] asynchronous rasterization on %u worker threads\n", m_workerCount);
 }
 
+namespace
+{
+    std::atomic<uint64_t> g_drainNanoseconds{0};
+    std::atomic<uint64_t> g_drainCount{0};
+}
+
+std::pair<uint64_t, uint64_t> GSCpuBackend::TakeDrainStats() noexcept
+{
+    return {g_drainNanoseconds.exchange(0u), g_drainCount.exchange(0u)};
+}
+
 void GSCpuBackend::DrainUnlocked() const
 {
+    const auto start = std::chrono::steady_clock::now();
     const uint64_t tail = m_queueTail.load(std::memory_order_acquire);
     for (uint32_t i = 0; i < m_workerCount; ++i)
     {
         while (m_workerProgress[i].done.load(std::memory_order_acquire) < tail)
             cpuRelax();
     }
+    g_drainNanoseconds.fetch_add(static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()));
+    g_drainCount.fetch_add(1u);
     // The write lists stay: workers' decoded textures may predate those writes, and the next
     // primitive sampling them needs the barrier that refreshes them.
     m_pendingWrites.clear();
@@ -1810,6 +1826,7 @@ void GSCpuBackend::NoteBarrierRange(std::vector<std::pair<uint32_t, uint32_t>> &
 
 void GSCpuBackend::WorkerMain(uint32_t index)
 {
+    ThreadNaming::SetCurrentThreadName("GSRaster");
     uint64_t next = 0u;
     for (;;)
     {

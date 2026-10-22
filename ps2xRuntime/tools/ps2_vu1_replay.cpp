@@ -1,14 +1,20 @@
 // Replays VU1 microprogram runs recorded with PS2X_VU1_RECORD and compares the interpreter's results
 // (registers, VU1 data memory, PATH1 packets, cycle count) with the recording.
 //   ps2_vu1_replay <trace> [repeat]   repeat > 1 also reports the interpreter's speed.
+//   ps2_vu1_replay <trace> stats      VU cycles per microprogram (code image and start pc).
+//   ps2_vu1_replay <trace> dumpcode <dir>   writes each distinct code image as <dir>/<hash>.bin.
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/ps2_vu1_trace.h"
 
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
 #include <cstring>
+#include <functional>
+#include <map>
 #include <string>
+#include <string_view>
 #include <vector>
 
 // ps2_runtime expects the generated runner to provide its function table; this tool runs no guest code.
@@ -84,6 +90,56 @@ int main(int argc, char **argv)
     for (Vu1TraceRecord record; readVu1TraceRecord(in, record);)
         records.push_back(record);
     std::fclose(in);
+    if (argc > 3 && std::string_view(argv[2]) == "dumpcode")
+    {
+        std::map<size_t, const std::vector<uint8_t> *> images;
+        for (const Vu1TraceRecord &record : records)
+            if (!record.code.empty())
+                images.emplace(std::hash<std::string_view>{}(std::string_view(reinterpret_cast<const char *>(record.code.data()), record.code.size())),
+                               &record.code);
+        for (const auto &[hash, code] : images)
+        {
+            char path[512];
+            std::snprintf(path, sizeof(path), "%s/%016zx.bin", argv[3], hash);
+            if (FILE *out = std::fopen(path, "wb"))
+            {
+                std::fwrite(code->data(), 1, code->size(), out);
+                std::fclose(out);
+            }
+            std::printf("%s\n", path);
+        }
+        return 0;
+    }
+    if (argc > 2 && std::string_view(argv[2]) == "stats")
+    {
+        struct Program
+        {
+            uint64_t runs = 0;
+            uint64_t cycles = 0;
+        };
+        std::map<std::pair<size_t, uint32_t>, Program> programs;
+        size_t codeHash = 0;
+        uint64_t total = 0;
+        for (const Vu1TraceRecord &record : records)
+        {
+            if (!record.code.empty())
+                codeHash = std::hash<std::string_view>{}(std::string_view(reinterpret_cast<const char *>(record.code.data()), record.code.size()));
+            Program &program = programs[{codeHash, record.startPC}];
+            const uint64_t cycles = record.stateAfter.cycles - record.stateBefore.cycles;
+            ++program.runs;
+            program.cycles += cycles;
+            total += cycles;
+        }
+        std::vector<std::pair<std::pair<size_t, uint32_t>, Program>> sorted(programs.begin(), programs.end());
+        std::sort(sorted.begin(), sorted.end(), [](const auto &a, const auto &b) { return a.second.cycles > b.second.cycles; });
+        std::printf("programs=%zu runs=%zu vu-cycles=%llu\n", sorted.size(), records.size(), static_cast<unsigned long long>(total));
+        for (size_t i = 0; i < sorted.size() && i < 40u; ++i)
+            std::printf("code=%016zx pc=0x%04x runs=%llu cycles=%llu (%.1f%%) avg=%llu\n", sorted[i].first.first, sorted[i].first.second,
+                        static_cast<unsigned long long>(sorted[i].second.runs), static_cast<unsigned long long>(sorted[i].second.cycles),
+                        100.0 * static_cast<double>(sorted[i].second.cycles) / static_cast<double>(std::max<uint64_t>(total, 1u)),
+                        static_cast<unsigned long long>(sorted[i].second.cycles / std::max<uint64_t>(sorted[i].second.runs, 1u)));
+        return 0;
+    }
     const int repeat = argc > 2 ? std::atoi(argv[2]) : 1;
 
     GS gs; // never initialized: packets are only observed

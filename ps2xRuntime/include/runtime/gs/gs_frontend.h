@@ -104,6 +104,13 @@ struct GSDebugHistoryEntry
 class GS
 {
 public:
+    // Frames the EE sent, and host time it waited for the GS thread to catch up, since the last call.
+    struct LagStats
+    {
+        uint64_t frames = 0;
+        uint64_t waitNanoseconds = 0;
+    };
+    LagStats takeLagStats();
     GS();
     ~GS();
 
@@ -232,6 +239,7 @@ private:
     // FINISH writes queued for / drawn by the GS thread: bounds how many frames it may lag.
     uint64_t m_finishesQueued = 0;
     uint64_t m_finishesDrawn = 0;
+    LagStats m_lagStats;
     bool m_workerBusy = false;
     bool m_stopWorker = false;
 
