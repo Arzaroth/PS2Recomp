@@ -1552,6 +1552,10 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         }
 
         ctx->pc = targetPc;
+        if (m_eeScheduler)
+        {
+            m_eeScheduler->noteTransferToDispatcher();
+        }
         return false;
     }
 
@@ -1567,6 +1571,10 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
             return true;
         }
 
+        if (m_eeScheduler)
+        {
+            m_eeScheduler->noteTransferToDispatcher();
+        }
         if (policy == MissingFunctionPolicy::ContinueToTarget)
         {
             ctx->pc = targetPc;
@@ -1581,7 +1589,11 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     const uint32_t entryPc = ctx->pc;
     targetFn(rdram, ctx, this);
 
-    if (isStopRequested() || ctx->pc == 0u)
+    // The callee is unwinding to the dispatcher with ctx->pc = where to resume. That pc can be
+    // this call's own target (recursion: A calls B, B calls A, a checkpoint fires at the inner
+    // call), which the entryPc test below would take for an HLE stub that returned.
+    if (isStopRequested() || ctx->pc == 0u ||
+        (m_eeScheduler && m_eeScheduler->transferToDispatcherPending()))
     {
         return false;
     }

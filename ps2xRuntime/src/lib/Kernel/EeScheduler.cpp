@@ -310,6 +310,7 @@ void EeScheduler::run()
 
         try
         {
+            m_transferToDispatcher = false;
             m_insideInterrupt = !running->invocations.empty() && running->invocations.back().kind == GuestInvocationKind::Interrupt;
             m_guestExecuting.store(true, std::memory_order_release);
             function(m_rdram, &context, &m_runtime);
@@ -377,6 +378,7 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
     if (m_checkpointPending.load(std::memory_order_acquire) ||
         m_stopRequested.load(std::memory_order_acquire))
     {
+        m_transferToDispatcher = true;
         return true;
     }
 
@@ -384,6 +386,7 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
     if (nextEventCycle != 0u && m_eeCycle >= nextEventCycle)
     {
         m_checkpointPending.store(true, std::memory_order_release);
+        m_transferToDispatcher = true;
         return true;
     }
 
@@ -398,6 +401,7 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
             accountCycles(static_cast<uint32_t>(std::min<uint64_t>(nextEventCycle - m_eeCycle,
                                                                    std::numeric_limits<uint32_t>::max())));
             m_checkpointPending.store(true, std::memory_order_release);
+            m_transferToDispatcher = true;
             return true;
         }
     }
@@ -420,6 +424,7 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
     {
         m_rescheduleRequested = true;
         m_timeSliceExpired = true;
+        m_transferToDispatcher = true;
         return true;
     }
 

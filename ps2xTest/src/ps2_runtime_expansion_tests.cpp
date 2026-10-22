@@ -147,6 +147,15 @@ namespace
         }
     }
 
+    void testGuestBranchRecursiveCheckpointHandler(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        // Calls itself again; a checkpoint fires at that inner call, which leaves ctx->pc at
+        // this function's entry and unwinds to the dispatcher.
+        setRegU32(*ctx, 31, 0x3010u);
+        ctx->pc = 0x3000u;
+        runtime->eeScheduler().noteTransferToDispatcher();
+    }
+
     void testGuestBranchImplicitReturnHandler(uint8_t *, R5900Context *ctx, PS2Runtime *)
     {
         if (ctx)
@@ -404,6 +413,29 @@ void register_ps2_runtime_expansion_tests()
                      "unchanged callee PC should be converted to call fallthrough");
             t.Equals(::getRegU32(&ctx, 2), 0x00FACE42u,
                      "callee should still execute normally");
+        });
+
+        tc.Run("dispatchGuestBranch call unwinds a checkpoint pending at its own target", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            runtime.registerFunction(0x3000u, &testGuestBranchRecursiveCheckpointHandler);
+
+            R5900Context ctx{};
+            ctx.pc = 0x2000u;
+
+            const bool returnedToFallthrough = runtime.dispatchGuestBranch(
+                nullptr,
+                &ctx,
+                0x3000u,
+                0x2000u,
+                0x2008u,
+                PS2Runtime::GuestBranchKind::IndirectCall,
+                "test-jalr");
+
+            t.IsFalse(returnedToFallthrough,
+                      "a callee unwinding to the dispatcher must not be taken for a returned stub");
+            t.Equals(ctx.pc, 0x3000u, "the pending inner call should stay the resume point");
+            t.Equals(::getRegU32(&ctx, 31), 0x3010u, "the inner call's return address should be kept");
         });
 
         tc.Run("dispatchGuestBranch jump returns to central dispatcher without nesting", [](TestCase &t)

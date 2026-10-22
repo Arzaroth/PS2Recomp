@@ -280,6 +280,11 @@ public:
     void requestStop();
     void postEvent(EeEvent event);
     [[nodiscard]] bool checkpointDue(uint32_t cycles = kGeneratedCheckpointCycles) noexcept;
+    // Set while guest code unwinds to the dispatcher (a checkpoint fired or a jump left the
+    // function), cleared before each dispatch: the enclosing dispatchGuestBranch frames must not
+    // read ctx->pc as the result of their call (see dispatchGuestBranch).
+    void noteTransferToDispatcher() noexcept { m_transferToDispatcher = true; }
+    [[nodiscard]] bool transferToDispatcherPending() const noexcept { return m_transferToDispatcher; }
     void accountCycles(uint32_t cycles) noexcept;
     [[nodiscard]] bool isExecutingGuest() const noexcept;
 
@@ -441,6 +446,7 @@ private:
     int m_currentThreadId = 0;
     bool m_rescheduleRequested = false;
     bool m_timeSliceExpired = false;
+    bool m_transferToDispatcher = false;
     bool m_insideInterrupt = false;
     uint32_t m_pendingEeTimerInterrupts = 0;
     uint64_t m_eeCycle = 0;
