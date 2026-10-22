@@ -1016,6 +1016,38 @@ void register_ps2_recompiler_tests()
             }
         });
 
+        tc.Run("entry reslice keeps a return delay slot that starts the next entry", [](TestCase &t) {
+            std::vector<Function> functions = {
+                makeFunction("container", 0x1000u, 0x1014u),
+                makeFunction("entry_1004", 0x1004u, 0x1014u),
+                makeFunction("entry_100c", 0x100Cu, 0x1014u)
+            };
+
+            std::unordered_map<uint32_t, std::vector<Instruction>> decodedFunctions;
+            decodedFunctions[0x1000u] = {
+                makeNopLike(0x1000u),
+                makeNopLike(0x1004u),
+                makeJrRa(0x1008u),
+                makeNopLike(0x100Cu),
+                makeNopLike(0x1010u)
+            };
+
+            PS2Recompiler::ResliceEntryFunctions(functions, decodedFunctions);
+
+            auto decoded1004It = decodedFunctions.find(0x1004u);
+            t.IsTrue(decoded1004It != decodedFunctions.end(), "decoded slice for 0x1004 should exist");
+            if (decoded1004It != decodedFunctions.end())
+            {
+                t.Equals(decoded1004It->second.size(), static_cast<size_t>(3),
+                         "entry 0x1004 slice should keep the jr ra delay slot at 0x100C");
+                if (!decoded1004It->second.empty())
+                {
+                    t.Equals(decoded1004It->second.back().address, 0x100Cu,
+                             "entry 0x1004 slice should end with the delay slot");
+                }
+            }
+        });
+
         tc.Run("same-function JAL return addresses get entry wrappers but targets stay labels", [](TestCase &t) {
             std::vector<Section> sections = {
                 {".text", 0x1000u, 0x40u, 0u, true, false, false, true, nullptr}
