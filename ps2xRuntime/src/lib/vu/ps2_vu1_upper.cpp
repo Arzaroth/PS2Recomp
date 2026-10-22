@@ -4,6 +4,8 @@
 #include <array>
 #include <cmath>
 #include <emmintrin.h>
+#include <smmintrin.h>
+#include <tmmintrin.h>
 #include <cstring>
 #include <limits>
 
@@ -76,6 +78,180 @@ namespace
                               _mm_and_si128(maxExponent, _mm_or_si128(sign, _mm_set1_epi32(0x7F7FFFFF))));
         _mm_storeu_si128(reinterpret_cast<__m128i *>(target), result);
     }
+}
+
+namespace
+{
+    __m128 normalizeLanes(__m128 value)
+    {
+        alignas(16) float lanes[4];
+        _mm_store_ps(lanes, value);
+        normalizeVector(lanes, lanes);
+        return _mm_load_ps(lanes);
+    }
+
+    // vuAdd on four lanes. 1 << shift comes from converting 2^shift, since SSE4 has no variable shift.
+    __m128 vuAdd4(__m128 a, __m128 b)
+    {
+        const __m128i ua = _mm_castps_si128(a);
+        const __m128i ub = _mm_castps_si128(b);
+        const __m128i ea = _mm_srli_epi32(_mm_slli_epi32(ua, 1), 24);
+        const __m128i eb = _mm_srli_epi32(_mm_slli_epi32(ub, 1), 24);
+        const __m128i zero = _mm_setzero_si128();
+        const __m128i ones = _mm_set1_epi32(-1);
+        const __m128i bothNonZero = _mm_andnot_si128(_mm_or_si128(_mm_cmpeq_epi32(ea, zero), _mm_cmpeq_epi32(eb, zero)), ones);
+        const __m128i shift = _mm_abs_epi32(_mm_sub_epi32(ea, eb));
+        const __m128i power = _mm_cvttps_epi32(
+            _mm_castsi128_ps(_mm_slli_epi32(_mm_add_epi32(_mm_min_epi32(shift, _mm_set1_epi32(24)), _mm_set1_epi32(127)), 23)));
+        const __m128i wide = _mm_cmpgt_epi32(shift, _mm_set1_epi32(23));
+        const __m128i smallMask = _mm_or_si128(_mm_andnot_si128(wide, _mm_xor_si128(_mm_sub_epi32(power, _mm_set1_epi32(1)), ones)),
+                                               _mm_and_si128(wide, _mm_set1_epi32(static_cast<int>(0x80000000u))));
+        const __m128i aSmall = _mm_and_si128(bothNonZero, _mm_cmpgt_epi32(eb, ea));
+        const __m128i bSmall = _mm_and_si128(bothNonZero, _mm_cmpgt_epi32(ea, eb));
+        const __m128i maskedA = _mm_and_si128(ua, _mm_or_si128(_mm_andnot_si128(aSmall, ones), _mm_and_si128(aSmall, smallMask)));
+        const __m128i maskedB = _mm_and_si128(ub, _mm_or_si128(_mm_andnot_si128(bSmall, ones), _mm_and_si128(bSmall, smallMask)));
+        return _mm_add_ps(_mm_castsi128_ps(maskedA), _mm_castsi128_ps(maskedB));
+    }
+
+    __m128 destLaneMask(uint8_t dest)
+    {
+        return _mm_castsi128_ps(_mm_set_epi32((dest & 1u) ? -1 : 0, (dest & 2u) ? -1 : 0, (dest & 4u) ? -1 : 0,
+                                              (dest & 8u) ? -1 : 0));
+    }
+}
+
+void VU1Interpreter::execUpperNop(uint32_t instr)
+{
+    m_currentUpperInstruction = instr;
+}
+
+template <VU1Interpreter::FmacKind Kind, VU1Interpreter::FmacOperand Operand, bool ToAcc>
+void VU1Interpreter::execFmac(uint32_t instr)
+{
+    m_currentUpperInstruction = instr;
+    const uint8_t dest = DEST(instr);
+    alignas(16) float vs[4];
+    alignas(16) float vt[4];
+    alignas(16) float acc[4];
+    float scalar = 0.0f;
+    const __m128 s = normalizeLanes(_mm_loadu_ps(m_state.vf[FS(instr)]));
+    _mm_store_ps(vs, s);
+    __m128 t;
+    if constexpr (Operand == FmacOperand::Vector || Operand == FmacOperand::Broadcast)
+    {
+        _mm_store_ps(vt, normalizeLanes(_mm_loadu_ps(m_state.vf[FT(instr)])));
+        t = Operand == FmacOperand::Vector ? _mm_load_ps(vt) : _mm_set1_ps(vt[instr & 3u]);
+    }
+    else
+    {
+        scalar = normalizeOperand(Operand == FmacOperand::Q ? m_state.q : m_state.i);
+        t = _mm_set1_ps(scalar);
+    }
+
+    const __m128 signBit = _mm_castsi128_ps(_mm_set1_epi32(static_cast<int>(0x80000000u)));
+    __m128 r;
+    if constexpr (Kind == FmacKind::Mul)
+        r = _mm_mul_ps(s, t);
+    else if constexpr (Kind == FmacKind::Add)
+        r = vuAdd4(s, t);
+    else if constexpr (Kind == FmacKind::Sub)
+        r = vuAdd4(s, _mm_xor_ps(t, signBit));
+    else
+    {
+        const __m128 a = normalizeLanes(_mm_loadu_ps(m_state.acc));
+        _mm_store_ps(acc, a);
+        const __m128 product = _mm_mul_ps(s, t);
+        r = vuAdd4(a, Kind == FmacKind::Madd ? product : _mm_xor_ps(product, signBit));
+    }
+
+    alignas(16) float result[4];
+    _mm_store_ps(result, r);
+    bool exact = m_currentFlagsLive;
+    if (!exact)
+    {
+        const __m128i exponent = _mm_srli_epi32(_mm_slli_epi32(_mm_castps_si128(r), 1), 24);
+        const __m128i ordinary = _mm_and_si128(_mm_cmpgt_epi32(exponent, _mm_set1_epi32(1)),
+                                               _mm_cmplt_epi32(exponent, _mm_set1_epi32(254)));
+        const int lanes = _mm_movemask_ps(destLaneMask(dest));
+        exact = (_mm_movemask_ps(_mm_castsi128_ps(ordinary)) & lanes) != lanes;
+    }
+    if (exact)
+    {
+        if constexpr (Operand == FmacOperand::Q || Operand == FmacOperand::I)
+            normalizeVector(m_state.vf[FT(instr)], vt);
+        m_fmacVs = vs;
+        m_fmacVt = vt;
+        m_fmacAcc = acc;
+        m_fmacQ = Operand == FmacOperand::Q ? scalar : 0.0f;
+        m_fmacI = Operand == FmacOperand::I ? scalar : 0.0f;
+        applyFmacFlags(result, dest);
+        r = _mm_load_ps(result);
+    }
+    float *target = ToAcc ? m_state.acc : m_state.vf[FD(instr)];
+    _mm_storeu_ps(target, _mm_blendv_ps(_mm_loadu_ps(target), r, destLaneMask(dest)));
+}
+
+VU1Interpreter::UpperHandler VU1Interpreter::selectUpperHandler(uint32_t upper)
+{
+    using K = FmacKind;
+    using O = FmacOperand;
+    const uint32_t low11 = upper & 0x7FFu;
+    if (low11 == 0x2FFu || low11 == 0x33Cu)
+        return &VU1Interpreter::execUpperNop;
+    const uint32_t op = upper & 0x3Fu;
+    const bool special = op >= 0x3Cu;
+    const uint32_t code = special ? ((upper & 3u) | ((upper >> 4) & 0x7Cu)) : op;
+    const auto pick = [special](UpperHandler toVf, UpperHandler toAcc) { return special ? toAcc : toVf; };
+#define PS2X_FMAC(kind, operand) pick(&VU1Interpreter::execFmac<K::kind, O::operand, false>, &VU1Interpreter::execFmac<K::kind, O::operand, true>)
+    if (code <= 0x03u)
+        return PS2X_FMAC(Add, Broadcast);
+    if (code <= 0x07u)
+        return PS2X_FMAC(Sub, Broadcast);
+    if (code <= 0x0Bu)
+        return PS2X_FMAC(Madd, Broadcast);
+    if (code <= 0x0Fu)
+        return PS2X_FMAC(Msub, Broadcast);
+    switch (code)
+    {
+    case 0x18u:
+    case 0x19u:
+    case 0x1Au:
+    case 0x1Bu:
+        return PS2X_FMAC(Mul, Broadcast);
+    case 0x1Cu:
+        return PS2X_FMAC(Mul, Q);
+    case 0x1Eu:
+        return PS2X_FMAC(Mul, I);
+    case 0x20u:
+        return PS2X_FMAC(Add, Q);
+    case 0x21u:
+        return PS2X_FMAC(Madd, Q);
+    case 0x22u:
+        return PS2X_FMAC(Add, I);
+    case 0x23u:
+        return PS2X_FMAC(Madd, I);
+    case 0x24u:
+        return PS2X_FMAC(Sub, Q);
+    case 0x25u:
+        return PS2X_FMAC(Msub, Q);
+    case 0x26u:
+        return PS2X_FMAC(Sub, I);
+    case 0x27u:
+        return PS2X_FMAC(Msub, I);
+    case 0x28u:
+        return PS2X_FMAC(Add, Vector);
+    case 0x29u:
+        return PS2X_FMAC(Madd, Vector);
+    case 0x2Au:
+        return PS2X_FMAC(Mul, Vector);
+    case 0x2Cu:
+        return PS2X_FMAC(Sub, Vector);
+    case 0x2Du:
+        return PS2X_FMAC(Msub, Vector);
+    default:
+        return &VU1Interpreter::execUpper;
+    }
+#undef PS2X_FMAC
 }
 
 // ============================================================================

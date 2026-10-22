@@ -111,10 +111,13 @@ private:
         bool reserved = false;
     };
 
+    using UpperHandler = void (VU1Interpreter::*)(uint32_t);
+
     struct DecodedInstructionPair
     {
         uint32_t lower = 0;
         uint32_t upper = 0;
+        UpperHandler upperHandler = nullptr;
         InstructionUsage lowerUsage{};
         InstructionUsage upperUsage{};
         bool iBit = false;
@@ -285,6 +288,26 @@ private:
                                                                  uint32_t pc);
 
     void execUpper(uint32_t instr);
+    // execUpper specialized by decodeInstructionPair for the common FMAC arithmetic and NOP.
+    enum class FmacKind : uint8_t
+    {
+        Add,
+        Sub,
+        Madd,
+        Msub,
+        Mul
+    };
+    enum class FmacOperand : uint8_t
+    {
+        Broadcast,
+        Q,
+        I,
+        Vector
+    };
+    template <FmacKind Kind, FmacOperand Operand, bool ToAcc>
+    void execFmac(uint32_t instr);
+    void execUpperNop(uint32_t instr);
+    static UpperHandler selectUpperHandler(uint32_t upper);
     void execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSize, GS &gs, PS2Memory *memory, uint32_t upperInstr);
 
     void applyDest(float *dst, const float *result, uint8_t dest);

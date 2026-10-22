@@ -1697,6 +1697,7 @@ VU1Interpreter::DecodedInstructionPair VU1Interpreter::decodeInstructionPair(con
     decoded.dBit = (decoded.upper & 0x10000000u) != 0u;
     decoded.tBit = (decoded.upper & 0x08000000u) != 0u;
     decoded.upperUsage = decodeUpperUsage(decoded.upper);
+    decoded.upperHandler = selectUpperHandler(decoded.upper);
     if (!decoded.iBit)
         decoded.lowerUsage = decodeLowerUsage(decoded.lower);
 
@@ -1947,7 +1948,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
 
         if (decoded.iBit)
         {
-            execUpper(decoded.upper);
+            (this->*decoded.upperHandler)(decoded.upper);
             float immediate = 0.0f;
             std::memcpy(&immediate, &decoded.lower, sizeof(immediate));
             m_state.i = normalizeOperand(immediate);
@@ -1959,7 +1960,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             std::memcpy(oldVf,
                         m_state.vf[decoded.upperVfShadowReg],
                         sizeof(oldVf));
-            execUpper(decoded.upper);
+            (this->*decoded.upperHandler)(decoded.upper);
             std::memcpy(upperVf,
                         m_state.vf[decoded.upperVfShadowReg],
                         sizeof(upperVf));
@@ -1973,7 +1974,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         }
         else
         {
-            execUpper(decoded.upper);
+            (this->*decoded.upperHandler)(decoded.upper);
             execLower(decoded.lower, vuData, dataSize, gs, memory, decoded.upper);
         }
 
