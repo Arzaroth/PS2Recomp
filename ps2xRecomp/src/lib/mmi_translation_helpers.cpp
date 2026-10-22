@@ -135,9 +135,9 @@ namespace ps2recomp
         case MMI2_PMADDW:
             return translatePMADDW(inst);
         case MMI2_PSLLVW:
-            return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PSLLVW(GPR_VEC(ctx, {}), GPR_VEC(ctx, {})));", rd, rs, rt);
+            return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PSLLVW(GPR_VEC(ctx, {}), GPR_VEC(ctx, {})));", rd, rt, rs);
         case MMI2_PSRLVW:
-            return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PSRLVW(GPR_VEC(ctx, {}), GPR_VEC(ctx, {})));", rd, rs, rt);
+            return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PSRLVW(GPR_VEC(ctx, {}), GPR_VEC(ctx, {})));", rd, rt, rs);
         case MMI2_PMSUBW:
             return translatePMSUBW(inst);
         case MMI2_PMFHI:
@@ -193,7 +193,7 @@ namespace ps2recomp
         case MMI3_PMADDUW:
             return translatePMADDUW(inst);
         case MMI3_PSRAVW:
-            return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PSRAVW(GPR_VEC(ctx, {}), GPR_VEC(ctx, {})));", rd, rs, rt);
+            return fmt::format("SET_GPR_VEC(ctx, {}, PS2_PSRAVW(GPR_VEC(ctx, {}), GPR_VEC(ctx, {})));", rd, rt, rs);
         case MMI3_PMTHI:
             return translatePMTHI(inst);
         case MMI3_PMTLO:
