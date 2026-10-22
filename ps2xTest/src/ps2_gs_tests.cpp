@@ -1072,6 +1072,82 @@ void register_ps2_gs_tests()
             t.IsTrue(immediate == async, "worker threads should produce exactly the immediate rasterizer's VRAM");
         });
 
+        tc.Run("asynchronous rasterization orders repeated render-to-texture copies", [](TestCase &t)
+        {
+            // Drakengard's field copy: each frame is drawn into an offscreen buffer, copied into
+            // the display buffer by a large bilinear sprite (decoded-texture path), and the next
+            // frame is drawn into the offscreen buffer while the copy may still be queued.
+            constexpr uint64_t kOffscreenFbp = 64u;
+            auto xyz = [](uint32_t x, uint32_t y)
+            {
+                return static_cast<uint64_t>(x << 4) | (static_cast<uint64_t>(y << 4) << 16);
+            };
+            auto frameColor = [](uint32_t frame)
+            {
+                return 0x80000000u | ((frame * 0x30u + 0x10u) & 0xFFu) | (((0xF0u - frame * 0x20u) & 0xFFu) << 8) | (0x40u << 16);
+            };
+
+            // A 2^sizeLog2 square texture. With texflush, TEXFLUSH follows each offscreen frame;
+            // without it (as the game does), a drain between drawing and copying (a VRAM read)
+            // must not let workers keep the previous frame's decoded texture. That texture spans
+            // more pages than the texture page buffer holds, so the buffer refills each copy.
+            auto drawFrames = [&](std::vector<uint8_t> &vram, bool async, uint32_t sizeLog2, bool texflush)
+            {
+                const uint32_t size = 1u << sizeLog2;
+                const uint64_t fbw = size / 64u;
+                GSCpuBackend::SetAsyncRasterization(async);
+                GS gs;
+                gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+                gs.writeRegister(GS_REG_ZBUF_1, 300ull | (1ull << 32));
+                gs.writeRegister(GS_REG_SCISSOR_1, (static_cast<uint64_t>(size - 1u) << 16) | (static_cast<uint64_t>(size - 1u) << 48));
+                gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
+                gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
+                gs.writeRegister(GS_REG_TEX0_1, (kOffscreenFbp * 32ull) | (fbw << 14) | (static_cast<uint64_t>(GS_PSM_CT32) << 20) |
+                                                    (static_cast<uint64_t>(sizeLog2) << 26) | (static_cast<uint64_t>(sizeLog2) << 30) |
+                                                    (1ull << 34));
+                gs.writeRegister(GS_REG_TEX1_1, (1ull << 5) | (1ull << 6));
+                gs.writeRegister(GS_REG_CLAMP_1, (1ull << 0) | (1ull << 2));
+                for (uint32_t frame = 0u; frame < 4u; ++frame)
+                {
+                    gs.writeRegister(GS_REG_FRAME_1, kOffscreenFbp | (fbw << 16) | (static_cast<uint64_t>(GS_PSM_CT32) << 24));
+                    gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_SPRITE));
+                    gs.writeRegister(GS_REG_RGBAQ, frameColor(frame));
+                    gs.writeRegister(GS_REG_XYZ2, xyz(0u, 0u));
+                    gs.writeRegister(GS_REG_XYZ2, xyz(size, size));
+                    if (texflush)
+                        gs.writeRegister(GS_REG_TEXFLUSH, 0ull);
+                    else
+                        (void)gs.ReadVram(GS_PSM_CT32, 0u, static_cast<uint32_t>(fbw), 0u, 0u);
+
+                    // Half a texel down, as the game does for one field.
+                    gs.writeRegister(GS_REG_FRAME_1, 0ull | (fbw << 16) | (static_cast<uint64_t>(GS_PSM_CT32) << 24));
+                    gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_SPRITE) | (1ull << 4) | (1ull << 8));
+                    gs.writeRegister(GS_REG_RGBAQ, 0x80808080ull);
+                    gs.writeRegister(GS_REG_UV, 8ull << 16);
+                    gs.writeRegister(GS_REG_XYZ2, xyz(0u, 0u));
+                    gs.writeRegister(GS_REG_UV, (static_cast<uint64_t>(size) << 4) | (((static_cast<uint64_t>(size) << 4) + 8ull) << 16));
+                    gs.writeRegister(GS_REG_XYZ2, xyz(size, size));
+                }
+                const uint32_t center = gs.ReadVram(GS_PSM_CT32, 0u, static_cast<uint32_t>(fbw), size / 2u, size / 2u);
+                GSCpuBackend::SetAsyncRasterization(false);
+                return center;
+            };
+
+            for (const bool texflush : {true, false})
+            {
+                const uint32_t sizeLog2 = texflush ? 7u : 8u;
+                std::vector<uint8_t> immediate(PS2_GS_VRAM_SIZE, 0u);
+                std::vector<uint8_t> async(PS2_GS_VRAM_SIZE, 0u);
+                const uint32_t immediateCenter = drawFrames(immediate, false, sizeLog2, texflush);
+                const uint32_t asyncCenter = drawFrames(async, true, sizeLog2, texflush);
+
+                const char *variant = texflush ? " (TEXFLUSH)" : " (drain, no TEXFLUSH)";
+                t.Equals(immediateCenter, frameColor(3u), std::string("the display buffer should hold a copy of the last frame") + variant);
+                t.Equals(asyncCenter, immediateCenter, std::string("asynchronous drawing should copy the same frame") + variant);
+                t.IsTrue(immediate == async, std::string("worker threads should produce exactly the immediate rasterizer's VRAM") + variant);
+            }
+        });
+
         tc.Run("FBA forces the framebuffer alpha high bit on CT32 writes", [](TestCase &t)
         {
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
