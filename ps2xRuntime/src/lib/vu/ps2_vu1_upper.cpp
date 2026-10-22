@@ -1,6 +1,7 @@
 #include "runtime/ps2_vu1.h"
 #include "ps2_vu1_detail.h"
 
+#include <array>
 #include <cmath>
 #include <emmintrin.h>
 #include <cstring>
@@ -94,18 +95,41 @@ void VU1Interpreter::execUpper(uint32_t instr)
     if (low11 == 0x2FFu || low11 == 0x33Cu)
         return;
 
+    // Which of ACC, Q and I an upper op reads, by op (0x00-0x3B) or 0x40 | special op.
+    static constexpr auto kReads = []
+    {
+        constexpr uint8_t kAcc = 1u, kQ = 2u, kI = 4u;
+        std::array<uint8_t, 0x80> reads{};
+        for (const uint32_t base : {0x00u, 0x40u})
+        {
+            for (uint32_t code = 0x08u; code <= 0x0Fu; ++code)
+                reads[base | code] |= kAcc;
+            for (const uint32_t code : {0x21u, 0x23u, 0x25u, 0x27u, 0x29u, 0x2Du})
+                reads[base | code] |= kAcc;
+            for (const uint32_t code : {0x1Cu, 0x20u, 0x21u, 0x24u, 0x25u})
+                reads[base | code] |= kQ;
+            for (const uint32_t code : {0x1Eu, 0x22u, 0x23u, 0x26u, 0x27u})
+                reads[base | code] |= kI;
+        }
+        reads[0x2Eu] |= kAcc; // OPMSUB
+        return reads;
+    }();
+    const uint8_t reads =
+        kReads[op >= 0x3Cu ? (0x40u | ((instr & 3u) | ((instr >> 4) & 0x7Cu))) & 0x7Fu : op];
+
     float *vd = m_state.vf[fd];
     alignas(16) float normalizedVs[4];
     alignas(16) float normalizedVt[4];
     alignas(16) float normalizedAcc[4];
     normalizeVector(m_state.vf[fs], normalizedVs);
     normalizeVector(m_state.vf[ft], normalizedVt);
-    normalizeVector(m_state.acc, normalizedAcc);
+    if (reads & 1u)
+        normalizeVector(m_state.acc, normalizedAcc);
     const float *vs = normalizedVs;
     const float *vt = normalizedVt;
     const float *acc = normalizedAcc;
-    const float q = normalizeOperand(m_state.q);
-    const float i = normalizeOperand(m_state.i);
+    const float q = (reads & 2u) ? normalizeOperand(m_state.q) : 0.0f;
+    const float i = (reads & 4u) ? normalizeOperand(m_state.i) : 0.0f;
     float result[4];
     m_fmacVs = vs;
     m_fmacVt = vt;

@@ -122,6 +122,7 @@ private:
         bool tBit = false;
         uint8_t upperVfShadowReg = 0;
         uint8_t suppressedLowerVf = 0;
+        uint8_t writtenVi = 0;
     };
 
     struct FlagPipelineEntry

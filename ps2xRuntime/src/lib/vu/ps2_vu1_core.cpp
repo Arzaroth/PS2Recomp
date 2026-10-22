@@ -1543,6 +1543,8 @@ VU1Interpreter::DecodedInstructionPair VU1Interpreter::decodeInstructionPair(con
         if (decoded.lowerUsage.vfWrite.reg == upperWriteReg)
             decoded.suppressedLowerVf = upperWriteReg;
     }
+    if (const uint32_t viWrites = decoded.lowerUsage.viWrite & 0xFFFEu; viWrites != 0u)
+        decoded.writtenVi = static_cast<uint8_t>(_tzcnt_u32(viWrites));
     return decoded;
 }
 
@@ -1750,20 +1752,8 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         if (m_cycle >= budgetEnd)
             break;
 
-        uint8_t writtenVi = 0u;
-        int32_t oldVi = 0;
-        if (decoded.lowerUsage.viWrite != 0u)
-        {
-            for (uint32_t reg = 1; reg < 16u; ++reg)
-            {
-                if ((decoded.lowerUsage.viWrite & (1u << reg)) != 0u)
-                {
-                    writtenVi = static_cast<uint8_t>(reg);
-                    oldVi = m_state.vi[reg];
-                    break;
-                }
-            }
-        }
+        const uint8_t writtenVi = decoded.writtenVi;
+        const int32_t oldVi = writtenVi != 0u ? m_state.vi[writtenVi] : 0;
 
         // Results are written immediately. Every reader stalls until its operands' latency has elapsed
         // (calculatePairReadyCycle), so the delayed writeback is unobservable inside a run; only the same-pair
