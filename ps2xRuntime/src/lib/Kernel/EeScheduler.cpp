@@ -388,7 +388,7 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
 
     // Guest code that runs slower than real time (busy-wait loops) would otherwise stretch
     // VBlank and timer events; once the host deadline has passed, fast-forward to the event.
-    if (nextEventCycle != 0u && (++m_hostCatchUpPoll & 0xFFu) == 0u)
+    if (m_wallClockCatchUp && nextEventCycle != 0u && (++m_hostCatchUpPoll & 0xFFu) == 0u)
     {
         const auto hostDeadline = std::chrono::steady_clock::time_point(
             std::chrono::steady_clock::duration(m_nextDeadlineHostTicks.load(std::memory_order_acquire)));

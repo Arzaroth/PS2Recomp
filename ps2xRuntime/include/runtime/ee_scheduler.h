@@ -347,6 +347,11 @@ public:
     static constexpr FieldRate kPalFieldRate{50u, 1u};
     void setFieldRate(FieldRate rate) noexcept;
     [[nodiscard]] FieldRate fieldRate() const noexcept;
+    // Guest code slower than real time normally fast-forwards to the next event once its host
+    // deadline has passed, so busy-wait loops do not stretch VBlank and timer events. A game whose
+    // EE is stalled by host work (a saturated GS) loses EE time that way while the IOP keeps its
+    // pace: its EE-produced audio can underrun. Disabling it lets emulated time slow down instead.
+    void setWallClockCatchUp(bool enabled) noexcept { m_wallClockCatchUp = enabled; }
     uint32_t setGsVSyncCallback(uint32_t callback, uint32_t gp, uint32_t sp);
 
     [[noreturn]] void waitVSync(uint64_t afterTick, int fixedResult = -1, std::function<void(R5900Context &)> completion = {});
@@ -470,6 +475,7 @@ private:
     // Host deadline of the event at m_nextDeadlineCycle; lets slow guest code catch up to wall-clock time.
     std::atomic<std::chrono::steady_clock::rep> m_nextDeadlineHostTicks{0};
     uint32_t m_hostCatchUpPoll = 0;
+    bool m_wallClockCatchUp = true;
 
     mutable std::mutex m_snapshotMutex;
     EeKernelSnapshot m_snapshot;
