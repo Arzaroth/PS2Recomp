@@ -5,6 +5,9 @@
 #include "runtime/ps2_memory.h"
 #include "ThreadNaming.h"
 #include <atomic>
+#if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#endif
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -120,6 +123,15 @@ namespace
     // Back-pressure: the EE waits once this much packet data is queued ahead of the GS thread.
     constexpr size_t kMaxQueuedBytes = 32u * 1024u * 1024u;
     constexpr uint32_t kWorkerSpinIterations = 2000u;
+
+    inline void cpuRelax()
+    {
+#if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
+        _mm_pause();
+#else
+        std::this_thread::yield();
+#endif
+    }
 }
 
 GS::GS()
@@ -288,7 +300,7 @@ void GS::workerLoop()
         // Packets of a frame arrive back to back: wait a little before sleeping, so the EE rarely
         // has to wake this thread.
         for (uint32_t spin = 0; spin < kWorkerSpinIterations && m_queuedCommands.load(std::memory_order_acquire) == 0u; ++spin)
-            std::this_thread::yield();
+            cpuRelax();
         {
             std::unique_lock<std::mutex> lock(m_queueMutex);
             m_workerSleeping = true;
