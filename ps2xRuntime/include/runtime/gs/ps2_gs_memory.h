@@ -545,6 +545,9 @@ namespace GSMem
 
     // Physical 8 KiB page holding pixel (x, y) of a buffer (base block bp, width bw).
     u32 PageOf(u32 psm, u32 bp, u32 bw, u32 x, u32 y);
+    // Physical 256-byte block holding pixel (x, y) of a buffer. Every 8-pixel-aligned run of a row
+    // lies in one block, whatever the format.
+    u32 BlockOf(u32 psm, u32 bp, u32 bw, u32 x, u32 y);
 
 	void WriteCT32(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 value);
 	void WriteZ32(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 value);

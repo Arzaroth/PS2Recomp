@@ -8,6 +8,7 @@
 #include "ps2_log.h"
 #include <atomic>
 #include <algorithm>
+#include <bit>
 #include <bitset>
 #include <cmath>
 #include <cstdarg>
@@ -569,10 +570,13 @@ namespace
 {
     // Worker spin before sleeping, about 50 us: primitives of a frame arrive back to back.
     constexpr uint32_t kWorkerSpinIterations = 2000u;
-    constexpr uint64_t kQueueSize = 4096u; // power of two
+    // Power of two. Deep enough that the producer can queue a whole frame while the workers draw
+    // the previous one (Drakengard's mission: 4096 left the workers idle a quarter of the time).
+    constexpr uint64_t kQueueSize = 16384u;
+    constexpr size_t kKeptUploadBytes = 4096u; // upload buffer a queue slot keeps for reuse
     constexpr uint32_t kVramBlocks = 16384u; // 4 MiB in 256-byte blocks
     constexpr size_t kMaxPendingWrites = 32u;
-    constexpr int kDecodedTileShift = 5; // 32x32 texel tiles
+    constexpr int kDecodedTileShift = 3; // 8x8 texel tiles
     constexpr size_t kDecodedTexturesPerWorker = 16u;
     constexpr int kDecodedMaxTexels = 1024 * 1024;
     // Smaller primitives (text, particles) sample the texture directly: decoding a whole
@@ -613,6 +617,37 @@ namespace
             height = 32u;
             break;
         }
+    }
+
+    // Block number (0-31) within its page of each 8x8-pixel cell of a page, for one format: with
+    // the page index, the 256-byte block of a pixel without the general address computation.
+    struct BlockLayout
+    {
+        uint32_t pageWidthShift = 6;
+        uint32_t pageHeightShift = 5;
+        std::array<std::array<uint8_t, 16>, 16> cells{};
+    };
+
+    const BlockLayout &blockLayout(uint32_t psm)
+    {
+        static std::array<BlockLayout, 64> layouts;
+        static std::once_flag once;
+        std::call_once(once, []()
+                       {
+                           for (uint32_t format = 0; format < layouts.size(); ++format)
+                           {
+                               BlockLayout &layout = layouts[format];
+                               uint32_t pageWidth = 0;
+                               uint32_t pageHeight = 0;
+                               pageGeometry(format, pageWidth, pageHeight);
+                               layout.pageWidthShift = static_cast<uint32_t>(std::countr_zero(pageWidth));
+                               layout.pageHeightShift = static_cast<uint32_t>(std::countr_zero(pageHeight));
+                               for (uint32_t cy = 0; cy < pageHeight / 8u; ++cy)
+                                   for (uint32_t cx = 0; cx < pageWidth / 8u; ++cx)
+                                       layout.cells[cy][cx] = static_cast<uint8_t>(
+                                           GSMem::BlockOf(format, 0u, pageWidth / 64u, cx * 8u, cy * 8u) % 32u);
+                           } });
+        return layouts[psm & 0x3Fu];
     }
 
     // VRAM blocks of the whole page rows that hold rows [firstRow, lastRow] of a buffer.
@@ -1015,23 +1050,29 @@ struct GSCpuBackend::RasterContext
     GSMem::TexturePageCache *cache;
     uint32_t stripe;
     uint32_t stripeCount;
-    // Page geometry of the frame buffer being drawn: a worker owns the VRAM pages whose
-    // number modulo stripeCount is its stripe, so each word (whatever buffer geometry or
-    // format writes it) is always written by the same worker, in queue order.
-    uint32_t basePage = 0;
+    // The frame buffer being drawn: a worker owns the 256-byte VRAM blocks whose number modulo
+    // stripeCount is its stripe, so each word (whatever buffer geometry or format writes it) is
+    // always written by the same worker, in queue order. Blocks rather than pages spread a
+    // primitive's pixels over the workers in small tiles (8x8 for 32-bit color).
+    const BlockLayout *layout = nullptr;
+    uint32_t frameBase = 0; // block, page aligned
     uint32_t pagesPerRow = 1;
-    uint32_t pageWidth = 64;
-    uint32_t pageHeight = 32;
 
+    // Same block as GSMem::BlockOf for a page-aligned buffer.
     bool owns(int x, int y) const
     {
         if (stripeCount <= 1u)
             return true;
-        const uint32_t page = basePage + (static_cast<uint32_t>(y) / pageHeight) * pagesPerRow + static_cast<uint32_t>(x) / pageWidth;
-        return (page % stripeCount) == stripe;
+        const uint32_t ux = static_cast<uint32_t>(x);
+        const uint32_t uy = static_cast<uint32_t>(y);
+        const uint32_t page = (uy >> layout->pageHeightShift) * pagesPerRow + (ux >> layout->pageWidthShift);
+        const uint32_t cell = layout->cells[(uy & ((1u << layout->pageHeightShift) - 1u)) >> 3u]
+                                           [(ux & ((1u << layout->pageWidthShift) - 1u)) >> 3u];
+        return (((frameBase + page * 32u + cell) % kVramBlocks) % stripeCount) == stripe;
     }
 
-    // Narrows [start, limit] on row y to its first run of owned pixels, in end.
+    // Narrows [start, limit] on row y to its first run of owned pixels, in end. An 8-pixel
+    // aligned run of a row always lies in one block.
     bool ownedRun(int y, int &start, int &end, int limit) const
     {
         if (stripeCount <= 1u)
@@ -1039,17 +1080,15 @@ struct GSCpuBackend::RasterContext
             end = limit;
             return start <= limit;
         }
-        const uint32_t rowPage = basePage + (static_cast<uint32_t>(y) / pageHeight) * pagesPerRow;
         while (start <= limit)
         {
-            const uint32_t column = static_cast<uint32_t>(start) / pageWidth;
-            const int columnEnd = std::min(limit, static_cast<int>((column + 1u) * pageWidth) - 1);
-            if (((rowPage + column) % stripeCount) == stripe)
+            const int chunkEnd = std::min(limit, start | 7);
+            if (owns(start, y))
             {
-                end = columnEnd;
+                end = chunkEnd;
                 return true;
             }
-            start = columnEnd + 1;
+            start = chunkEnd + 1;
         }
         return false;
     }
@@ -1073,9 +1112,11 @@ struct GSCpuBackend::QueuedPrimitive
     std::vector<uint8_t> uploadData;
 };
 
-// Texels converted to RGBA (TEXA and CLUT applied) in a linear array, filled by 32x32 tiles on
+// Texels converted to RGBA (TEXA and CLUT applied) in a linear array, filled by 8x8 tiles on
 // first use: bilinear filtering then reads an array instead of four swizzled, palettized
-// fetches per pixel. Like the texture page cache, its contents stay until TEXFLUSH.
+// fetches per pixel. Small tiles matter because each worker keeps its own copy and draws 8x8
+// blocks spread over the whole frame: it should only decode what its blocks sample. Like the
+// texture page cache, its contents stay until TEXFLUSH.
 struct GSCpuBackend::DecodedTexture
 {
     uint32_t tbp0 = 0;
@@ -1748,7 +1789,7 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
     // Rather than stopping the producer, the workers wait for each other at this primitive when
     // it samples what queued primitives draw (render to texture), draws over what they still
     // sample, or mixes pixel and depth writes on the same pages (their owners differ). Depth
-    // words follow the owner of their color page, so a Z buffer reused under another color-page
+    // words follow the owner of their color block, so a Z buffer reused under another color
     // layout (double buffering) also gets a barrier.
     bool barrier = m_barrierRequested ||
                    (blocks.samples && (overlapsAny(blocks.texture, m_pixelWritesSinceBarrier) ||
@@ -1760,14 +1801,12 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
     const bool writesZ = blocks.writesZ;
     if (writesZ)
     {
+        // The color layout deciding each depth word's owner: format, width, and base block
+        // modulo the worker count.
         const auto &frame = state.context.frame;
-        uint32_t pageWidth = 0;
-        uint32_t pageHeight = 0;
-        pageGeometry(frame.psm, pageWidth, pageHeight);
-        const uint32_t basePage = GSInternal::framePageBaseToBlock(frame.fbp) / 32u;
-        const uint32_t pagesPerRow = std::max(1u, (std::max<uint32_t>(frame.fbw, 1u) * 64u + pageWidth - 1u) / pageWidth);
-        zOwnerKey = (static_cast<uint64_t>(state.context.zbuf.zbp) << 40u) | (static_cast<uint64_t>(basePage % m_workerCount) << 32u) |
-                    (static_cast<uint64_t>(pagesPerRow) << 16u) | (pageWidth << 8u) | pageHeight;
+        const uint32_t baseBlock = GSInternal::framePageBaseToBlock(frame.fbp);
+        zOwnerKey = (static_cast<uint64_t>(state.context.zbuf.zbp) << 40u) | (static_cast<uint64_t>(baseBlock % m_workerCount) << 24u) |
+                    (static_cast<uint64_t>(frame.fbw) << 8u) | static_cast<uint64_t>(frame.psm);
         for (const uint64_t key : m_zOwnerKeys)
             barrier = barrier || ((key >> 40u) == state.context.zbuf.zbp && key != zOwnerKey);
     }
@@ -1812,7 +1851,12 @@ GSCpuBackend::QueuedPrimitive &GSCpuBackend::ReserveQueueSlotUnlocked()
         while (tail - m_workerProgress[i].done.load(std::memory_order_acquire) >= kQueueSize)
             cpuRelax();
     }
-    return m_queue[tail & (kQueueSize - 1u)];
+    QueuedPrimitive &item = m_queue[tail & (kQueueSize - 1u)];
+    // A slot keeps its upload buffer when reused; left alone, every slot would end up holding
+    // the largest texture chunk it ever carried (gigabytes over a long run).
+    if (item.uploadData.capacity() > kKeptUploadBytes)
+        std::vector<uint8_t>().swap(item.uploadData);
+    return item;
 }
 
 void GSCpuBackend::PublishQueueSlotUnlocked()
@@ -1857,9 +1901,9 @@ void GSCpuBackend::DrawQueued(const QueuedPrimitive &item, uint32_t index)
         texture.decoded = FindDecodedTexture(m_decodedCaches[index + 1u], texture);
     RasterContext raster{&item.pixel, &texture, &m_texturePageCaches[index + 1u], index, m_workerCount};
     const auto &frame = state.context.frame;
-    pageGeometry(frame.psm, raster.pageWidth, raster.pageHeight);
-    raster.basePage = GSInternal::framePageBaseToBlock(frame.fbp) / 32u;
-    raster.pagesPerRow = std::max(1u, (std::max<uint32_t>(frame.fbw, 1u) * 64u + raster.pageWidth - 1u) / raster.pageWidth);
+    raster.layout = &blockLayout(frame.psm);
+    raster.frameBase = GSInternal::framePageBaseToBlock(frame.fbp);
+    raster.pagesPerRow = (std::max<uint32_t>(frame.fbw, 1u) * 64u) >> raster.layout->pageWidthShift; // as GSMem's PageId
     DrawWith(batch, raster);
 }
 
@@ -2385,10 +2429,39 @@ uint32_t GSCpuBackend::SampleTexture(const TextureSampler &sampler, GSMem::Textu
         return samplePoint(u0, v0); // texel-aligned (e.g. 1:1 movie frames): the blend is c00
     }
 
-    const uint32_t c00 = samplePoint(u0, v0);
-    const uint32_t c10 = samplePoint(u1, v0);
-    const uint32_t c01 = samplePoint(u0, v1);
-    const uint32_t c11 = samplePoint(u1, v1);
+    uint32_t c00 = 0u;
+    uint32_t c10 = 0u;
+    uint32_t c01 = 0u;
+    uint32_t c11 = 0u;
+    DecodedTexture *decoded = sampler.decoded;
+    if (decoded && sampler.wrapU <= 1u && sampler.wrapV <= 1u && u0 >= 0 && v0 >= 0 && u1 < decoded->width &&
+        v1 < decoded->height)
+    {
+        // All four taps inside the texture: REPEAT and CLAMP leave them as they are, so read the
+        // decoded rows directly once their tiles are decoded.
+        for (int tileV = v0 >> kDecodedTileShift; tileV <= (v1 >> kDecodedTileShift); ++tileV)
+        {
+            for (int tileU = u0 >> kDecodedTileShift; tileU <= (u1 >> kDecodedTileShift); ++tileU)
+            {
+                const uint32_t tile = static_cast<uint32_t>(tileV) * decoded->tilesPerRow + static_cast<uint32_t>(tileU);
+                if (!decoded->tileReady[tile])
+                    DecodeTile(*decoded, sampler, cache, tile);
+            }
+        }
+        const uint32_t *row0 = decoded->texels.get() + static_cast<size_t>(v0) * static_cast<size_t>(decoded->width);
+        const uint32_t *row1 = row0 + decoded->width;
+        c00 = row0[u0];
+        c10 = row0[u1];
+        c01 = row1[u0];
+        c11 = row1[u1];
+    }
+    else
+    {
+        c00 = samplePoint(u0, v0);
+        c10 = samplePoint(u1, v0);
+        c01 = samplePoint(u0, v1);
+        c11 = samplePoint(u1, v1);
+    }
 
     const uint8_t r = lerpChannel(static_cast<uint8_t>(c00 & 0xFFu),
                                   static_cast<uint8_t>(c10 & 0xFFu),
@@ -2862,22 +2935,35 @@ uint32_t GSCpuBackend::WriteUploadPixels(const GSTransferCommand &transfer,
     uint32_t pixel = firstPixel;
     uint32_t offset = 0u;
 
-    // A block (8 pixels wide or more in every format) never straddles a page, so the owning
-    // worker only changes on a new row or every 8 pixels.
+    // An 8-pixel aligned run of a row lies in one block, so the owning worker only changes on a
+    // new row or every 8 pixels.
     uint32_t ownerY = UINT32_MAX;
     uint32_t ownerColumn = UINT32_MAX;
     bool owned = true;
+    // Pixels come in order: step the position instead of dividing for each one.
+    uint32_t cursorIndex = firstPixel;
+    uint32_t cursorColumn = firstPixel % rrw;
+    uint32_t cursorRow = firstPixel / rrw;
     auto put = [&](uint32_t index, uint32_t value)
     {
         if (!write)
             return;
-        const uint32_t x = dsax + index % rrw;
-        const uint32_t y = dsay + index / rrw;
+        while (cursorIndex < index)
+        {
+            ++cursorIndex;
+            if (++cursorColumn == rrw)
+            {
+                cursorColumn = 0u;
+                ++cursorRow;
+            }
+        }
+        const uint32_t x = dsax + cursorColumn;
+        const uint32_t y = dsay + cursorRow;
         if (rows && (y != ownerY || (x >> 3u) != ownerColumn))
         {
             ownerY = y;
             ownerColumn = x >> 3u;
-            owned = (GSMem::PageOf(dpsm, dbp, dbw, x, y) % rows->stripeCount) == rows->stripe;
+            owned = (GSMem::BlockOf(dpsm, dbp, dbw, x, y) % rows->stripeCount) == rows->stripe;
         }
         if (owned)
             WriteVramUnlocked(dpsm, dbp, dbw, x, y, value);

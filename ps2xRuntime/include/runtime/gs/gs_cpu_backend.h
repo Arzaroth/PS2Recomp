@@ -73,7 +73,7 @@ private:
     void WritePixel(const PixelPipeline &pipeline, int x, int y, uint32_t z, uint8_t r, uint8_t g, uint8_t b, uint8_t a, uint8_t fog);
     uint32_t SampleTexture(const TextureSampler &sampler, GSMem::TexturePageCache &cache, float s, float t, float q, uint16_t u, uint16_t v);
 
-    // Submit queues primitives; worker threads draw them in order, each on the VRAM pages it
+    // Submit queues primitives; worker threads draw them in order, each on the VRAM blocks it
     // owns, so every word sees the same write order as a serial rasterizer. Anything else
     // that touches VRAM drains the queue first.
     struct QueuedPrimitive;
@@ -153,8 +153,8 @@ private:
     mutable std::vector<std::pair<uint32_t, uint32_t>> m_pendingWrites;
     // Writes queued since the last in-queue barrier: a primitive sampling one of them gets a
     // barrier (the workers wait for each other there) instead of draining the queue. Pixel
-    // writes (color, uploads) are made by the owner of their page, depth writes by the owner of
-    // the color page, so the two kinds overlapping also need a barrier.
+    // writes (color, uploads) are made by the owner of their block, depth writes by the owner of
+    // the color block, so the two kinds overlapping also need a barrier.
     std::vector<std::pair<uint32_t, uint32_t>> m_pixelWritesSinceBarrier;
     std::vector<std::pair<uint32_t, uint32_t>> m_zWritesSinceBarrier;
     // Texture ranges read since the last barrier: a queued write over them gets a barrier.
@@ -162,8 +162,8 @@ private:
     bool m_barrierRequested = false;
     // Queued items wrote VRAM since m_texturePageCaches[0] (CLUT loads) was last emptied.
     bool m_callerCacheStale = false;
-    // Z buffers written since the last barrier, with the color-page layout that decided
-    // which worker wrote each depth word.
+    // Z buffers written since the last barrier, with the color layout that decided which
+    // worker wrote each depth word.
     mutable std::vector<uint64_t> m_zOwnerKeys;
     std::vector<std::thread> m_workers;
     std::mutex m_workMutex;
