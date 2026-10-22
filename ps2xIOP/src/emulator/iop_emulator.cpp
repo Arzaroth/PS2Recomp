@@ -22,18 +22,87 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <map>
 #include <optional>
 #include <span>
 #include <sstream>
+#include <unordered_set>
 #include <utility>
+#include <vector>
 
 namespace ps2x::iop::detail
 {
     namespace
     {
+        // PS2X_IOP_TRACE_PC=0x62914,0x6291c: log a0-a3 and ra each time the IOP reaches one of these addresses.
+        const std::unordered_set<uint32_t> *tracedPcs()
+        {
+            static const std::unordered_set<uint32_t> *pcs = []() -> const std::unordered_set<uint32_t> *
+            {
+                const char *spec = std::getenv("PS2X_IOP_TRACE_PC");
+                if (!spec || !*spec)
+                    return nullptr;
+                auto *set = new std::unordered_set<uint32_t>();
+                std::string text(spec);
+                for (size_t start = 0; start < text.size();)
+                {
+                    size_t end = text.find(',', start);
+                    if (end == std::string::npos)
+                        end = text.size();
+                    set->insert(static_cast<uint32_t>(std::strtoul(text.substr(start, end - start).c_str(), nullptr, 0)));
+                    start = end + 1;
+                }
+                return set;
+            }();
+            return pcs;
+        }
+
+        // PS2X_IOP_COUNT_RANGE=0x56b00-0x63000: count executed instructions per pc in that range and write
+        // "pc count" lines to PS2X_IOP_COUNT_OUT (default iop_pc_counts.txt) every 2^24 counted instructions.
+        struct PcCounter
+        {
+            uint32_t low = 0;
+            uint32_t high = 0;
+            std::vector<uint64_t> counts;
+            uint64_t total = 0;
+
+            void write() const
+            {
+                const char *out = std::getenv("PS2X_IOP_COUNT_OUT");
+                if (FILE *f = std::fopen(out && *out ? out : "iop_pc_counts.txt", "w"))
+                {
+                    for (size_t i = 0; i < counts.size(); ++i)
+                        if (counts[i] != 0u)
+                            std::fprintf(f, "0x%x %llu\n", low + static_cast<uint32_t>(i) * 4u,
+                                         static_cast<unsigned long long>(counts[i]));
+                    std::fclose(f);
+                }
+            }
+        };
+
+        PcCounter *pcCounter()
+        {
+            static PcCounter *counter = []() -> PcCounter *
+            {
+                const char *spec = std::getenv("PS2X_IOP_COUNT_RANGE");
+                if (!spec || !*spec)
+                    return nullptr;
+                char *end = nullptr;
+                auto *result = new PcCounter();
+                result->low = static_cast<uint32_t>(std::strtoul(spec, &end, 0));
+                result->high = static_cast<uint32_t>(std::strtoul(end && *end == '-' ? end + 1 : "0", nullptr, 0));
+                if (result->high <= result->low)
+                    return nullptr;
+                result->counts.assign((result->high - result->low) / 4u, 0u);
+                return result;
+            }();
+            return counter;
+        }
+
         constexpr uint32_t kRamSize = IopMemory::RamSize;
         constexpr uint32_t kKernelHeapBase = IopMemory::HeapBase;
         constexpr uint32_t kKernelHeapLimit = IopMemory::HeapLimit;
@@ -417,6 +486,16 @@ namespace ps2x::iop::detail
             }
             if (checkInterrupt(cpu))
                 return true;
+
+            if (PcCounter *counter = pcCounter(); counter && cpu.pc >= counter->low && cpu.pc < counter->high)
+            {
+                ++counter->counts[(cpu.pc - counter->low) / 4u];
+                if ((++counter->total & 0xFFFFFFu) == 0u)
+                    counter->write();
+            }
+            if (const auto *traced = tracedPcs(); traced && traced->count(cpu.pc) != 0u)
+                std::fprintf(stderr, "[iop-pc] pc=0x%x v1=0x%x v0=0x%x a0=0x%x a1=0x%x a2=0x%x a3=0x%x ra=0x%x\n", cpu.pc, cpu.gpr[3], cpu.gpr[2], cpu.gpr[4],
+                             cpu.gpr[5], cpu.gpr[6], cpu.gpr[7], cpu.gpr[31]);
 
             if (const auto import = imports.decode(cpu.pc))
             {

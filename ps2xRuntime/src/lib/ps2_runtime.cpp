@@ -853,46 +853,62 @@ namespace
 
 namespace
 {
-    // PS2X_WATCH="0x4ED6E8,0x5562F8:4": guest words printed by the state dump (address[:count]).
-    void dumpWatchedWords(std::ostringstream &text, PS2Memory &memory)
+    std::vector<std::pair<uint32_t, uint32_t>> parseWatchSpec(const char *variable)
     {
-        static const std::vector<std::pair<uint32_t, uint32_t>> watches = []
+        std::vector<std::pair<uint32_t, uint32_t>> parsed;
+        const char *spec = std::getenv(variable);
+        std::string_view rest = spec ? spec : "";
+        while (!rest.empty())
         {
-            std::vector<std::pair<uint32_t, uint32_t>> parsed;
-            const char *spec = std::getenv("PS2X_WATCH");
-            std::string_view rest = spec ? spec : "";
-            while (!rest.empty())
-            {
-                const size_t comma = rest.find(',');
-                const std::string entry(rest.substr(0, comma));
-                rest = comma == std::string_view::npos ? std::string_view{} : rest.substr(comma + 1);
-                const size_t colon = entry.find(':');
-                const uint32_t address = static_cast<uint32_t>(std::strtoul(entry.substr(0, colon).c_str(), nullptr, 0));
-                const uint32_t count = colon == std::string::npos
-                                           ? 1u
-                                           : static_cast<uint32_t>(std::strtoul(entry.substr(colon + 1).c_str(), nullptr, 0));
-                parsed.emplace_back(address & ~3u, std::max<uint32_t>(1u, std::min<uint32_t>(count, 64u)));
-            }
-            return parsed;
-        }();
-        const uint8_t *rdram = memory.getRDRAM();
+            const size_t comma = rest.find(',');
+            const std::string entry(rest.substr(0, comma));
+            rest = comma == std::string_view::npos ? std::string_view{} : rest.substr(comma + 1);
+            const size_t colon = entry.find(':');
+            const uint32_t address = static_cast<uint32_t>(std::strtoul(entry.substr(0, colon).c_str(), nullptr, 0));
+            const uint32_t count = colon == std::string::npos
+                                       ? 1u
+                                       : static_cast<uint32_t>(std::strtoul(entry.substr(colon + 1).c_str(), nullptr, 0));
+            parsed.emplace_back(address & ~3u, std::max<uint32_t>(1u, std::min<uint32_t>(count, 64u)));
+        }
+        return parsed;
+    }
+
+    template <typename ReadWord>
+    void dumpWatchedWords(std::ostringstream &text, const char *label,
+                          const std::vector<std::pair<uint32_t, uint32_t>> &watches, ReadWord readWord)
+    {
         for (const auto &[address, count] : watches)
         {
-            text << "[state] watch 0x" << std::hex << address << ':';
+            text << "[state] " << label << " 0x" << std::hex << address << ':';
             for (uint32_t index = 0; index < count; ++index)
-            {
-                const uint32_t physical = (address + index * 4u) & PS2_RAM_MASK;
-                uint32_t word = 0;
-                if (rdram && physical + 4u <= PS2_RAM_SIZE)
-                    std::memcpy(&word, rdram + physical, sizeof(word));
-                text << ' ' << word;
-            }
+                text << ' ' << readWord(address + index * 4u);
             text << std::dec << '\n';
         }
     }
+
+    // PS2X_WATCH="0x4ED6E8,0x5562F8:4" (EE) and PS2X_IOP_WATCH (IOP): words printed by the state dump
+    // (address[:count]).
+    void dumpWatches(std::ostringstream &text, PS2Memory &memory, const PS2Runtime &runtime)
+    {
+        static const auto eeWatches = parseWatchSpec("PS2X_WATCH");
+        static const auto iopWatches = parseWatchSpec("PS2X_IOP_WATCH");
+        const uint8_t *rdram = memory.getRDRAM();
+        dumpWatchedWords(text, "watch", eeWatches, [rdram](uint32_t address)
+                         {
+                             const uint32_t physical = address & PS2_RAM_MASK;
+                             uint32_t word = 0;
+                             if (rdram && physical + 4u <= PS2_RAM_SIZE)
+                                 std::memcpy(&word, rdram + physical, sizeof(word));
+                             return word; });
+        dumpWatchedWords(text, "iop watch", iopWatches, [&runtime](uint32_t address)
+                         {
+                             uint32_t word = 0;
+                             (void)runtime.readIopMemory(address, &word, sizeof(word));
+                             return word; });
+    }
 }
 
-static void dumpRuntimeState(std::ostream &out, PS2Memory &memory, const EeKernelSnapshot &ee,
+static void dumpRuntimeState(std::ostream &out, PS2Memory &memory, const PS2Runtime &runtime, const EeKernelSnapshot &ee,
                              const ps2x::iop::DebugSnapshot &iop)
 {
     static constexpr const char *kStatus[] = {"run", "ready", "wait", "wait+susp", "susp", "dormant"};
@@ -947,7 +963,7 @@ static void dumpRuntimeState(std::ostream &out, PS2Memory &memory, const EeKerne
          << " threads=" << iop.emulatorThreads << " rpc=" << iop.emulatorRpcServers << '\n';
     for (const std::string &line : iop.diagnostics)
         text << "[state]   " << line << '\n';
-    dumpWatchedWords(text, memory);
+    dumpWatches(text, memory, runtime);
     ps2_syscalls::describeSifRpcHistory(text);
     dumpHottestCalls(text);
     out << text.str() << std::flush;
@@ -2829,7 +2845,7 @@ void PS2Runtime::run()
             nextStateDump = std::chrono::steady_clock::now() +
                             std::chrono::duration_cast<std::chrono::steady_clock::duration>(
                                 std::chrono::duration<double>(stateDumpPeriod));
-            dumpRuntimeState(std::cerr, m_memory, m_eeScheduler->snapshot(), iopDebugSnapshot());
+            dumpRuntimeState(std::cerr, m_memory, *this, m_eeScheduler->snapshot(), iopDebugSnapshot());
         }
         PS2_IF_AGRESSIVE_LOGS({
             tick++;
