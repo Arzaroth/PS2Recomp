@@ -2,6 +2,7 @@
 #define PS2_AUDIO_H
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -28,6 +29,10 @@ public:
     // SPU2 output of the IOP emulator: interleaved stereo frames at 48 kHz of emulated time,
     // played through one raylib stream that follows the emulation speed.
     void pushSpu2Frames(const int16_t *frames, size_t count);
+    // Adds host audio (e.g. a movie soundtrack) into the SPU2 output, in place, so it follows
+    // emulated time. Called on the thread that pushes SPU2 frames.
+    using Spu2Mixer = std::function<void(int16_t *frames, size_t count)>;
+    void setSpu2Mixer(Spu2Mixer mixer);
     // Before CloseAudioDevice.
     void closeSpu2Stream();
     struct Spu2Stream;
@@ -47,6 +52,9 @@ private:
     };
     std::unique_ptr<Spu2Stream, Spu2StreamDeleter> m_spu2;
     bool m_audioReady = false;
+    std::mutex m_spu2MixerMutex;
+    Spu2Mixer m_spu2Mixer;
+    std::vector<int16_t> m_spu2MixBuffer;
     uint32_t m_mostRecentSampleKey = 0;
     std::vector<DecodedSample> m_loadOrderSamples;
     std::vector<uint32_t> m_loadOrderSampleKeys;

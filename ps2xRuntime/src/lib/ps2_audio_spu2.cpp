@@ -126,7 +126,22 @@ void PS2AudioBackend::pushSpu2Frames(const int16_t *frames, size_t count)
         }
 #endif
     }
+    {
+        std::lock_guard<std::mutex> lock(m_spu2MixerMutex);
+        if (m_spu2Mixer)
+        {
+            m_spu2MixBuffer.assign(frames, frames + count * 2u);
+            m_spu2Mixer(m_spu2MixBuffer.data(), count);
+            frames = m_spu2MixBuffer.data();
+        }
+    }
     m_spu2->push(frames, count);
+}
+
+void PS2AudioBackend::setSpu2Mixer(Spu2Mixer mixer)
+{
+    std::lock_guard<std::mutex> lock(m_spu2MixerMutex);
+    m_spu2Mixer = std::move(mixer);
 }
 
 void PS2AudioBackend::closeSpu2Stream()

@@ -485,9 +485,17 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     static std::vector<uint8_t> s_scratch;
     static std::vector<uint8_t> s_uploadBuffer(DEFAULT_FB_SIZE, 0u);
 
+    s_scratch.clear();
+    uint32_t overrideWidth = 0u;
+    uint32_t overrideHeight = 0u;
+    const bool overridden = rt->presentOverride(s_scratch, overrideWidth, overrideHeight);
     const uint64_t currentTick = rt->eeScheduler().currentVSyncTick();
     const bool needsLatch = !s_hasLatchedInitialFrame || currentTick != s_lastPresentationTick;
-    if (needsLatch)
+    if (overridden)
+    {
+        s_hasLatchedInitialFrame = false;
+    }
+    else if (needsLatch)
     {
         rt->gs().latchHostPresentationFrame();
         s_lastPresentationTick = currentTick;
@@ -500,13 +508,12 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         return;
     }
 
-    s_scratch.clear();
-    uint32_t width = 0u;
-    uint32_t height = 0u;
+    uint32_t width = overrideWidth;
+    uint32_t height = overrideHeight;
     uint32_t displayFbp = 0u;
     uint32_t sourceFbp = 0u;
     bool usedPreferredDisplaySource = false;
-    if (!rt->gs().copyLatchedHostPresentationFrame(s_scratch,
+    if (!overridden && !rt->gs().copyLatchedHostPresentationFrame(s_scratch,
                                                    width,
                                                    height,
                                                    &displayFbp,
@@ -2412,6 +2419,18 @@ void PS2Runtime::configureReservedMemory(uint32_t base, uint32_t top, uint32_t g
 uint32_t PS2Runtime::reservedMemoryBase()
 {
     return reservedMemoryBaseStorage();
+}
+
+void PS2Runtime::setPresentationOverride(PresentationOverride presentationOverride)
+{
+    std::lock_guard<std::mutex> lock(m_presentationOverrideMutex);
+    m_presentationOverride = std::move(presentationOverride);
+}
+
+bool PS2Runtime::presentOverride(std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height)
+{
+    std::lock_guard<std::mutex> lock(m_presentationOverrideMutex);
+    return m_presentationOverride && m_presentationOverride(rgba, width, height) && width != 0u && height != 0u;
 }
 
 uint32_t PS2Runtime::reserveAsyncCallbackStack(uint32_t size, uint32_t alignment)

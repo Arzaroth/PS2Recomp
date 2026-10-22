@@ -398,6 +398,12 @@ public:
     void configureReservedMemory(uint32_t base, uint32_t top, uint32_t guestHeapHardLimit);
     static uint32_t reservedMemoryBase();
 
+    // Host-rendered frames shown instead of the GS output while the callback returns true
+    // (e.g. a game override playing a movie on the host). Called on the render thread.
+    using PresentationOverride = std::function<bool(std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height)>;
+    void setPresentationOverride(PresentationOverride presentationOverride);
+    bool presentOverride(std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height);
+
     void drainCompletedDmacHandlers(uint8_t *rdram);
     // Raise INTC cause 0 (GS) for unmasked CSR SIGNAL/FINISH rising edges recorded by the GS.
     void pollGsInterrupt(uint8_t *rdram);
@@ -540,6 +546,8 @@ private:
     DebugUiCallback m_debugUiShutdownCallback = nullptr;
     void *m_debugUiUserData = nullptr;
     bool m_debugUiInitialized = false;
+    std::mutex m_presentationOverrideMutex;
+    PresentationOverride m_presentationOverride;
 
 public:
     std::atomic<uint32_t> m_debugPc{0};
