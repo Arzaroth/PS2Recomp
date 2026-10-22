@@ -2018,6 +2018,74 @@ void register_ps2_memory_tests()
                 t.Equals(causes[0], 9u, "SPR_TO completion should use DMAC cause 9");
         });
 
+        tc.Run("DMAC SPR_TO source chain follows ref, cnt and end tags", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            constexpr uint32_t kChannel = 0x1000D400u;
+            constexpr uint32_t kChain = 0x00030000u;
+            constexpr uint32_t kRefData = 0x00031000u;
+            constexpr uint32_t kSadr = 0x00000100u;
+            uint8_t *rdram = mem.getRDRAM();
+            auto putTag = [&](uint32_t at, uint64_t qwc, uint64_t id, uint64_t addr)
+            {
+                const uint64_t tag = qwc | (id << 28u) | (addr << 32u);
+                std::memcpy(rdram + at, &tag, sizeof(tag));
+            };
+            // ref: 1 qword from kRefData; cnt: 1 qword following the tag; end: 1 qword following it.
+            putTag(kChain + 0x00u, 1u, 3u, kRefData);
+            putTag(kChain + 0x10u, 1u, 1u, 0u);
+            std::memset(rdram + kChain + 0x20u, 0xBB, 16);
+            putTag(kChain + 0x30u, 1u, 7u, 0u);
+            std::memset(rdram + kChain + 0x40u, 0xCC, 16);
+            std::memset(rdram + kRefData, 0xAA, 16);
+
+            t.IsTrue(mem.writeIORegister(kChannel + 0x30u, kChain), "write SPR_TO TADR should succeed");
+            t.IsTrue(mem.writeIORegister(kChannel + 0x80u, kSadr), "write SPR_TO SADR should succeed");
+            t.IsTrue(mem.writeIORegister(kChannel + 0x00u, 0x105u), "start SPR_TO in chain mode should succeed");
+
+            const uint8_t *spr = mem.getScratchpad();
+            t.Equals(static_cast<uint32_t>(spr[kSadr]), 0xAAu, "ref data lands first");
+            t.Equals(static_cast<uint32_t>(spr[kSadr + 16u]), 0xBBu, "cnt data follows");
+            t.Equals(static_cast<uint32_t>(spr[kSadr + 32u]), 0xCCu, "end data comes last");
+            t.Equals(mem.readIORegister(kChannel + 0x80u), kSadr + 48u, "SADR advances by the transferred qwords");
+            t.IsTrue((mem.readIORegister(kChannel + 0x00u) & 0x100u) == 0u, "chain completion should clear CHCR.STR");
+            t.IsTrue((mem.readIORegister(0x1000E010u) & (1u << 9u)) != 0u, "chain completion should raise D_STAT channel 9");
+        });
+
+        tc.Run("DMAC SPR_FROM destination chain follows tags stored in the scratchpad", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            constexpr uint32_t kChannel = 0x1000D000u;
+            constexpr uint32_t kSadr = 0x00000200u;
+            constexpr uint32_t kDestA = 0x00032000u;
+            constexpr uint32_t kDestB = 0x00033000u;
+            uint8_t *spr = mem.getScratchpad();
+            auto putTag = [&](uint32_t at, uint64_t qwc, uint64_t id, uint64_t addr)
+            {
+                std::memset(spr + at, 0, 16);
+                const uint64_t tag = qwc | (id << 28u) | (addr << 32u);
+                std::memcpy(spr + at, &tag, sizeof(tag));
+            };
+            // cnt: 1 qword to kDestA; end: 2 qwords to kDestB.
+            putTag(kSadr + 0x00u, 1u, 1u, kDestA);
+            std::memset(spr + kSadr + 0x10u, 0x11, 16);
+            putTag(kSadr + 0x20u, 2u, 7u, kDestB);
+            std::memset(spr + kSadr + 0x30u, 0x22, 32);
+
+            t.IsTrue(mem.writeIORegister(kChannel + 0x80u, kSadr), "write SPR_FROM SADR should succeed");
+            t.IsTrue(mem.writeIORegister(kChannel + 0x00u, 0x105u), "start SPR_FROM in chain mode should succeed");
+
+            const uint8_t *rdram = mem.getRDRAM();
+            t.Equals(static_cast<uint32_t>(rdram[kDestA]), 0x11u, "cnt block lands at its tag address");
+            t.Equals(static_cast<uint32_t>(rdram[kDestB + 31u]), 0x22u, "end block lands at its tag address");
+            t.Equals(mem.readIORegister(kChannel + 0x80u), kSadr + 0x50u, "SADR advances past tags and data");
+            t.IsTrue((mem.readIORegister(0x1000E010u) & (1u << 8u)) != 0u, "chain completion should raise D_STAT channel 8");
+        });
+
         tc.Run("sceDmaReset re-enables DMAC DMAE", [](TestCase &t)
         {
             PS2Runtime runtime;

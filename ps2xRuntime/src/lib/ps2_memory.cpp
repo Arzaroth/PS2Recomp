@@ -1592,70 +1592,190 @@ bool PS2Memory::tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr)
     if (channelBase != kSprFromChannel && channelBase != kSprToChannel)
         return false;
 
+    const bool fromScratchpad = channelBase == kSprFromChannel;
     const uint32_t mode = (chcr >> 2u) & 0x3u;
-    if (mode != 0u)
+    // Normal mode both ways; chain mode is a source chain for toSPR (DMAtags in main memory) and a
+    // destination chain for fromSPR (each block starts with a DMAtag in the scratchpad data).
+    if (mode > 1u)
         return false;
 
-    const uint32_t qwc = m_ioRegisters[channelBase + 0x20u] & 0xFFFFu;
-    const uint32_t byteCount = qwc * 16u;
-    const uint32_t originalMadr = m_ioRegisters[channelBase + 0x10u] & 0x7FFFFFF0u;
-    const uint32_t originalSadr = m_ioRegisters[channelBase + 0x80u] & 0x3FF0u;
+    uint32_t scratchOffset = m_ioRegisters[channelBase + 0x80u] & 0x3FF0u;
 
-    // MADR addresses main RAM or, through the 0x11000000 window, VU micro/data memory (games copy VU0
-    // results out with toSPR, e.g. Drakengard's VU0 vertex pipeline reading 0x11004AE0).
-    uint8_t *mainBase = m_rdram;
-    uint32_t mainOffset = 0u;
-    uint32_t vuLimit = 0u;
-    if (uint8_t *vuMemory = mapVuMemory(originalMadr, byteCount, mainOffset, vuLimit))
+    // Moves qwc quadwords between MADR-style address `madr` and the scratchpad at scratchOffset.
+    // MADR addresses main RAM or, through the 0x11000000 window, VU micro/data memory (games copy
+    // VU0 results out with toSPR, e.g. Drakengard's VU0 vertex pipeline reading 0x11004AE0).
+    auto transfer = [&](uint32_t madr, uint32_t qwc) -> bool
     {
-        mainBase = vuMemory;
-    }
-    else
-    {
-        try
+        const uint32_t byteCount = qwc * 16u;
+        madr &= 0x7FFFFFF0u;
+        uint8_t *mainBase = m_rdram;
+        uint32_t mainOffset = 0u;
+        uint32_t vuLimit = 0u;
+        if (uint8_t *vuMemory = mapVuMemory(madr, byteCount, mainOffset, vuLimit))
         {
-            mainOffset = translateAddress(originalMadr);
-        }
-        catch (const std::exception &)
-        {
-            return false;
-        }
-
-        if (mainOffset > PS2_RAM_SIZE || byteCount > PS2_RAM_SIZE - mainOffset)
-            return false;
-    }
-
-    const bool fromScratchpad = channelBase == kSprFromChannel;
-    if (fromScratchpad && mainBase == m_vu0Code)
-        markVU0CodeModified();
-    else if (fromScratchpad && mainBase == m_vu1Code)
-        markVU1CodeModified();
-    uint32_t scratchOffset = originalSadr;
-    uint32_t bytesLeft = byteCount;
-    uint32_t copied = 0u;
-    while (bytesLeft != 0u)
-    {
-        const uint32_t scratchChunk = PS2_SCRATCHPAD_SIZE - scratchOffset;
-        const uint32_t chunk = std::min(bytesLeft, scratchChunk);
-        if (fromScratchpad)
-        {
-            std::memcpy(mainBase + mainOffset + copied, m_scratchpad + scratchOffset, chunk);
-            if (mainBase == m_rdram)
-                markModified(mainOffset + copied, chunk);
+            mainBase = vuMemory;
         }
         else
         {
-            std::memcpy(m_scratchpad + scratchOffset, mainBase + mainOffset + copied, chunk);
+            try
+            {
+                mainOffset = translateAddress(madr);
+            }
+            catch (const std::exception &)
+            {
+                return false;
+            }
+            if (mainOffset > PS2_RAM_SIZE || byteCount > PS2_RAM_SIZE - mainOffset)
+                return false;
         }
 
-        copied += chunk;
-        bytesLeft -= chunk;
-        scratchOffset = (scratchOffset + chunk) & (PS2_SCRATCHPAD_SIZE - 1u);
+        if (fromScratchpad && mainBase == m_vu0Code)
+            markVU0CodeModified();
+        else if (fromScratchpad && mainBase == m_vu1Code)
+            markVU1CodeModified();
+        uint32_t bytesLeft = byteCount;
+        uint32_t copied = 0u;
+        while (bytesLeft != 0u)
+        {
+            const uint32_t scratchChunk = PS2_SCRATCHPAD_SIZE - scratchOffset;
+            const uint32_t chunk = std::min(bytesLeft, scratchChunk);
+            if (fromScratchpad)
+            {
+                std::memcpy(mainBase + mainOffset + copied, m_scratchpad + scratchOffset, chunk);
+                if (mainBase == m_rdram)
+                    markModified(mainOffset + copied, chunk);
+            }
+            else
+            {
+                std::memcpy(m_scratchpad + scratchOffset, mainBase + mainOffset + copied, chunk);
+            }
+
+            copied += chunk;
+            bytesLeft -= chunk;
+            scratchOffset = (scratchOffset + chunk) & (PS2_SCRATCHPAD_SIZE - 1u);
+        }
+        return true;
+    };
+
+    if (mode == 0u)
+    {
+        const uint32_t qwc = m_ioRegisters[channelBase + 0x20u] & 0xFFFFu;
+        const uint32_t madr = m_ioRegisters[channelBase + 0x10u] & 0x7FFFFFF0u;
+        if (!transfer(madr, qwc))
+            return false;
+        m_ioRegisters[channelBase + 0x10u] = (madr + qwc * 16u) & 0x7FFFFFF0u;
+    }
+    else if (fromScratchpad)
+    {
+        // Destination chain: cnts/cnt tags move QWC quadwords to ADDR and continue, end stops.
+        const bool tagInterrupts = (chcr & (1u << 7u)) != 0u; // TIE
+        uint32_t madr = m_ioRegisters[channelBase + 0x10u];
+        bool done = false;
+        for (uint32_t step = 0u; !done; ++step)
+        {
+            if (step >= 0x10000u)
+                return false; // runaway chain
+            uint64_t rawTag = 0u;
+            std::memcpy(&rawTag, m_scratchpad + scratchOffset, sizeof(rawTag));
+            scratchOffset = (scratchOffset + 16u) & (PS2_SCRATCHPAD_SIZE - 1u);
+            const DmaTagView tag = decodeDmaTag(rawTag);
+            madr = tag.addr;
+            if (!transfer(madr, tag.qwc))
+                return false;
+            madr += tag.qwc * 16u;
+            done = tag.id == 7u || (tag.irq && tagInterrupts);
+        }
+        m_ioRegisters[channelBase + 0x10u] = madr & 0x7FFFFFF0u;
+    }
+    else
+    {
+        // Source chain: DMAtags in main memory at TADR; ASR0/ASR1 hold call return addresses.
+        const bool transferTags = (chcr & (1u << 6u)) != 0u; // TTE
+        const bool tagInterrupts = (chcr & (1u << 7u)) != 0u; // TIE
+        uint32_t tadr = m_ioRegisters[channelBase + 0x30u] & 0x7FFFFFF0u;
+        uint32_t asr[2] = {m_ioRegisters[channelBase + 0x40u], m_ioRegisters[channelBase + 0x50u]};
+        uint32_t callDepth = (chcr >> 4u) & 0x3u;
+        uint32_t madr = m_ioRegisters[channelBase + 0x10u];
+        bool done = false;
+        for (uint32_t step = 0u; !done; ++step)
+        {
+            if (step >= 0x10000u)
+                return false; // runaway chain
+            uint32_t tagOffset = 0u;
+            try
+            {
+                tagOffset = translateAddress(tadr);
+            }
+            catch (const std::exception &)
+            {
+                return false;
+            }
+            if (tagOffset > PS2_RAM_SIZE - 16u)
+                return false;
+            uint64_t rawTag = 0u;
+            std::memcpy(&rawTag, m_rdram + tagOffset, sizeof(rawTag));
+            const DmaTagView tag = decodeDmaTag(rawTag);
+
+            if (transferTags && !transfer(tadr, 1u))
+                return false;
+
+            const uint32_t following = tadr + 16u;
+            uint32_t next = 0u;
+            switch (tag.id)
+            {
+            case 0u: // refe
+                madr = tag.addr;
+                done = true;
+                break;
+            case 1u: // cnt
+                madr = following;
+                next = following + tag.qwc * 16u;
+                break;
+            case 2u: // next
+                madr = following;
+                next = tag.addr;
+                break;
+            case 3u: // ref
+            case 4u: // refs
+                madr = tag.addr;
+                next = following;
+                break;
+            case 5u: // call
+                madr = following;
+                if (callDepth >= 2u)
+                    return false;
+                asr[callDepth++] = following + tag.qwc * 16u;
+                next = tag.addr;
+                break;
+            case 6u: // ret
+                madr = following;
+                if (callDepth == 0u)
+                    done = true;
+                else
+                    next = asr[--callDepth];
+                break;
+            default: // end
+                madr = following;
+                done = true;
+                break;
+            }
+
+            if (!transfer(madr, tag.qwc))
+                return false;
+            madr += tag.qwc * 16u;
+            if (tag.irq && tagInterrupts)
+                done = true;
+            if (!done)
+                tadr = next;
+        }
+        m_ioRegisters[channelBase + 0x10u] = madr & 0x7FFFFFF0u;
+        m_ioRegisters[channelBase + 0x30u] = tadr;
+        m_ioRegisters[channelBase + 0x40u] = asr[0];
+        m_ioRegisters[channelBase + 0x50u] = asr[1];
     }
 
-    m_ioRegisters[channelBase + 0x10u] = (originalMadr + byteCount) & 0x7FFFFFF0u;
     m_ioRegisters[channelBase + 0x20u] = 0u;
-    m_ioRegisters[channelBase + 0x80u] = (originalSadr + byteCount) & 0x3FF0u;
+    m_ioRegisters[channelBase + 0x80u] = scratchOffset & 0x3FF0u;
     completeDmacChannel(channelBase, fromScratchpad ? 8u : 9u);
     return true;
 }
