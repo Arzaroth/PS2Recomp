@@ -3204,7 +3204,9 @@ void GSCpuBackend::DumpUpdateUnlocked()
         std::fclose(f);
     }
     m_dumpLog = std::fopen((m_dumpDir + "/prims.txt").c_str(), "w");
-    m_dumpRemaining = 4000u;
+    const char *prims = std::getenv("PS2X_GS_DUMP_PRIMS");
+    m_dumpTotal = prims && *prims ? std::max(1, std::atoi(prims)) : 4000u;
+    m_dumpRemaining = m_dumpTotal;
     m_dumpState = 2u;
 }
 
@@ -3228,7 +3230,12 @@ void GSCpuBackend::DumpPrimitiveUnlocked(const GSPrimitiveBatch &batch)
     // target and texture), to see the frame being composed.
     const uint64_t group = (static_cast<uint64_t>(ctx.frame.fbp) << 40u) ^ (static_cast<uint64_t>(state.prim.tme ? tex.tbp0 + 1u : 0u) << 8u) ^
                            (static_cast<uint64_t>(ctx.alpha & 0xFFu)) ^ (static_cast<uint64_t>(state.prim.abe) << 63u);
-    if (m_dumpPresents == 1u && m_dumpGroupValid && group != m_dumpGroup)
+    static const uint32_t snapPresents = []
+    {
+        const char *value = std::getenv("PS2X_GS_DUMP_SNAP_PRESENTS");
+        return value && *value ? static_cast<uint32_t>(std::max(1, std::atoi(value))) : 1u;
+    }();
+    if (m_dumpPresents >= 1u && m_dumpPresents <= snapPresents && m_dumpGroupValid && group != m_dumpGroup)
     {
         const GSFrameReg &frame = m_dumpGroupFrame;
         const uint32_t width = std::min<uint32_t>(m_dumpGroupScissorX1 + 1u, 1024u);
@@ -3297,7 +3304,7 @@ void GSCpuBackend::DumpPrimitiveUnlocked(const GSPrimitiveBatch &batch)
     DumpLog("PRIM #%u type=%u iip=%u tme=%u fge=%u abe=%u fst=%u ctxt=%u frame=(fbp=%u fbw=%u psm=0x%x msk=%08x) zbuf=(zbp=%u psm=0x%x zmsk=%u) "
             "scissor=%u,%u-%u,%u test=0x%llx alpha=0x%llx fba=%u pabe=%u tex%d=(tbp0=%u tbw=%u psm=0x%x tw=%u th=%u tcc=%u tfx=%u cbp=%u cpsm=0x%x csm=%u csa=%u) "
             "lin=%u clamp=0x%llx texa=%u/%u/%u%s",
-            4000u - m_dumpRemaining, unsigned(state.prim.type), unsigned(state.prim.iip), unsigned(state.prim.tme), unsigned(state.prim.fge), unsigned(state.prim.abe),
+            m_dumpTotal - m_dumpRemaining, unsigned(state.prim.type), unsigned(state.prim.iip), unsigned(state.prim.tme), unsigned(state.prim.fge), unsigned(state.prim.abe),
             unsigned(state.prim.fst), unsigned(state.prim.ctxt), unsigned(ctx.frame.fbp), unsigned(ctx.frame.fbw), unsigned(ctx.frame.psm), unsigned(ctx.frame.fbmsk),
             unsigned(ctx.zbuf.zbp), unsigned(ctx.zbuf.psm), unsigned(ctx.zbuf.zmask), unsigned(ctx.scissor.x0), unsigned(ctx.scissor.y0), unsigned(ctx.scissor.x1),
             unsigned(ctx.scissor.y1), (unsigned long long)ctx.test, (unsigned long long)ctx.alpha, unsigned(ctx.fba & 1u), unsigned(state.pabe), textureIndex,

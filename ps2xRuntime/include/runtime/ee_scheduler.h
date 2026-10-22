@@ -107,6 +107,7 @@ struct GuestThread
     int id = 0;
     R5900Context context{};
     uint32_t entry = 0;
+    uint64_t cycles = 0;
     uint32_t stack = 0;
     uint32_t stackSize = 0;
     uint32_t gp = 0;
@@ -197,6 +198,7 @@ struct EeThreadSnapshot
     int suspendCount = 0;
     uint32_t wakeupCount = 0;
     uint32_t invocationDepth = 0;
+    uint64_t cycles = 0; // EE cycles accounted while this thread ran
 };
 
 struct EeSemaphoreSnapshot
@@ -222,6 +224,7 @@ struct EeKernelSnapshot
     uint64_t eeCycle = 0;
     uint64_t sliceEndCycle = 0;
     uint64_t nextEventCycle = 0;
+    uint64_t idleCycles = 0; // EE cycles skipped while no thread was ready
     int runningThreadId = 0;
     std::vector<EeThreadSnapshot> threads;
     std::vector<EeSemaphoreSnapshot> semaphores;
@@ -336,6 +339,9 @@ public:
     void dispatchIrq(bool dmac, uint32_t cause);
     void setVSyncFlag(uint32_t flagAddress, uint32_t tickAddress);
     [[nodiscard]] uint64_t currentVSyncTick() const noexcept;
+    // PS2X_EE_PROFILE=1: EE cycles accounted at each checkpoint, by the guest pc it resumes at
+    // (loop heads); returns and clears the counts gathered since the last call.
+    [[nodiscard]] std::vector<std::pair<uint32_t, uint64_t>> takeGuestProfile();
     // Vblanks per second (numerator / denominator): NTSC fields until the game resets the GS
     // in PAL mode (sceGsResetGraph), which switches to 50 Hz.
     struct FieldRate
@@ -439,6 +445,9 @@ private:
     bool m_insideInterrupt = false;
     uint32_t m_pendingEeTimerInterrupts = 0;
     uint64_t m_eeCycle = 0;
+    uint64_t m_idleCycles = 0;
+    std::mutex m_guestProfileMutex;
+    std::unordered_map<uint32_t, uint64_t> m_guestProfile;
     uint64_t m_iopEeCycles = 0; // EE cycles handed to the IOP (accounted ones plus vblank catch-up)
     uint64_t m_iopVblankEnd = 0; // IOP cycle at which the current vblank's frame ends
     FieldRate m_fieldRate = kNtscFieldRate;

@@ -915,13 +915,35 @@ namespace
     }
 }
 
-static void dumpRuntimeState(std::ostream &out, PS2Memory &memory, const PS2Runtime &runtime, const EeKernelSnapshot &ee,
+static void dumpRuntimeState(std::ostream &out, PS2Memory &memory, PS2Runtime &runtime, const EeKernelSnapshot &ee,
                              const ps2x::iop::DebugSnapshot &iop)
 {
     static constexpr const char *kStatus[] = {"run", "ready", "wait", "wait+susp", "susp", "dormant"};
     static constexpr const char *kWait[] = {"-", "sleep", "sema", "evflag", "vsync", "external", "mpeg"};
     std::ostringstream text;
-    text << "[state] ee cycle=" << ee.eeCycle << " running=" << ee.runningThreadId << '\n';
+    text << "[state] ee cycle=" << ee.eeCycle << " idle=" << ee.idleCycles << " running=" << ee.runningThreadId << '\n';
+    if (const auto profile = runtime.eeScheduler().takeGuestProfile(); !profile.empty())
+    {
+        uint64_t total = 0;
+        for (const auto &entry : profile)
+            total += entry.second;
+        static uint64_t lastCycle = 0;
+        text << "[state] ee profile covers " << (total * 100u / std::max<uint64_t>(ee.eeCycle - lastCycle, 1u)) << "% of "
+             << (ee.eeCycle - lastCycle) << " cycles\n";
+        lastCycle = ee.eeCycle;
+        text << "[state] ee profile (cycles by resume pc):";
+        for (size_t i = 0; i < profile.size() && i < 16u; ++i)
+            text << std::hex << " 0x" << profile[i].first << std::dec << '=' << (profile[i].second * 1000u / std::max<uint64_t>(total, 1u)) / 10.0 << '%';
+        text << '\n';
+    }
+    text << "[state] ee timers:" << std::hex;
+    for (uint32_t i = 0; i < 4u; ++i)
+    {
+        const uint32_t base = 0x10000000u + i * 0x800u;
+        text << " t" << i << "(mode=0x" << memory.readIORegister(base + 0x10u) << " count=0x" << memory.readIORegister(base)
+             << " comp=0x" << memory.readIORegister(base + 0x20u) << ')';
+    }
+    text << std::dec << '\n';
     const GSRegisters &gs = memory.gs();
     text << "[state] dma=" << memory.dmaStartCount() << " gif=" << memory.gifCopyCount()
          << " gsw=" << memory.gsWriteCount() << " vif=" << memory.vifWriteCount() << std::hex
@@ -933,7 +955,7 @@ static void dumpRuntimeState(std::ostream &out, PS2Memory &memory, const PS2Runt
         text << "[state]   thread " << thread.id << ' ' << kStatus[static_cast<size_t>(thread.status)]
              << " wait=" << kWait[static_cast<size_t>(thread.waitReason)] << ':' << thread.waitId
              << std::hex << " pc=0x" << thread.pc << " ra=0x" << thread.ra << " entry=0x" << thread.entry
-             << std::dec << " prio=" << thread.currentPriority << '\n';
+             << std::dec << " prio=" << thread.currentPriority << " cycles=" << thread.cycles << '\n';
     }
     for (const EeSemaphoreSnapshot &sema : ee.semaphores)
     {

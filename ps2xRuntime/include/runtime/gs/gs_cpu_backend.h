@@ -104,9 +104,10 @@ private:
     void DrawWith(const GSPrimitiveBatch &batch, const RasterContext &raster);
     void WorkerMain(uint32_t index);
 
-    // PS2X_GS_DUMP=<dir>, PS2X_GS_DUMP_AFTER=<seconds>: after that delay, the next 4000
+    // PS2X_GS_DUMP=<dir>, PS2X_GS_DUMP_AFTER=<seconds>: after that delay, the next 4000 (PS2X_GS_DUMP_PRIMS)
     // primitives are drawn immediately and logged with their state (prims.txt), each distinct
-    // texture decoded as sampled (tex_N_WxH.rgba), with VRAM before and after.
+    // texture decoded as sampled (tex_N_WxH.rgba), with VRAM before and after, and the render
+    // target after each group of primitives until the PS2X_GS_DUMP_SNAP_PRESENTS-th present (default 1).
     void DumpUpdateUnlocked();
     void DumpLog(const char *format, ...) const;
     void DumpPrimitiveUnlocked(const GSPrimitiveBatch &batch);
@@ -174,6 +175,7 @@ private:
     std::atomic<bool> m_stopWorkers{false};
     uint32_t m_dumpState = 0; // 0 unchecked, 1 armed, 2 done or disabled
     uint32_t m_dumpRemaining = 0;
+    uint32_t m_dumpTotal = 0;
     std::string m_dumpDir;
     std::chrono::steady_clock::time_point m_dumpStart{};
     FILE *m_dumpLog = nullptr;

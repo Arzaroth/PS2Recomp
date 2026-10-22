@@ -317,6 +317,7 @@ public:
     // EE cycles owed to timer busy-waits (see readIORegister): the scheduler accounts them so a
     // loop polling a timer faster than it ticks finishes in game time, not in host time.
     uint64_t takeTimerSpinCycles() noexcept { return m_timerSpinCycles.exchange(0u, std::memory_order_acq_rel); }
+    uint64_t pendingTimerSpinCycles() const noexcept { return m_timerSpinCycles.load(std::memory_order_acquire); }
     [[nodiscard]] uint64_t cyclesUntilNextEeTimerInterrupt() const noexcept;
     void resetEeTimers() noexcept;
 
