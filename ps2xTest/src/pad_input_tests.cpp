@@ -1,4 +1,5 @@
 #include "MiniTest.h"
+#include "runtime/ps2_pad.h"
 #include "ps2_stubs.h"
 #include "ps2_syscalls.h"
 #include "Stubs/Pad.h"
@@ -68,6 +69,16 @@ void register_pad_input_tests()
 {
     MiniTest::Case("PadInput", [](TestCase &tc)
                    {
+        tc.Run("PS2X_PAD_SCRIPT presses buttons at their times for their hold", [](TestCase &t)
+        {
+            const char *script = "2:SQUARE,5.5:START/300,5.5:CROSS";
+            t.Equals(static_cast<int>(ps2PadScriptButtonsAt(script, 1.9)), 0, "nothing before the first press");
+            t.Equals(static_cast<int>(ps2PadScriptButtonsAt(script, 2.2)), 0x8000, "SQUARE held for the default 500 ms");
+            t.Equals(static_cast<int>(ps2PadScriptButtonsAt(script, 2.6)), 0, "SQUARE released after 500 ms");
+            t.Equals(static_cast<int>(ps2PadScriptButtonsAt(script, 5.6)), 0x4008, "simultaneous presses combine");
+            t.Equals(static_cast<int>(ps2PadScriptButtonsAt(script, 5.9)), 0x4000, "START released after its 300 ms hold");
+        });
+
         tc.Run("scePadRead uses override state", [](TestCase &t)
                {
             std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0);
