@@ -1692,6 +1692,41 @@ void register_ps2_vu1_tests()
                       "FMAND on the commit cycle should observe the new MAC flags");
         });
 
+        tc.Run("VU1 FMAND sees the flag writer issued four cycles earlier past three newer writers", [](TestCase &t)
+        {
+            for (const uint32_t newer : {3u, 4u})
+            {
+                Vu1Fixture fx;
+                t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
+
+                writeVuInstructionPair(fx.code, 0u, 0u, makeVuUpper(0x28u, 0x8u, 2u, 1u, 3u));
+                for (uint32_t index = 1u; index <= newer; ++index)
+                    writeVuInstructionPair(fx.code, index * 8u, 0u, makeVuUpper(0x28u, 0x8u, 1u, 1u, 4u));
+                writeVuInstructionPair(fx.code, (newer + 1u) * 8u, makeVuFlagRegister(0x1Au, 4u, 5u),
+                                       kVuUpperNop | 0x40000000u);
+                writeVuInstructionPair(fx.code, (newer + 2u) * 8u, 0u, kVuUpperNop);
+
+                VU1Interpreter vu1;
+                vu1.state().vf[1][0] = 1.0f;
+                vu1.state().vf[2][0] = -1.0f;
+                vu1.state().vi[5] = 0xFFFF;
+
+                // The second run uses the decoded code of the first.
+                for (int run = 0; run < 2; ++run)
+                {
+                    vu1.state().vi[4] = 0x7;
+                    vu1.state().mac = 0xF;
+                    vu1.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem, 0u, 0u, 0u);
+
+                    if (newer == 3u)
+                        t.Equals(vu1.state().vi[4], 0x8, "FMAND should see the zero flag of the writer four pairs back");
+                    else
+                        t.Equals(vu1.state().vi[4], 0, "FMAND should see the newer writer once four of them issued");
+                    t.Equals(vu1.state().mac, 0u, "the last writer's MAC flags should be committed at the end");
+                }
+            }
+        });
+
         tc.Run("VU1 CLIP and FCGET share the four-cycle flag timeline", [](TestCase &t)
         {
             Vu1Fixture fx;
