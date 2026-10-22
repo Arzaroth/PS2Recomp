@@ -263,6 +263,7 @@ namespace ps2_syscalls
             uint32_t count = 0;
             uint64_t lastSeq = 0;
             uint32_t lastPc = 0;
+            SifRpcDebugEvent last{};
         };
         std::map<std::tuple<std::string, uint32_t, uint32_t, int32_t>, Row> rows;
         uint64_t nextSeq = 0;
@@ -279,6 +280,7 @@ namespace ps2_syscalls
                 {
                     row.lastSeq = event.seq;
                     row.lastPc = event.pc;
+                    row.last = event;
                 }
             }
         }
@@ -287,7 +289,12 @@ namespace ps2_syscalls
         {
             out << "[state]   " << std::get<0>(key) << std::hex << " sid=0x" << std::get<1>(key) << " rpc=0x"
                 << std::get<2>(key) << std::dec << " result=" << std::get<3>(key) << " x" << row.count
-                << " lastSeq=" << row.lastSeq << std::hex << " pc=0x" << row.lastPc << std::dec << '\n';
+                << " lastSeq=" << row.lastSeq << std::hex << " pc=0x" << row.lastPc << std::dec;
+            if (row.last.sendPreviewSize != 0u)
+                out << " send=[" << formatRpcTraceBytes(row.last.sendPreview, row.last.sendPreviewSize) << "]";
+            if (row.last.recvPreviewSize != 0u)
+                out << " recv=[" << formatRpcTraceBytes(row.last.recvPreview, row.last.recvPreviewSize) << "]";
+            out << '\n';
         }
     }
 

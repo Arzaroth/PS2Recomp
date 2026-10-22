@@ -317,8 +317,14 @@ namespace ps2_syscalls
         setReturnS32(ctx, result);
     }
 
+    namespace
+    {
+        void logPriorityCall(const char *name, R5900Context *ctx);
+    }
+
     void SuspendThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        logPriorityCall("SuspendThread", ctx);
         EeScheduler &ee = scheduler(rdram, ctx, runtime);
         const int result = ee.suspendThread(static_cast<int>(getRegU32(ctx, 4)), false);
         setReturnS32(ctx, result);
@@ -327,6 +333,7 @@ namespace ps2_syscalls
 
     void ResumeThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        logPriorityCall("ResumeThread", ctx);
         EeScheduler &ee = scheduler(rdram, ctx, runtime);
         const int result = ee.resumeThread(static_cast<int>(getRegU32(ctx, 4)), false);
         setReturnS32(ctx, result);
