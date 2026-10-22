@@ -28,11 +28,18 @@ namespace ps2_gif_path_stats
     {
         std::atomic<uint64_t> g_packets[4]{};
         std::atomic<uint64_t> g_bytes[4]{};
+        std::atomic<uint64_t> g_formats[4][4]{};
     }
 
-    void notePacket(GifPathId pathId, uint32_t sizeBytes)
+    void notePacket(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes)
     {
         const size_t index = static_cast<size_t>(pathId) & 3u;
+        if (data && sizeBytes >= 16u)
+        {
+            uint64_t tagLo = 0;
+            std::memcpy(&tagLo, data, sizeof(tagLo));
+            g_formats[index][(tagLo >> 58u) & 3u].fetch_add(1u, std::memory_order_relaxed);
+        }
         g_packets[index].fetch_add(1u, std::memory_order_relaxed);
         g_bytes[index].fetch_add(sizeBytes, std::memory_order_relaxed);
     }
@@ -40,6 +47,11 @@ namespace ps2_gif_path_stats
     uint64_t packets(GifPathId pathId)
     {
         return g_packets[static_cast<size_t>(pathId) & 3u].load(std::memory_order_relaxed);
+    }
+
+    uint64_t tagFormats(GifPathId pathId, uint32_t format)
+    {
+        return g_formats[static_cast<size_t>(pathId) & 3u][format & 3u].load(std::memory_order_relaxed);
     }
 
     uint64_t bytes(GifPathId pathId)
@@ -53,7 +65,7 @@ void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeByte
     if (!data || sizeBytes < 16 || !m_processFn)
         return;
 
-    ps2_gif_path_stats::notePacket(pathId, sizeBytes);
+    ps2_gif_path_stats::notePacket(pathId, data, sizeBytes);
     GifArbiterPacket pkt;
     pkt.pathId = pathId;
     pkt.path2DirectHl = (pathId == GifPathId::Path2) && path2DirectHl;

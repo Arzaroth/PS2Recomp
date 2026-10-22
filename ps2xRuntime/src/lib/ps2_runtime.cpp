@@ -928,6 +928,14 @@ static void dumpRuntimeState(std::ostream &out, PS2Memory &memory, const EeKerne
          << "B p2=" << ps2_gif_path_stats::packets(GifPathId::Path2) << '/' << ps2_gif_path_stats::bytes(GifPathId::Path2)
          << "B p3=" << ps2_gif_path_stats::packets(GifPathId::Path3) << '/' << ps2_gif_path_stats::bytes(GifPathId::Path3)
          << "B\n";
+    text << "[state] gif tag formats (packed/reglist/image/disabled):";
+    for (const GifPathId path : {GifPathId::Path1, GifPathId::Path2, GifPathId::Path3})
+    {
+        text << " p" << static_cast<int>(path) << '=';
+        for (uint32_t format = 0; format < 4u; ++format)
+            text << (format ? "/" : "") << ps2_gif_path_stats::tagFormats(path, format);
+    }
+    text << '\n';
     text << "[state] vif1 cmds:" << std::hex;
     for (uint32_t opcode = 0; opcode < 0x80u; ++opcode)
     {

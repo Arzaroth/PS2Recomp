@@ -7,9 +7,10 @@
 
 namespace ps2_gif_path_stats
 {
-    void notePacket(GifPathId pathId, uint32_t sizeBytes);
+    void notePacket(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes);
     uint64_t packets(GifPathId pathId);
     uint64_t bytes(GifPathId pathId);
+    uint64_t tagFormats(GifPathId pathId, uint32_t format);
 }
 
 #endif
