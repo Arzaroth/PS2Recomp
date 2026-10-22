@@ -54,9 +54,9 @@ public:
 private:
     bool m_asyncAllowed = true;
     void ResetUnlocked();
-    void LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &texclut);
+    void LoadClutInto(std::array<uint16_t, 512> &clut, GSMem::TexturePageCache &cache, const GSTex0Reg &tex0,
+                      const GSTexClutReg &texclut);
     uint32_t ReadVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const;
-    uint32_t ReadTextureVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y);
     void WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value);
 
     // Registers decoded once per primitive, and the slice of rows one thread rasterizes.
@@ -65,7 +65,6 @@ private:
     struct RasterContext;
     PixelPipeline MakePixelPipeline(const GSDrawState &state) const;
     TextureSampler MakeTextureSampler(const GSDrawState &state) const;
-    const std::array<uint16_t, 512> *ClutSnapshotUnlocked(uint64_t queueIndex);
 
     void DrawPrimitive(const GSPrimitiveBatch &batch);
     void DrawSprite(const GSPrimitiveBatch &batch, const RasterContext &raster);
@@ -137,11 +136,10 @@ private:
     std::array<WriteVramFunc, kPsmHandlerCount> m_writeVramFuncs{};
     std::array<uint16_t, 512> m_clut{};
     std::array<uint32_t, 2> m_clutCbp{};
-    // Copies of m_clut taken when it changed, one per run of queued primitives that sample it.
-    std::vector<std::array<uint16_t, 512>> m_clutSnapshots;
-    std::vector<uint64_t> m_clutSnapshotLastUse; // queue index + 1 of the slot's last user
-    uint32_t m_clutSnapshotSlot = 0;
-    bool m_clutSnapshotStale = true;
+    // With workers, CLUT loads are queued and each worker keeps its own copy ([1 + i] worker i,
+    // [0] unused), loaded in queue order; m_clut then only holds the CLUT from before they started.
+    std::vector<std::array<uint16_t, 512>> m_workerCluts;
+    std::vector<uint64_t> m_workerClutSerials;
     std::vector<GSMem::TexturePageCache> m_texturePageCaches; // [0] caller (CLUT loads), [1 + i] worker i
     std::vector<DecodedTextureCache> m_decodedCaches;           // same indexing, used by workers only
     uint64_t m_clutSerial = 1;                                  // bumped whenever m_clut changes

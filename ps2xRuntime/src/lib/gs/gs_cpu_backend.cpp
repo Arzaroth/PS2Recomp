@@ -8,6 +8,7 @@
 #include "ps2_log.h"
 #include <atomic>
 #include <algorithm>
+#include <bitset>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
@@ -571,7 +572,6 @@ namespace
     constexpr uint64_t kQueueSize = 4096u; // power of two
     constexpr uint32_t kVramBlocks = 16384u; // 4 MiB in 256-byte blocks
     constexpr size_t kMaxPendingWrites = 32u;
-    constexpr uint32_t kClutSnapshots = 256u;
     constexpr int kDecodedTileShift = 5; // 32x32 texel tiles
     constexpr size_t kDecodedTexturesPerWorker = 16u;
     constexpr int kDecodedMaxTexels = 1024 * 1024;
@@ -683,46 +683,93 @@ namespace
         lastRow = clampInt(static_cast<int>(maxY - ofy) + 1, ctx.scissor.y0, ctx.scissor.y1);
     }
 
-    // Texture rows a primitive can sample. Perspective-correct T/Q stays within the vertices'
-    // range while Q keeps one sign; wrapping or mixed signs mean the whole texture.
-    void textureRows(const GSPrimitiveBatch &batch, int &firstRow, int &lastRow)
+    // Framebuffer columns a primitive can touch (its bounding box within the scissor).
+    void primitiveColumns(const GSPrimitiveBatch &batch, int &firstColumn, int &lastColumn)
+    {
+        const auto &ctx = batch.state.context;
+        const float ofx = static_cast<float>(ctx.xyoffset.ofx >> 4);
+        const uint32_t count = std::min<uint32_t>(primitiveVertexCount(batch.state.prim.type), batch.vertexCount);
+        float minX = batch.vertices[0].x;
+        float maxX = minX;
+        for (uint32_t i = 1; i < count; ++i)
+        {
+            minX = std::min(minX, batch.vertices[i].x);
+            maxX = std::max(maxX, batch.vertices[i].x);
+        }
+        firstColumn = clampInt(static_cast<int>(minX - ofx) - 1, ctx.scissor.x0, ctx.scissor.x1);
+        lastColumn = clampInt(static_cast<int>(maxX - ofx) + 1, ctx.scissor.x0, ctx.scissor.x1);
+    }
+
+    // Texels a primitive can sample along one axis (U for columns, else V). Perspective-correct
+    // S/Q and T/Q stay within the vertices' range while Q keeps one sign; wrapping or mixed signs
+    // mean the whole texture.
+    void textureSpan(const GSPrimitiveBatch &batch, bool columns, int &first, int &last)
     {
         const GSDrawState &state = batch.state;
-        const int height = std::max<int>(state.textureHeight, 1);
-        firstRow = 0;
-        lastRow = height - 1;
+        const int size = std::max<int>(columns ? state.textureWidth : state.textureHeight, 1);
+        first = 0;
+        last = size - 1;
         const uint32_t count = std::min<uint32_t>(primitiveVertexCount(state.prim.type), batch.vertexCount);
-        float minV = 0.0f;
-        float maxV = 0.0f;
+        float minCoord = 0.0f;
+        float maxCoord = 0.0f;
         bool positiveQ = false;
         bool negativeQ = false;
         for (uint32_t i = 0; i < count; ++i)
         {
             const GSVertex &v = batch.vertices[i];
-            float row = 0.0f;
+            float coord = 0.0f;
             if (state.prim.fst)
             {
-                row = static_cast<float>(v.v) / 16.0f;
+                coord = static_cast<float>(columns ? v.u : v.v) / 16.0f;
             }
             else
             {
                 positiveQ |= v.q > 0.0f;
                 negativeQ |= v.q <= 0.0f;
-                row = (v.q != 0.0f ? v.t / v.q : 0.0f) * static_cast<float>(height);
+                coord = (v.q != 0.0f ? (columns ? v.s : v.t) / v.q : 0.0f) * static_cast<float>(size);
             }
-            minV = i == 0 ? row : std::min(minV, row);
-            maxV = i == 0 ? row : std::max(maxV, row);
+            minCoord = i == 0 ? coord : std::min(minCoord, coord);
+            maxCoord = i == 0 ? coord : std::max(maxCoord, coord);
         }
         if (!state.prim.fst && (negativeQ || !positiveQ))
             return;
-        const int low = static_cast<int>(minV) - 2; // bilinear taps and rounding
-        const int high = static_cast<int>(maxV) + 2;
-        const uint8_t wrapV = static_cast<uint8_t>((state.context.clamp >> 2) & 0x3u);
-        // REGION_CLAMP/REGION_REPEAT remap rows to the region; REPEAT wraps out-of-range rows.
-        if (wrapV >= 2u || (wrapV == 0u && (low < 0 || high >= height)))
+        const int low = static_cast<int>(minCoord) - 2; // bilinear taps and rounding
+        const int high = static_cast<int>(maxCoord) + 2;
+        const uint8_t wrap = static_cast<uint8_t>((state.context.clamp >> (columns ? 0 : 2)) & 0x3u);
+        // REGION_CLAMP/REGION_REPEAT remap texels to the region; REPEAT wraps out-of-range ones.
+        if (wrap >= 2u || (wrap == 0u && (low < 0 || high >= size)))
             return;
-        firstRow = std::max(low, 0);
-        lastRow = std::min(high, height - 1);
+        first = std::max(low, 0);
+        last = std::min(high, size - 1);
+    }
+
+    void textureRows(const GSPrimitiveBatch &batch, int &firstRow, int &lastRow)
+    {
+        textureSpan(batch, false, firstRow, lastRow);
+    }
+
+    constexpr uint32_t kVramPages = kVramBlocks / 32u;
+
+    // Marks the VRAM pages holding pixels [x0, x1] x [y0, y1] of a page-aligned buffer.
+    void markRectPages(std::bitset<kVramPages> &pages, uint32_t baseBlock, uint32_t width64, uint32_t psm,
+                       int x0, int x1, int y0, int y1)
+    {
+        uint32_t pageWidth = 0u;
+        uint32_t pageHeight = 0u;
+        pageGeometry(psm, pageWidth, pageHeight);
+        const uint32_t pagesPerRow = std::max(1u, (std::max(width64, 1u) * 64u + pageWidth - 1u) / pageWidth);
+        const uint32_t basePage = baseBlock / 32u;
+        for (uint32_t row = static_cast<uint32_t>(std::max(y0, 0)) / pageHeight; row <= static_cast<uint32_t>(std::max(y1, 0)) / pageHeight; ++row)
+            for (uint32_t column = static_cast<uint32_t>(std::max(x0, 0)) / pageWidth; column <= static_cast<uint32_t>(std::max(x1, 0)) / pageWidth; ++column)
+                pages.set((basePage + row * pagesPerRow + column) % kVramPages);
+    }
+
+    bool rectTouchesPages(const std::bitset<kVramPages> &pages, uint32_t baseBlock, uint32_t width64, uint32_t psm,
+                          int x0, int x1, int y0, int y1)
+    {
+        std::bitset<kVramPages> rect;
+        markRectPages(rect, baseBlock, width64, psm, x0, x1, y0, y1);
+        return (rect & pages).any();
     }
 
     bool blocksOverlap(std::pair<uint32_t, uint32_t> a, std::pair<uint32_t, uint32_t> b)
@@ -777,11 +824,28 @@ namespace
         return blocks;
     }
 
-    // Samples what it draws: the result depends on the order its pixels are written in.
-    bool readsOwnWrites(const PrimitiveBlocks &blocks)
+    // Samples what it draws: the result depends on the order its pixels are written in. The
+    // page-row ranges in blocks are a first filter; a texture beside the drawn rectangle in the
+    // same page rows (a movie frame next to the display buffer) does not count.
+    bool readsOwnWrites(const GSPrimitiveBatch &batch, const PrimitiveBlocks &blocks)
     {
-        return blocks.samples && (blocksOverlap(blocks.texture, blocks.frame) ||
-                                  (blocks.writesZ && blocksOverlap(blocks.texture, blocks.z)));
+        if (!blocks.samples || !(blocksOverlap(blocks.texture, blocks.frame) ||
+                                 (blocks.writesZ && blocksOverlap(blocks.texture, blocks.z))))
+            return false;
+        const auto &ctx = batch.state.context;
+        if ((ctx.tex0.tbp0 % 32u) != 0u)
+            return true; // not page aligned: its texels do not map to whole pages
+        int x0 = 0, x1 = 0, y0 = 0, y1 = 0;
+        primitiveColumns(batch, x0, x1);
+        primitiveRows(batch, y0, y1);
+        std::bitset<kVramPages> written;
+        markRectPages(written, GSInternal::framePageBaseToBlock(ctx.frame.fbp), ctx.frame.fbw, ctx.frame.psm, x0, x1, y0, y1);
+        if (blocks.writesZ)
+            markRectPages(written, GSInternal::framePageBaseToBlock(ctx.zbuf.zbp), ctx.frame.fbw, ctx.zbuf.psm, x0, x1, y0, y1);
+        int u0 = 0, u1 = 0, v0 = 0, v1 = 0;
+        textureSpan(batch, true, u0, u1);
+        textureSpan(batch, false, v0, v1);
+        return rectTouchesPages(written, ctx.tex0.tbp0, ctx.tex0.tbw, ctx.tex0.psm, u0, u1, v0, v1);
     }
 }
 
@@ -897,6 +961,9 @@ struct GSCpuBackend::QueuedPrimitive
     bool barrier = false;      // samples what earlier queued primitives draw: wait for them
     int64_t area = 0;          // bounding box pixels
     bool upload = false;       // host-to-local image data instead of a primitive
+    bool clutLoad = false;     // CLUT load instead of a primitive
+    GSTex0Reg clutTex0{};
+    GSTexClutReg clutTexclut{};
     GSTransferCommand transfer{};
     uint32_t uploadFirstPixel = 0;
     uint32_t uploadTotalPixels = 0;
@@ -1109,8 +1176,11 @@ void GSCpuBackend::Reset()
 void GSCpuBackend::ResetUnlocked()
 {
     m_clut.fill(0u);
-    m_clutSnapshotStale = true;
     ++m_clutSerial;
+    for (auto &clut : m_workerCluts)
+        clut.fill(0u);
+    for (uint64_t &serial : m_workerClutSerials)
+        ++serial;
     for (DecodedTextureCache &cache : m_decodedCaches)
         cache.Invalidate();
     m_clutCbp.fill(0u);
@@ -1246,52 +1316,42 @@ void GSCpuBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
         return;
     }
 
-    if (m_workerCount != 0u)
+    if (m_workerCount == 0u)
     {
-        // Queued primitives sample CLUT snapshots, so only the source rows matter.
-        const auto source = tex0.csm == 0u ? rowBlocks(tex0.cbp, 1u, tex0.cpsm, 0, 15)
-                                           : rowBlocks(tex0.cbp, texclut.cbw, tex0.cpsm, texclut.cov, texclut.cov);
-        if (overlapsAny(source, m_pendingWrites))
-            DrainUnlocked();
-        // Only CLUT loads use this cache while workers draw, so it would keep pages they have
-        // written since far longer than the immediate rasterizer's does.
-        if (m_callerCacheStale)
-        {
-            m_texturePageCaches[0].Invalidate();
-            m_callerCacheStale = false;
-        }
-        m_clutSnapshotStale = true;
+        ++m_clutSerial;
+        LoadClutInto(m_clut, m_texturePageCaches[0], tex0, texclut);
+        return;
     }
-    LoadClutUnlocked(tex0, texclut);
+
+    // Queued: each worker loads its own copy of the CLUT when it reaches this point, so the
+    // producer never waits. The source must hold what earlier items drew there (barrier), and
+    // later writes over it must wait for the load.
+    const auto source = tex0.csm == 0u ? rowBlocks(tex0.cbp, 1u, tex0.cpsm, 0, 15)
+                                       : rowBlocks(tex0.cbp, texclut.cbw, tex0.cpsm, texclut.cov, texclut.cov);
+    const bool barrier = m_barrierRequested || overlapsAny(source, m_pixelWritesSinceBarrier) ||
+                         overlapsAny(source, m_zWritesSinceBarrier);
+    if (barrier)
+    {
+        m_pixelWritesSinceBarrier.clear();
+        m_zWritesSinceBarrier.clear();
+        m_readsSinceBarrier.clear();
+        m_zOwnerKeys.clear();
+        m_barrierRequested = false;
+    }
+    QueuedPrimitive &item = ReserveQueueSlotUnlocked();
+    item.textureFlush = false;
+    item.upload = false;
+    item.clutLoad = true;
+    item.barrier = barrier;
+    item.clutTex0 = tex0;
+    item.clutTexclut = texclut;
+    NoteBarrierRange(m_readsSinceBarrier, source);
+    PublishQueueSlotUnlocked();
 }
 
-const std::array<uint16_t, 512> *GSCpuBackend::ClutSnapshotUnlocked(uint64_t queueIndex)
+void GSCpuBackend::LoadClutInto(std::array<uint16_t, 512> &clut, GSMem::TexturePageCache &cache, const GSTex0Reg &tex0,
+                                const GSTexClutReg &texclut)
 {
-    if (m_clutSnapshotStale || m_clutSnapshots.empty())
-    {
-        if (m_clutSnapshots.empty())
-        {
-            m_clutSnapshots.resize(kClutSnapshots);
-            m_clutSnapshotLastUse.assign(kClutSnapshots, 0u);
-        }
-        m_clutSnapshotSlot = (m_clutSnapshotSlot + 1u) % kClutSnapshots;
-        // The slot's previous users must be drawn before it is overwritten.
-        const uint64_t lastUse = m_clutSnapshotLastUse[m_clutSnapshotSlot];
-        for (uint32_t i = 0; i < m_workerCount; ++i)
-        {
-            while (m_workerProgress[i].done.load(std::memory_order_acquire) < lastUse)
-                cpuRelax();
-        }
-        m_clutSnapshots[m_clutSnapshotSlot] = m_clut;
-        m_clutSnapshotStale = false;
-    }
-    m_clutSnapshotLastUse[m_clutSnapshotSlot] = queueIndex + 1u;
-    return &m_clutSnapshots[m_clutSnapshotSlot];
-}
-
-void GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
-{
-    ++m_clutSerial;
     const bool fourBit = isFourBitIndexedPsm(tex0.psm);
     const bool sixteenBit = tex0.cpsm == GS_PSM_CT16 || tex0.cpsm == GS_PSM_CT16S;
     const bool thirtyTwoBit = tex0.cpsm == GS_PSM_CT32 || tex0.cpsm == GS_PSM_CT24;
@@ -1324,16 +1384,16 @@ void GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &t
             sourceY = static_cast<uint32_t>(texclut.cov);
         }
 
-        const uint32_t raw = ReadTextureVramUnlocked(tex0.cpsm, tex0.cbp, sourceWidth, sourceX, sourceY); 
+        const uint32_t raw = GSMem::ReadTexture(cache, m_vram, tex0.cpsm, tex0.cbp, sourceWidth, sourceX, sourceY);
         const uint32_t destination = (loadCsm1Suffix ? entry : destinationBase + entry) & (sixteenBit ? 0x1FFu : 0x0FFu);
         if (sixteenBit)
         {
-            m_clut[destination] = static_cast<uint16_t>(raw);
+            clut[destination] = static_cast<uint16_t>(raw);
         }
         else
         {
-            m_clut[destination] = static_cast<uint16_t>(raw & 0xFFFFu);
-            m_clut[destination + 256u] = static_cast<uint16_t>(raw >> 16u);
+            clut[destination] = static_cast<uint16_t>(raw & 0xFFFFu);
+            clut[destination + 256u] = static_cast<uint16_t>(raw >> 16u);
         }
     }
 }
@@ -1355,6 +1415,7 @@ void GSCpuBackend::TextureFlush()
     QueuedPrimitive &item = ReserveQueueSlotUnlocked();
     item.textureFlush = true;
     item.upload = false;
+    item.clutLoad = false;
     item.barrier = false;
     PublishQueueSlotUnlocked();
 }
@@ -1376,14 +1437,6 @@ uint32_t GSCpuBackend::ReadVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw
     if (!m_vram)
         return 0u;
     return m_readVramFuncs[psm & 0x3Fu](m_vram, base, bw, x, y);
-}
-
-uint32_t GSCpuBackend::ReadTextureVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y)
-{
-    if (!m_vram)
-        return 0u;
-
-    return GSMem::ReadTexture(m_texturePageCaches[0], m_vram, psm, base, bw, x, y);
 }
 
 void GSCpuBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
@@ -1560,13 +1613,24 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
     const PrimitiveBlocks blocks = primitiveBlocks(batch);
     // A primitive sampling what it draws is drawn here, in pixel order: split among workers,
     // which of its own pixels it samples would depend on their timing.
-    const bool feedback = readsOwnWrites(blocks);
+    const bool feedback = readsOwnWrites(batch, blocks);
     if (m_workerCount == 0u || m_dumpRemaining != 0u || feedback)
     {
-        if (m_workerCount != 0u)
-            DrainUnlocked();
         const PixelPipeline pixel = MakePixelPipeline(state);
-        const TextureSampler texture = MakeTextureSampler(state);
+        TextureSampler texture = MakeTextureSampler(state);
+        if (m_workerCount != 0u)
+        {
+            // Workers hold the current CLUT (all the same copy once drained), and wrote VRAM
+            // this cache may still hold.
+            DrainUnlocked();
+            texture.clut = &m_workerCluts[1];
+            texture.clutSerial = m_workerClutSerials[1];
+            if (m_callerCacheStale)
+            {
+                m_texturePageCaches[0].Invalidate();
+                m_callerCacheStale = false;
+            }
+        }
         DrawWith(batch, RasterContext{&pixel, &texture, &m_texturePageCaches[0], 0u, 1u});
         NoteDirectWrite(blocks.frame);
         if (blocks.writesZ)
@@ -1616,11 +1680,10 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
     QueuedPrimitive &item = ReserveQueueSlotUnlocked();
     item.batch = batch;
     item.pixel = MakePixelPipeline(state);
-    item.texture = MakeTextureSampler(state);
-    if (state.prim.tme && (isFourBitIndexedPsm(state.context.tex0.psm) || isEightBitIndexedPsm(state.context.tex0.psm)))
-        item.texture.clut = ClutSnapshotUnlocked(m_queueTail.load(std::memory_order_relaxed));
+    item.texture = MakeTextureSampler(state); // its CLUT is rebound to the worker's copy
     item.textureFlush = false;
     item.upload = false;
+    item.clutLoad = false;
     item.barrier = barrier;
     item.area = primitiveArea(batch);
     NotePendingRange(m_pendingWrites, blocks.frame);
@@ -1666,6 +1729,12 @@ void GSCpuBackend::DrawQueued(const QueuedPrimitive &item, uint32_t index)
         m_decodedCaches[index + 1u].Invalidate();
         return;
     }
+    if (item.clutLoad)
+    {
+        ++m_workerClutSerials[index + 1u];
+        LoadClutInto(m_workerCluts[index + 1u], m_texturePageCaches[index + 1u], item.clutTex0, item.clutTexclut);
+        return;
+    }
     if (item.upload)
     {
         const RasterContext rows{nullptr, nullptr, nullptr, index, m_workerCount};
@@ -1677,6 +1746,8 @@ void GSCpuBackend::DrawQueued(const QueuedPrimitive &item, uint32_t index)
     const GSDrawState &state = batch.state;
     TextureSampler texture = item.texture;
     texture.state = &state;
+    texture.clut = &m_workerCluts[index + 1u];
+    texture.clutSerial = m_workerClutSerials[index + 1u];
     if (state.prim.tme && item.area >= kDecodedMinPixels)
         texture.decoded = FindDecodedTexture(m_decodedCaches[index + 1u], texture);
     RasterContext raster{&item.pixel, &texture, &m_texturePageCaches[index + 1u], index, m_workerCount};
@@ -1736,6 +1807,8 @@ void GSCpuBackend::StartWorkersUnlocked()
     m_workerCount = std::clamp(hardware > 4u ? hardware - 4u : 1u, 1u, 8u);
     m_texturePageCaches.resize(m_workerCount + 1u);
     m_decodedCaches.resize(m_workerCount + 1u);
+    m_workerCluts.assign(m_workerCount + 1u, m_clut);
+    m_workerClutSerials.assign(m_workerCount + 1u, m_clutSerial);
     m_queue.resize(kQueueSize);
     m_workerProgress = std::make_unique<WorkerProgress[]>(m_workerCount);
     for (uint32_t i = 0; i < m_workerCount; ++i)
@@ -1779,7 +1852,12 @@ void GSCpuBackend::NotePendingRange(std::vector<std::pair<uint32_t, uint32_t>> &
         }
     }
     if (ranges.size() >= kMaxPendingWrites)
-        DrainUnlocked(); // clears both lists
+    {
+        // Too many ranges to track: count the whole of VRAM as pending, so the next CLUT load
+        // drains the queue (rather than stopping the producer here).
+        ranges.assign(1u, {0u, kVramBlocks});
+        return;
+    }
     ranges.push_back(range);
 }
 
@@ -2637,6 +2715,7 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
         QueuedPrimitive &item = ReserveQueueSlotUnlocked();
         item.textureFlush = false;
         item.upload = true;
+        item.clutLoad = false;
         item.barrier = barrier;
         item.area = 0;
         item.transfer = m_transfer;
@@ -2678,11 +2757,24 @@ uint32_t GSCpuBackend::WriteUploadPixels(const GSTransferCommand &transfer,
     uint32_t pixel = firstPixel;
     uint32_t offset = 0u;
 
+    // A block (8 pixels wide or more in every format) never straddles a page, so the owning
+    // worker only changes on a new row or every 8 pixels.
+    uint32_t ownerY = UINT32_MAX;
+    uint32_t ownerColumn = UINT32_MAX;
+    bool owned = true;
     auto put = [&](uint32_t index, uint32_t value)
     {
+        if (!write)
+            return;
         const uint32_t x = dsax + index % rrw;
         const uint32_t y = dsay + index / rrw;
-        if (write && (!rows || (GSMem::PageOf(dpsm, dbp, dbw, x, y) % rows->stripeCount) == rows->stripe))
+        if (rows && (y != ownerY || (x >> 3u) != ownerColumn))
+        {
+            ownerY = y;
+            ownerColumn = x >> 3u;
+            owned = (GSMem::PageOf(dpsm, dbp, dbw, x, y) % rows->stripeCount) == rows->stripe;
+        }
+        if (owned)
             WriteVramUnlocked(dpsm, dbp, dbw, x, y, value);
     };
 

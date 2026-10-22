@@ -1925,10 +1925,7 @@ void GS::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)
             m_backend->SnapshotVram(localMemory);
             const size_t bytes = std::min<size_t>(localMemory.size(), m_localMemorySize);
             if (bytes != 0u)
-            {
                 std::memcpy(m_localMemoryStorage, localMemory.data(), bytes);
-                GSMem::MarkAllPagesWritten();
-            }
         }
     }
 

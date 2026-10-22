@@ -1148,6 +1148,106 @@ void register_ps2_gs_tests()
             }
         });
 
+        tc.Run("asynchronous rasterization orders queued CLUT loads", [](TestCase &t)
+        {
+            // Palettes uploaded or drawn right before each CLUT load, then sampled by a large
+            // T8 sprite (decoded-texture path): workers load their CLUT copies in queue order.
+            constexpr uint32_t kTexTbp = 64u;   // page 2
+            constexpr uint32_t kClutCbp = 128u; // page 4
+            auto xyz = [](uint32_t x, uint32_t y)
+            {
+                return static_cast<uint64_t>(x << 4) | (static_cast<uint64_t>(y << 4) << 16);
+            };
+
+            auto drawFrames = [&](std::vector<uint8_t> &vram, bool async)
+            {
+                GSCpuBackend::SetAsyncRasterization(async);
+                for (uint32_t y = 0u; y < 16u; ++y)
+                    for (uint32_t x = 0u; x < 16u; ++x)
+                        vram[GSPSMT8::addrPSMT8(kTexTbp, 1u, x, y)] = static_cast<uint8_t>(x + y * 16u);
+
+                GS gs;
+                gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+                gs.writeRegister(GS_REG_ZBUF_1, 300ull | (1ull << 32));
+                gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
+                gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
+                gs.writeRegister(GS_REG_ALPHA_1, 0ull);
+                for (uint32_t frame = 0u; frame < 6u; ++frame)
+                {
+                    if ((frame & 1u) == 0u)
+                    {
+                        // Upload a 16x16 CT32 palette.
+                        gs.writeRegister(GS_REG_BITBLTBUF, (static_cast<uint64_t>(kClutCbp) << 32) | (1ull << 48) |
+                                                               (static_cast<uint64_t>(GS_PSM_CT32) << 56));
+                        gs.writeRegister(GS_REG_TRXPOS, 0ull);
+                        gs.writeRegister(GS_REG_TRXREG, 16ull | (16ull << 32));
+                        gs.writeRegister(GS_REG_TRXDIR, 0ull);
+                        std::vector<uint8_t> packet;
+                        appendU64(packet, makeGifTag(64u, GIF_FMT_IMAGE, 0u, true));
+                        appendU64(packet, 0ull);
+                        for (uint32_t i = 0u; i < 256u; ++i)
+                        {
+                            const uint32_t color = 0x80000000u | ((i * 7u + frame * 40u) & 0xFFu) |
+                                                   (((i * 3u) & 0xFFu) << 8) | (((frame * 50u) & 0xFFu) << 16);
+                            packet.insert(packet.end(), reinterpret_cast<const uint8_t *>(&color),
+                                          reinterpret_cast<const uint8_t *>(&color) + 4u);
+                        }
+                        gs.processGIFPacket(packet.data(), static_cast<uint32_t>(packet.size()));
+                    }
+                    else
+                    {
+                        // Draw the palette instead (a gradient over its 16 rows).
+                        gs.writeRegister(GS_REG_FRAME_1, (kClutCbp / 32u) | (1ull << 16) | (static_cast<uint64_t>(GS_PSM_CT32) << 24));
+                        gs.writeRegister(GS_REG_SCISSOR_1, (15ull << 16) | (15ull << 48));
+                        gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_TRIANGLE) | (1ull << 3));
+                        gs.writeRegister(GS_REG_RGBAQ, 0x80000000ull | (frame * 30u));
+                        gs.writeRegister(GS_REG_XYZ2, xyz(0u, 0u));
+                        gs.writeRegister(GS_REG_RGBAQ, 0x8000FF00ull);
+                        gs.writeRegister(GS_REG_XYZ2, xyz(16u, 0u));
+                        gs.writeRegister(GS_REG_RGBAQ, 0x80FF0000ull);
+                        gs.writeRegister(GS_REG_XYZ2, xyz(0u, 16u));
+                        gs.writeRegister(GS_REG_XYZ2, xyz(16u, 16u));
+                    }
+
+                    // Load the CLUT (CLD 1) and draw the T8 texture scaled up over 64x64 pixels. The
+                    // immediate rasterizer reads CLUTs through its texture page cache, which keeps
+                    // written pages hidden until TEXFLUSH.
+                    gs.writeRegister(GS_REG_TEXFLUSH, 0ull);
+                    gs.writeRegister(GS_REG_FRAME_1, 0ull | (1ull << 16) | (static_cast<uint64_t>(GS_PSM_CT32) << 24));
+                    gs.writeRegister(GS_REG_SCISSOR_1, (63ull << 16) | (63ull << 48));
+                    gs.writeRegister(GS_REG_TEX0_1, static_cast<uint64_t>(kTexTbp) | (1ull << 14) |
+                                                        (static_cast<uint64_t>(GS_PSM_T8) << 20) | (4ull << 26) | (4ull << 30) |
+                                                        (1ull << 34) | (static_cast<uint64_t>(kClutCbp) << 37) |
+                                                        (static_cast<uint64_t>(GS_PSM_CT32) << 51) | (1ull << 61));
+                    gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_SPRITE) | (1ull << 4) | (1ull << 8));
+                    gs.writeRegister(GS_REG_RGBAQ, 0x80808080ull);
+                    gs.writeRegister(GS_REG_UV, 0ull);
+                    gs.writeRegister(GS_REG_XYZ2, xyz(0u, 0u));
+                    gs.writeRegister(GS_REG_UV, (16ull << 4) | ((16ull << 4) << 16));
+                    gs.writeRegister(GS_REG_XYZ2, xyz(64u, 64u));
+                    // Keep this frame's picture: copy it aside before the next one overwrites it.
+                    gs.writeRegister(GS_REG_BITBLTBUF, 0ull | (1ull << 16) | (static_cast<uint64_t>(GS_PSM_CT32) << 24) |
+                                                           ((256ull + frame * 64ull) << 32) | (1ull << 48) |
+                                                           (static_cast<uint64_t>(GS_PSM_CT32) << 56));
+                    gs.writeRegister(GS_REG_TRXPOS, 0ull);
+                    gs.writeRegister(GS_REG_TRXREG, 64ull | (64ull << 32));
+                    gs.writeRegister(GS_REG_TRXDIR, 2ull);
+                }
+                const uint32_t corner = gs.ReadVram(GS_PSM_CT32, 0u, 1u, 63u, 63u);
+                GSCpuBackend::SetAsyncRasterization(false);
+                return corner;
+            };
+
+            std::vector<uint8_t> immediate(PS2_GS_VRAM_SIZE, 0u);
+            std::vector<uint8_t> async(PS2_GS_VRAM_SIZE, 0u);
+            const uint32_t immediateCorner = drawFrames(immediate, false);
+            const uint32_t asyncCorner = drawFrames(async, true);
+
+            t.IsTrue(immediateCorner != 0u, "the T8 sprite should cover the framebuffer");
+            t.Equals(asyncCorner, immediateCorner, "asynchronous drawing should use the same CLUT");
+            t.IsTrue(immediate == async, "worker threads should produce exactly the immediate rasterizer's VRAM");
+        });
+
         tc.Run("FBA forces the framebuffer alpha high bit on CT32 writes", [](TestCase &t)
         {
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
