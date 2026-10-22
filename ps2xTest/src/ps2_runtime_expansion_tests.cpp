@@ -345,6 +345,29 @@ void register_ps2_runtime_expansion_tests()
             }
         });
 
+        tc.Run("MMI variable word shifts use words 0 and 2 and sign-extend each result", [](TestCase &t)
+        {
+            const __m128i value = _mm_set_epi32(0x11111111, static_cast<int>(0x80000001u),
+                                                0x22222222, static_cast<int>(0xF0000000u));
+            const __m128i amount = _mm_set_epi32(0, 4, 0, 33);
+            int64_t out[2];
+
+            std::memcpy(out, &static_cast<const __m128i &>(PS2_PSRLVW(value, amount)), sizeof(out));
+            t.Equals(out[0], static_cast<int64_t>(0x78000000), "PSRLVW shifts word 0 by rs word 0 & 31");
+            t.Equals(out[1], static_cast<int64_t>(0x08000000), "PSRLVW shifts word 2 by rs word 2");
+
+            std::memcpy(out, &static_cast<const __m128i &>(PS2_PSRAVW(value, amount)), sizeof(out));
+            t.Equals(out[0], static_cast<int64_t>(static_cast<int32_t>(0xF8000000u)), "PSRAVW keeps the sign and sign-extends");
+            t.Equals(out[1], static_cast<int64_t>(static_cast<int32_t>(0xF8000000u)), "PSRAVW shifts word 2 arithmetically");
+
+            std::memcpy(out, &static_cast<const __m128i &>(PS2_PSLLVW(value, amount)), sizeof(out));
+            t.Equals(out[0], static_cast<int64_t>(static_cast<int32_t>(0xE0000000u)), "PSLLVW sign-extends the shifted word");
+            t.Equals(out[1], static_cast<int64_t>(0x10), "PSLLVW shifts word 2 by rs word 2");
+
+            std::memcpy(out, &static_cast<const __m128i &>(PS2_PSRLVW(_mm_set_epi32(0, 0, 0, 5), _mm_setzero_si128())), sizeof(out));
+            t.Equals(out[0], static_cast<int64_t>(5), "a zero shift returns the word itself");
+        });
+
         tc.Run("lookupFunction rejects internal resume PCs without exact registration", [](TestCase &t)
         {
             PS2Runtime runtime;

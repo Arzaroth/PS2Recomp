@@ -1266,6 +1266,40 @@ void register_code_generator_tests()
             }
         });
 
+        tc.Run("MMI variable word shifts take the value from rt and the amount from rs", [](TestCase &t) {
+            CodeGenerator gen({}, {});
+
+            struct ShiftCase
+            {
+                const char *helper;
+                uint8_t function;
+                uint8_t subfunction;
+            };
+
+            const std::vector<ShiftCase> cases = {
+                {"PS2_PSLLVW", MMI_MMI2, MMI2_PSLLVW},
+                {"PS2_PSRLVW", MMI_MMI2, MMI2_PSRLVW},
+                {"PS2_PSRAVW", MMI_MMI3, MMI3_PSRAVW},
+            };
+
+            for (const ShiftCase &item : cases)
+            {
+                Instruction inst{};
+                inst.isMMI = true;
+                inst.opcode = OPCODE_MMI;
+                inst.function = item.function;
+                inst.sa = item.subfunction;
+                inst.rd = 3;
+                inst.rs = 4;
+                inst.rt = 5;
+
+                const std::string out = gen.translateInstruction(inst);
+                const std::string expected = std::string(item.helper) + "(GPR_VEC(ctx, 5), GPR_VEC(ctx, 4))";
+                t.IsTrue(out.find(expected) != std::string::npos,
+                         std::string(item.helper) + " should shift rt by rs");
+            }
+        });
+
         tc.Run("VU0 macro mappings cover all S1/S2 enums", [](TestCase &t) {
             const std::vector<std::string> candidates = {
                 "ps2xRecomp/include/ps2recomp/instructions.h",
