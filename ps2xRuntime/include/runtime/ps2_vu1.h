@@ -202,6 +202,7 @@ private:
     std::array<ScalarPipelineEntry, 2> m_efu{};
     XgkickPipeline m_xgkick{};
     std::array<std::array<uint64_t, 4>, 32> m_vfReady{};
+    std::array<uint64_t, 32> m_vfReadyMax{};
     std::array<uint64_t, 16> m_viReady{};
     std::array<uint64_t, 4> m_accReady{};
 
@@ -239,6 +240,11 @@ private:
     uint64_t m_efuResourceReady = 0;
     uint32_t m_workingClip = 0;
     uint32_t m_currentUpperInstruction = 0;
+    const float *m_fmacVs = nullptr;
+    const float *m_fmacVt = nullptr;
+    const float *m_fmacAcc = nullptr;
+    float m_fmacQ = 0.0f;
+    float m_fmacI = 0.0f;
     int32_t m_viBranchBackupValue = 0;
     uint8_t m_viBranchBackupReg = 0;
     bool m_viBranchBackupValid = false;
@@ -270,11 +276,13 @@ private:
 
     void applyDest(float *dst, const float *result, uint8_t dest);
     void applyDestAcc(const float *result, uint8_t dest);
+    bool exactZeroLanes(int zeroComponents) const;
+    void applyFmacFlags(float *result, uint8_t dest);
     void applyFmacDest(float *dst, float *result, uint8_t dest);
     void applyFmacDestAcc(float *result, uint8_t dest);
     void normalizeFmacResult(float *result, uint8_t dest, uint8_t laneFlags[4]);
-    bool calculateFmacExactResult(uint32_t component, long double &result) const;
-    uint8_t normalizeFmacExactResult(float &value, long double exactResult) const;
+    bool calculateFmacExactResult(uint32_t component, double &result) const;
+    uint8_t normalizeFmacExactResult(float &value, double exactResult) const;
     uint32_t calculateFmacProductSticky(uint8_t dest) const;
     void updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest, uint32_t extraSticky);
     void queueFsset(uint16_t immediate);

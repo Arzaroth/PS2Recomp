@@ -107,6 +107,11 @@ void VU1Interpreter::execUpper(uint32_t instr)
     const float q = normalizeOperand(m_state.q);
     const float i = normalizeOperand(m_state.i);
     float result[4];
+    m_fmacVs = vs;
+    m_fmacVt = vt;
+    m_fmacAcc = acc;
+    m_fmacQ = q;
+    m_fmacI = i;
 
     // Upper opcode decoding (bits 5:0 of upper word)
     switch (op)

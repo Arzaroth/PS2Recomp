@@ -76,6 +76,7 @@ void VU1Interpreter::resetScheduler()
     m_efu = {};
     resetXgkick();
     m_vfReady = {};
+    m_vfReadyMax = {};
     m_viReady = {};
     m_accReady = {};
     m_efuResourceReady = 0;
@@ -213,7 +214,7 @@ void VU1Interpreter::normalizeFmacResult(float *result, uint8_t dest,
             continue;
         }
 
-        long double exactResult = 0.0L;
+        double exactResult = 0.0;
         if (calculateFmacExactResult(component, exactResult))
         {
             laneFlags[component] = normalizeFmacExactResult(result[component], exactResult);
@@ -227,35 +228,29 @@ void VU1Interpreter::normalizeFmacResult(float *result, uint8_t dest,
 }
 
 bool VU1Interpreter::calculateFmacExactResult(uint32_t component,
-                                               long double &result) const
+                                               double &result) const
 {
     const uint32_t upper = m_currentUpperInstruction;
     const uint8_t op = static_cast<uint8_t>(upper & 0x3Fu);
     const uint8_t special = op >= 0x3Cu
                                 ? static_cast<uint8_t>((upper & 3u) | ((upper >> 4) & 0x7Cu))
                                 : 0xFFu;
-    const uint8_t fs = FS(upper);
-    const uint8_t ft = FT(upper);
 
-    const auto operand = [this](float value)
+    const auto vs = [this](uint32_t lane)
     {
-        return static_cast<long double>(normalizeOperand(value));
+        return static_cast<double>(m_fmacVs[lane]);
     };
-    const auto vs = [&](uint32_t lane)
+    const auto vt = [this](uint32_t lane)
     {
-        return operand(m_state.vf[fs][lane]);
+        return static_cast<double>(m_fmacVt[lane]);
     };
-    const auto vt = [&](uint32_t lane)
+    const auto acc = [this](uint32_t lane)
     {
-        return operand(m_state.vf[ft][lane]);
-    };
-    const auto acc = [&](uint32_t lane)
-    {
-        return operand(m_state.acc[lane]);
+        return static_cast<double>(m_fmacAcc[lane]);
     };
 
-    const long double q = operand(m_state.q);
-    const long double i = operand(m_state.i);
+    const double q = m_fmacQ;
+    const double i = m_fmacI;
 
     if (op < 0x3Cu)
     {
@@ -264,9 +259,9 @@ bool VU1Interpreter::calculateFmacExactResult(uint32_t component,
         else if (op <= 0x07u)
             result = vs(component) - vt(op & 3u);
         else if (op <= 0x0Bu)
-            result = acc(component) + vs(component) * vt(op & 3u);
+            result = std::fma(vs(component), vt(op & 3u), acc(component));
         else if (op <= 0x0Fu)
-            result = acc(component) - vs(component) * vt(op & 3u);
+            result = std::fma(-vs(component), vt(op & 3u), acc(component));
         else if (op >= 0x18u && op <= 0x1Bu)
             result = vs(component) * vt(op & 3u);
         else
@@ -283,31 +278,31 @@ bool VU1Interpreter::calculateFmacExactResult(uint32_t component,
                 result = vs(component) + q;
                 break;
             case 0x21u:
-                result = acc(component) + vs(component) * q;
+                result = std::fma(vs(component), q, acc(component));
                 break;
             case 0x22u:
                 result = vs(component) + i;
                 break;
             case 0x23u:
-                result = acc(component) + vs(component) * i;
+                result = std::fma(vs(component), i, acc(component));
                 break;
             case 0x24u:
                 result = vs(component) - q;
                 break;
             case 0x25u:
-                result = acc(component) - vs(component) * q;
+                result = std::fma(-vs(component), q, acc(component));
                 break;
             case 0x26u:
                 result = vs(component) - i;
                 break;
             case 0x27u:
-                result = acc(component) - vs(component) * i;
+                result = std::fma(-vs(component), i, acc(component));
                 break;
             case 0x28u:
                 result = vs(component) + vt(component);
                 break;
             case 0x29u:
-                result = acc(component) + vs(component) * vt(component);
+                result = std::fma(vs(component), vt(component), acc(component));
                 break;
             case 0x2Au:
                 result = vs(component) * vt(component);
@@ -316,15 +311,15 @@ bool VU1Interpreter::calculateFmacExactResult(uint32_t component,
                 result = vs(component) - vt(component);
                 break;
             case 0x2Du:
-                result = acc(component) - vs(component) * vt(component);
+                result = std::fma(-vs(component), vt(component), acc(component));
                 break;
             case 0x2Eu:
             {
                 static constexpr uint8_t left[4] = {1u, 2u, 0u, 3u};
                 static constexpr uint8_t right[4] = {2u, 0u, 1u, 3u};
                 result = component == 3u
-                             ? 0.0L
-                             : acc(component) - vs(left[component]) * vt(right[component]);
+                             ? 0.0
+                             : std::fma(-vs(left[component]), vt(right[component]), acc(component));
                 break;
             }
             default:
@@ -339,9 +334,9 @@ bool VU1Interpreter::calculateFmacExactResult(uint32_t component,
     else if (special <= 0x07u)
         result = vs(component) - vt(special & 3u);
     else if (special <= 0x0Bu)
-        result = acc(component) + vs(component) * vt(special & 3u);
+        result = std::fma(vs(component), vt(special & 3u), acc(component));
     else if (special <= 0x0Fu)
-        result = acc(component) - vs(component) * vt(special & 3u);
+        result = std::fma(-vs(component), vt(special & 3u), acc(component));
     else if (special >= 0x18u && special <= 0x1Bu)
         result = vs(component) * vt(special & 3u);
     else
@@ -358,31 +353,31 @@ bool VU1Interpreter::calculateFmacExactResult(uint32_t component,
             result = vs(component) + q;
             break;
         case 0x21u:
-            result = acc(component) + vs(component) * q;
+            result = std::fma(vs(component), q, acc(component));
             break;
         case 0x22u:
             result = vs(component) + i;
             break;
         case 0x23u:
-            result = acc(component) + vs(component) * i;
+            result = std::fma(vs(component), i, acc(component));
             break;
         case 0x24u:
             result = vs(component) - q;
             break;
         case 0x25u:
-            result = acc(component) - vs(component) * q;
+            result = std::fma(-vs(component), q, acc(component));
             break;
         case 0x26u:
             result = vs(component) - i;
             break;
         case 0x27u:
-            result = acc(component) - vs(component) * i;
+            result = std::fma(-vs(component), i, acc(component));
             break;
         case 0x28u:
             result = vs(component) + vt(component);
             break;
         case 0x29u:
-            result = acc(component) + vs(component) * vt(component);
+            result = std::fma(vs(component), vt(component), acc(component));
             break;
         case 0x2Au:
             result = vs(component) * vt(component);
@@ -391,14 +386,14 @@ bool VU1Interpreter::calculateFmacExactResult(uint32_t component,
             result = vs(component) - vt(component);
             break;
         case 0x2Du:
-            result = acc(component) - vs(component) * vt(component);
+            result = std::fma(-vs(component), vt(component), acc(component));
             break;
         case 0x2Eu:
         {
             static constexpr uint8_t left[4] = {1u, 2u, 0u, 3u};
             static constexpr uint8_t right[4] = {2u, 0u, 1u, 3u};
             result = component == 3u
-                         ? 0.0L
+                         ? 0.0
                          : vs(left[component]) * vt(right[component]);
             break;
         }
@@ -410,12 +405,12 @@ bool VU1Interpreter::calculateFmacExactResult(uint32_t component,
 }
 
 uint8_t VU1Interpreter::normalizeFmacExactResult(float &value,
-                                                  long double exactResult) const
+                                                  double exactResult) const
 {
     const bool negative = std::signbit(exactResult);
-    const long double magnitude = std::fabs(exactResult);
-    const long double maximum = static_cast<long double>(std::numeric_limits<float>::max());
-    const long double minimum = static_cast<long double>(std::numeric_limits<float>::min());
+    const double magnitude = std::fabs(exactResult);
+    const double maximum = static_cast<double>(std::numeric_limits<float>::max());
+    const double minimum = static_cast<double>(std::numeric_limits<float>::min());
     uint8_t flags = negative ? 0x2u : 0u;
 
     uint32_t bits = negative ? 0x80000000u : 0u;
@@ -455,8 +450,47 @@ uint32_t VU1Interpreter::calculateFmacProductSticky(uint8_t dest) const
     if (!productSum)
         return 0u;
 
-    const uint8_t fs = FS(upper);
-    const uint8_t ft = FT(upper);
+    {
+        // Fast path: every product either has a zero factor (sticky Z) or an exponent far from the
+        // underflow and overflow ranges (sticky S only, from its sign).
+        static constexpr uint8_t crossLeft[4] = {1u, 2u, 0u, 3u};
+        static constexpr uint8_t crossRight[4] = {2u, 0u, 1u, 3u};
+        const bool broadcast = (op >= 0x08u && op <= 0x0Fu) || (special >= 0x08u && special <= 0x0Fu);
+        const bool qProduct = op == 0x21u || op == 0x25u || special == 0x21u || special == 0x25u;
+        const bool iProduct = op == 0x23u || op == 0x27u || special == 0x23u || special == 0x27u;
+        alignas(16) float left[4];
+        alignas(16) float right[4];
+        for (uint32_t component = 0; component < 4u; ++component)
+        {
+            left[component] = m_fmacVs[op == 0x2Eu ? crossLeft[component] : component];
+            right[component] = broadcast  ? m_fmacVt[(op >= 0x08u && op <= 0x0Fu ? op : special) & 3u]
+                               : qProduct ? m_fmacQ
+                               : iProduct ? m_fmacI
+                               : op == 0x2Eu ? m_fmacVt[crossRight[component]]
+                                             : m_fmacVt[component];
+        }
+        const __m128i leftBits = _mm_load_si128(reinterpret_cast<const __m128i *>(left));
+        const __m128i rightBits = _mm_load_si128(reinterpret_cast<const __m128i *>(right));
+        const __m128i leftExponent = _mm_srli_epi32(_mm_slli_epi32(leftBits, 1), 24);
+        const __m128i rightExponent = _mm_srli_epi32(_mm_slli_epi32(rightBits, 1), 24);
+        const __m128i zero = _mm_or_si128(_mm_cmpeq_epi32(leftExponent, _mm_setzero_si128()),
+                                          _mm_cmpeq_epi32(rightExponent, _mm_setzero_si128()));
+        const __m128i productExponent = _mm_sub_epi32(_mm_add_epi32(leftExponent, rightExponent), _mm_set1_epi32(127));
+        const __m128i ordinary = _mm_and_si128(_mm_cmpgt_epi32(productExponent, _mm_set1_epi32(1)),
+                                               _mm_cmplt_epi32(productExponent, _mm_set1_epi32(253)));
+        static constexpr uint8_t kReverse4[16] = {0x0, 0x8, 0x4, 0xC, 0x2, 0xA, 0x6, 0xE,
+                                                  0x1, 0x9, 0x5, 0xD, 0x3, 0xB, 0x7, 0xF};
+        const int components = kReverse4[dest & 0xFu];
+        const int zeroComponents = _mm_movemask_ps(_mm_castsi128_ps(zero)) & components;
+        const int ordinaryComponents = _mm_movemask_ps(_mm_castsi128_ps(ordinary)) & components;
+        if ((zeroComponents | ordinaryComponents) == components)
+        {
+            const int negative =
+                _mm_movemask_ps(_mm_castsi128_ps(_mm_xor_si128(leftBits, rightBits))) & components;
+            return (zeroComponents != 0 ? 0x1u : 0u) | (negative != 0 ? 0x2u : 0u);
+        }
+    }
+
     for (uint32_t component = 0; component < 4u; ++component)
     {
         if ((dest & laneForComponent(component)) == 0u)
@@ -464,27 +498,27 @@ uint32_t VU1Interpreter::calculateFmacProductSticky(uint8_t dest) const
         static constexpr uint8_t crossLeft[4] = {1u, 2u, 0u, 3u};
         static constexpr uint8_t crossRight[4] = {2u, 0u, 1u, 3u};
         const uint8_t leftComponent = op == 0x2Eu ? crossLeft[component] : static_cast<uint8_t>(component);
-        const float left = normalizeOperand(m_state.vf[fs][leftComponent]);
+        const float left = m_fmacVs[leftComponent];
         float right = 0.0f;
         if ((op >= 0x08u && op <= 0x0Fu) || (special >= 0x08u && special <= 0x0Fu))
         {
-            right = normalizeOperand(m_state.vf[ft][(op >= 0x08u && op <= 0x0Fu ? op : special) & 3u]);
+            right = m_fmacVt[(op >= 0x08u && op <= 0x0Fu ? op : special) & 3u];
         }
         else if (op == 0x21u || op == 0x25u || special == 0x21u || special == 0x25u)
         {
-            right = normalizeOperand(m_state.q);
+            right = m_fmacQ;
         }
         else if (op == 0x23u || op == 0x27u || special == 0x23u || special == 0x27u)
         {
-            right = normalizeOperand(m_state.i);
+            right = m_fmacI;
         }
         else if (op == 0x2Eu)
         {
-            right = normalizeOperand(m_state.vf[ft][crossRight[component]]);
+            right = m_fmacVt[crossRight[component]];
         }
         else
         {
-            right = normalizeOperand(m_state.vf[ft][component]);
+            right = m_fmacVt[component];
         }
 
         uint32_t leftBits = 0u, rightBits = 0u;
@@ -508,7 +542,7 @@ uint32_t VU1Interpreter::calculateFmacProductSticky(uint8_t dest) const
         }
 
         float product = left * right;
-        const long double exactProduct = static_cast<long double>(left) * static_cast<long double>(right);
+        const double exactProduct = static_cast<double>(left) * static_cast<double>(right);
         const uint8_t productFlags = normalizeFmacExactResult(product, exactProduct);
         // Product-sum instructions report Z/S/U/O from the add/subtract result
         // as current flags, while every product condition accumulates into the
@@ -554,19 +588,91 @@ void VU1Interpreter::updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest,
     entry->writesStatus = true;
 }
 
-void VU1Interpreter::applyFmacDest(float *dst, float *result, uint8_t dest)
+bool VU1Interpreter::exactZeroLanes(int zeroComponents) const
 {
+    // A +-0 result is exact (zero flag, sign from the result) for an add or subtract, where the PS2 sum only
+    // reaches zero by exact cancellation, and for a product with a zero factor, where any accumulator is
+    // added to an exact zero. Other zero results may hide an underflow and take the exact path.
+    if (zeroComponents == 0)
+        return true;
+    const uint32_t upper = m_currentUpperInstruction;
+    const uint8_t op = static_cast<uint8_t>(upper & 0x3Fu);
+    const uint8_t code = op >= 0x3Cu ? static_cast<uint8_t>((upper & 3u) | ((upper >> 4) & 0x7Cu)) : op;
+    if (code <= 0x07u || code == 0x20u || code == 0x22u || code == 0x24u || code == 0x26u || code == 0x28u ||
+        code == 0x2Cu)
+        return true;
+    const bool crossProduct = code == 0x2Eu;
+    const bool broadcastProduct = (code >= 0x08u && code <= 0x0Fu) || (code >= 0x18u && code <= 0x1Bu);
+    const bool qProduct = code == 0x1Cu || code == 0x21u || code == 0x25u;
+    const bool iProduct = code == 0x1Eu || code == 0x23u || code == 0x27u;
+    const bool laneProduct = code == 0x29u || code == 0x2Au || code == 0x2Du;
+    if (!crossProduct && !broadcastProduct && !qProduct && !iProduct && !laneProduct)
+        return false;
+    for (uint32_t component = 0; component < 4u; ++component)
+    {
+        if ((zeroComponents & (1 << component)) == 0)
+            continue;
+        static constexpr uint8_t crossLeft[4] = {1u, 2u, 0u, 3u};
+        static constexpr uint8_t crossRight[4] = {2u, 0u, 1u, 3u};
+        if (crossProduct && component == 3u)
+            return false;
+        const float left = m_fmacVs[crossProduct ? crossLeft[component] : component];
+        const float right = broadcastProduct ? m_fmacVt[code & 3u]
+                            : qProduct       ? m_fmacQ
+                            : iProduct       ? m_fmacI
+                            : crossProduct   ? m_fmacVt[crossRight[component]]
+                                             : m_fmacVt[component];
+        if (left != 0.0f && right != 0.0f)
+            return false;
+    }
+    return true;
+}
+
+void VU1Interpreter::applyFmacFlags(float *result, uint8_t dest)
+{
+    // Destination lanes in component order (bit 0 = x) and back: DEST and the MAC flag fields put x in bit 3.
+    static constexpr uint8_t kReverse4[16] = {0x0, 0x8, 0x4, 0xC, 0x2, 0xA, 0x6, 0xE,
+                                              0x1, 0x9, 0x5, 0xD, 0x3, 0xB, 0x7, 0xF};
+    const int components = kReverse4[dest & 0xFu];
+    if (components != 0)
+    {
+        // Results with exponent 2..253 raise only the sign flag (see normalizeFmacResult).
+        const __m128i bits = _mm_loadu_si128(reinterpret_cast<const __m128i *>(result));
+        const __m128i exponent = _mm_srli_epi32(_mm_and_si128(bits, _mm_set1_epi32(0x7F800000)), 23);
+        const __m128i ordinary = _mm_and_si128(_mm_cmpgt_epi32(exponent, _mm_set1_epi32(1)),
+                                               _mm_cmplt_epi32(exponent, _mm_set1_epi32(254)));
+        const int ordinaryComponents = _mm_movemask_ps(_mm_castsi128_ps(ordinary)) & components;
+        const int zeroComponents =
+            _mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(_mm_slli_epi32(bits, 1), _mm_setzero_si128()))) & components;
+        if ((ordinaryComponents | zeroComponents) == components && exactZeroLanes(zeroComponents))
+        {
+            const int negative = _mm_movemask_ps(_mm_castsi128_ps(bits)) & components;
+            const uint32_t extraSticky = calculateFmacProductSticky(dest);
+            if (FlagPipelineEntry *entry = pushFlagEntry(true, 0xFFFFFFFFu))
+            {
+                entry->mac = (static_cast<uint32_t>(kReverse4[negative]) << 4) | kReverse4[zeroComponents];
+                entry->status = (negative != 0 ? 0x2u : 0u) | (zeroComponents != 0 ? 0x1u : 0u);
+                entry->extraSticky = extraSticky;
+                entry->writesMac = true;
+                entry->writesStatus = true;
+            }
+            return;
+        }
+    }
     uint8_t laneFlags[4]{};
     normalizeFmacResult(result, dest, laneFlags);
     updateFmacFlags(laneFlags, dest, calculateFmacProductSticky(dest));
+}
+
+void VU1Interpreter::applyFmacDest(float *dst, float *result, uint8_t dest)
+{
+    applyFmacFlags(result, dest);
     applyDest(dst, result, dest);
 }
 
 void VU1Interpreter::applyFmacDestAcc(float *result, uint8_t dest)
 {
-    uint8_t laneFlags[4]{};
-    normalizeFmacResult(result, dest, laneFlags);
-    updateFmacFlags(laneFlags, dest, calculateFmacProductSticky(dest));
+    applyFmacFlags(result, dest);
     applyDestAcc(result, dest);
 }
 
@@ -893,15 +999,21 @@ uint64_t VU1Interpreter::calculatePairReadyCycle(const DecodedInstructionPair &d
         if (lanes & 0x1u)
             ready = std::max(ready, laneCycles[3]);
     };
-    for (const InstructionUsage *usage : {&decoded.upperUsage, &decoded.lowerUsage})
+    const auto vfReady = [&](const InstructionUsage &usage)
     {
-        for (uint32_t index = 0; index < usage->vfReadCount; ++index)
-            laneReady(m_vfReady[usage->vfRead[index].reg], usage->vfRead[index].lanes);
-        for (uint32_t mask = usage->viRead & 0xFFFEu; mask != 0u; mask &= mask - 1u)
-            ready = std::max(ready, m_viReady[static_cast<uint32_t>(_tzcnt_u32(mask))]);
-        if (usage->accRead != 0u)
-            laneReady(m_accReady, usage->accRead);
-    }
+        for (uint32_t index = 0; index < usage.vfReadCount; ++index)
+        {
+            const uint8_t reg = usage.vfRead[index].reg;
+            if (m_vfReadyMax[reg] > ready)
+                laneReady(m_vfReady[reg], usage.vfRead[index].lanes);
+        }
+    };
+    vfReady(decoded.upperUsage);
+    vfReady(decoded.lowerUsage);
+    for (uint32_t mask = (decoded.upperUsage.viRead | decoded.lowerUsage.viRead) & 0xFFFEu; mask != 0u; mask &= mask - 1u)
+        ready = std::max(ready, m_viReady[static_cast<uint32_t>(_tzcnt_u32(mask))]);
+    if (const uint8_t accRead = decoded.upperUsage.accRead | decoded.lowerUsage.accRead; accRead != 0u)
+        laneReady(m_accReady, accRead);
 
     if (decoded.lowerUsage.pipeline == PipelineFdiv && m_fdiv.valid)
         ready = std::max(ready, m_fdiv.readyCycle);
@@ -948,6 +1060,7 @@ void VU1Interpreter::markPairWrites(const DecodedInstructionPair &decoded)
                                      ? decoded.lowerUsage.vfLatency
                                      : decoded.lowerUsage.latency;
         setLanes(m_vfReady[lowerWrite.reg], lowerWrite.lanes, m_cycle + latency);
+        m_vfReadyMax[lowerWrite.reg] = std::max(m_vfReadyMax[lowerWrite.reg], m_cycle + latency);
         noteWriteback(m_cycle + latency);
     }
 
@@ -958,6 +1071,7 @@ void VU1Interpreter::markPairWrites(const DecodedInstructionPair &decoded)
                                      ? decoded.upperUsage.vfLatency
                                      : decoded.upperUsage.latency;
         setLanes(m_vfReady[upperWrite.reg], upperWrite.lanes, m_cycle + latency);
+        m_vfReadyMax[upperWrite.reg] = std::max(m_vfReadyMax[upperWrite.reg], m_cycle + latency);
         noteWriteback(m_cycle + latency);
     }
 
@@ -1594,12 +1708,28 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     m_logInFlight = maxCycles < (1u << 20);
     if (!m_logInFlight)
         m_inFlightCount = 0u;
+    // The decode cache stamp only changes when microcode is uploaded, which cannot happen during a run.
+    uint64_t decodeStamp = 0u;
+    if (m_cachedVuCode == vuCode && m_cachedMemory == memory && m_cachedCodeSize == codeSize)
+    {
+        if (memory == nullptr)
+            decodeStamp = m_externalCodeGeneration + 1u;
+        else if (m_unit == Unit::VU1 && vuCode == memory->getVU1Code())
+            decodeStamp = memory->getVU1CodeGeneration() + 1u;
+        else if (m_unit == Unit::VU0 && vuCode == memory->getVU0Code())
+            decodeStamp = memory->getVU0CodeGeneration() + 1u;
+    }
     while (m_cycle < budgetEnd && !m_stopRequested)
     {
         if (m_state.pc + 8u > codeSize)
             break;
 
-        const DecodedInstructionPair &decoded = getDecodedInstructionPairForPc(vuCode, codeSize, memory, m_state.pc);
+        const uint32_t pairIndex = m_state.pc / 8u;
+        const DecodedInstructionPair &decoded =
+            (decodeStamp != 0u && (m_state.pc & 7u) == 0u && pairIndex < kMaxDecodedPairs &&
+             m_decodedPairStamp[pairIndex] == decodeStamp)
+                ? m_decodedCodeCache[pairIndex]
+                : getDecodedInstructionPairForPc(vuCode, codeSize, memory, m_state.pc);
         if (decoded.upperUsage.reserved || decoded.lowerUsage.reserved)
         {
             reportReservedInstruction(decoded.upperUsage.reserved, decoded.upperUsage.reserved ? decoded.upper : decoded.lower);
