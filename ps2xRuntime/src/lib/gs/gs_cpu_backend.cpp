@@ -703,38 +703,103 @@ namespace
     // Texels a primitive can sample along one axis (U for columns, else V). Perspective-correct
     // S/Q and T/Q stay within the vertices' range while Q keeps one sign; wrapping or mixed signs
     // mean the whole texture.
+    // Texel coordinates (in texels, along one axis) a sprite samples at its first and last drawn
+    // pixel centers, as DrawSprite maps them. False when nothing is drawn.
+    bool spriteTexelCoords(const GSPrimitiveBatch &batch, bool columns, float &low, float &high)
+    {
+        const GSDrawState &state = batch.state;
+        const auto &ctx = state.context;
+        const GSVertex &v0 = batch.vertices[0];
+        const GSVertex &v1 = batch.vertices[1];
+        const int offset = (columns ? ctx.xyoffset.ofx : ctx.xyoffset.ofy) >> 4;
+        int p0 = static_cast<int>(columns ? v0.x : v0.y) - offset;
+        int p1 = static_cast<int>(columns ? v1.x : v1.y) - offset;
+        if (p0 > p1)
+            std::swap(p0, p1);
+        const int span = std::max(1, p1 - p0);
+        const int scissor0 = columns ? ctx.scissor.x0 : ctx.scissor.y0;
+        const int scissor1 = columns ? ctx.scissor.x1 : ctx.scissor.y1;
+        const int draw0 = clampInt(p0, scissor0, scissor1);
+        const int draw1 = clampInt(p0 + span - 1, scissor0, scissor1);
+        if (p0 + span - 1 < scissor0 || p0 > scissor1)
+            return false;
+        float c0 = 0.0f;
+        float c1 = 0.0f;
+        if (state.prim.fst)
+        {
+            c0 = static_cast<float>(columns ? v0.u : v0.v) / 16.0f;
+            c1 = static_cast<float>(columns ? v1.u : v1.v) / 16.0f;
+        }
+        else
+        {
+            const float size = static_cast<float>(columns ? state.textureWidth : state.textureHeight);
+            c0 = ((columns ? v0.s : v0.t) / fabsQ(v0.q)) * size;
+            c1 = ((columns ? v1.s : v1.t) / fabsQ(v1.q)) * size;
+        }
+        const float a = c0 + (c1 - c0) * ((static_cast<float>(draw0 - p0) + 0.5f) / static_cast<float>(span));
+        const float b = c0 + (c1 - c0) * ((static_cast<float>(draw1 - p0) + 0.5f) / static_cast<float>(span));
+        low = std::min(a, b);
+        high = std::max(a, b);
+        return true;
+    }
+
     void textureSpan(const GSPrimitiveBatch &batch, bool columns, int &first, int &last)
     {
         const GSDrawState &state = batch.state;
         const int size = std::max<int>(columns ? state.textureWidth : state.textureHeight, 1);
         first = 0;
         last = size - 1;
-        const uint32_t count = std::min<uint32_t>(primitiveVertexCount(state.prim.type), batch.vertexCount);
-        float minCoord = 0.0f;
-        float maxCoord = 0.0f;
-        bool positiveQ = false;
-        bool negativeQ = false;
-        for (uint32_t i = 0; i < count; ++i)
+        int low = 0;
+        int high = 0;
+        float spriteLow = 0.0f;
+        float spriteHigh = 0.0f;
+        if (state.prim.type == GS_PRIM_SPRITE && batch.vertexCount >= 2u &&
+            (state.prim.fst || (batch.vertices[0].q > 0.0f && batch.vertices[1].q > 0.0f)) &&
+            spriteTexelCoords(batch, columns, spriteLow, spriteHigh))
         {
-            const GSVertex &v = batch.vertices[i];
-            float coord = 0.0f;
-            if (state.prim.fst)
+            // Exact up to float rounding (a sixteenth of a texel, the UV step): the texels a
+            // point sample or the two bilinear taps read at those coordinates.
+            constexpr float kRounding = 1.0f / 16.0f;
+            if (state.linearFilter)
             {
-                coord = static_cast<float>(columns ? v.u : v.v) / 16.0f;
+                low = static_cast<int>(std::floor(spriteLow - 0.5f - kRounding));
+                high = static_cast<int>(std::floor(spriteHigh - 0.5f + kRounding)) + 1;
             }
             else
             {
-                positiveQ |= v.q > 0.0f;
-                negativeQ |= v.q <= 0.0f;
-                coord = (v.q != 0.0f ? (columns ? v.s : v.t) / v.q : 0.0f) * static_cast<float>(size);
+                low = static_cast<int>(std::floor(spriteLow - kRounding));
+                high = static_cast<int>(std::ceil(spriteHigh + kRounding)); // truncation, either sign
             }
-            minCoord = i == 0 ? coord : std::min(minCoord, coord);
-            maxCoord = i == 0 ? coord : std::max(maxCoord, coord);
         }
-        if (!state.prim.fst && (negativeQ || !positiveQ))
-            return;
-        const int low = static_cast<int>(minCoord) - 2; // bilinear taps and rounding
-        const int high = static_cast<int>(maxCoord) + 2;
+        else
+        {
+            const uint32_t count = std::min<uint32_t>(primitiveVertexCount(state.prim.type), batch.vertexCount);
+            float minCoord = 0.0f;
+            float maxCoord = 0.0f;
+            bool positiveQ = false;
+            bool negativeQ = false;
+            for (uint32_t i = 0; i < count; ++i)
+            {
+                const GSVertex &v = batch.vertices[i];
+                float coord = 0.0f;
+                if (state.prim.fst)
+                {
+                    coord = static_cast<float>(columns ? v.u : v.v) / 16.0f;
+                }
+                else
+                {
+                    positiveQ |= v.q > 0.0f;
+                    negativeQ |= v.q <= 0.0f;
+                    coord = (v.q != 0.0f ? (columns ? v.s : v.t) / v.q : 0.0f) * static_cast<float>(size);
+                }
+                minCoord = i == 0 ? coord : std::min(minCoord, coord);
+                maxCoord = i == 0 ? coord : std::max(maxCoord, coord);
+            }
+            if (!state.prim.fst && (negativeQ || !positiveQ))
+                return;
+            low = static_cast<int>(minCoord) - 2; // bilinear taps and rounding
+            high = static_cast<int>(maxCoord) + 2;
+        }
         const uint64_t clamp = state.context.clamp;
         const uint8_t wrap = static_cast<uint8_t>((clamp >> (columns ? 0 : 2)) & 0x3u);
         if (wrap == 2u)
