@@ -101,6 +101,8 @@ private:
     uint32_t WriteUploadPixels(const GSTransferCommand &transfer, uint32_t firstPixel, uint32_t totalPixels,
                                const uint8_t *data, uint32_t sizeBytes, const RasterContext *rows, bool write);
     QueuedPrimitive &ReserveQueueSlotUnlocked();
+    // A queued item not yet drawn by every worker writes (or, with includeReads, samples) the range.
+    bool OverlapsInFlightUnlocked(std::pair<uint32_t, uint32_t> range, bool includeReads) const;
     void PublishQueueSlotUnlocked();
     void DrawQueued(const QueuedPrimitive &item, uint32_t index);
     void DrawWith(const GSPrimitiveBatch &batch, const RasterContext &raster);

@@ -938,6 +938,11 @@ struct GSCpuBackend::QueuedPrimitive
     uint32_t uploadFirstPixel = 0;
     uint32_t uploadTotalPixels = 0;
     std::vector<uint8_t> uploadData;
+    // VRAM blocks it writes (frame or upload target, depth) and samples.
+    std::pair<uint32_t, uint32_t> writes[2]{};
+    uint8_t writeCount = 0;
+    std::pair<uint32_t, uint32_t> reads{};
+    bool samples = false;
 };
 
 // Texels converted to RGBA (TEXA and CLUT applied) in a linear array, filled by 32x32 tiles on
@@ -1289,7 +1294,7 @@ void GSCpuBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
         // Queued primitives sample CLUT snapshots, so only the source rows matter.
         const auto source = tex0.csm == 0u ? rowBlocks(tex0.cbp, 1u, tex0.cpsm, 0, 15)
                                            : rowBlocks(tex0.cbp, texclut.cbw, tex0.cpsm, texclut.cov, texclut.cov);
-        if (overlapsAny(source, m_pendingWrites))
+        if (OverlapsInFlightUnlocked(source, false))
             DrainUnlocked();
         // Only CLUT loads use this cache while workers draw, so it would keep pages they have
         // written since far longer than the immediate rasterizer's does.
@@ -1396,6 +1401,8 @@ void GSCpuBackend::TextureFlush()
     item.textureFlush = true;
     item.upload = false;
     item.barrier = false;
+    item.writeCount = 0u;
+    item.samples = false;
     PublishQueueSlotUnlocked();
 }
 
@@ -1683,6 +1690,11 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
     item.upload = false;
     item.barrier = barrier;
     item.area = primitiveArea(batch);
+    item.writes[0] = blocks.frame;
+    item.writes[1] = blocks.z;
+    item.writeCount = blocks.writesZ ? 2u : 1u;
+    item.reads = blocks.texture;
+    item.samples = blocks.samples;
     NotePendingRange(m_pendingWrites, blocks.frame);
     NoteBarrierRange(m_pixelWritesSinceBarrier, blocks.frame);
     if (blocks.writesZ)
@@ -1693,6 +1705,24 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
     if (blocks.samples)
         NoteBarrierRange(m_readsSinceBarrier, blocks.texture);
     PublishQueueSlotUnlocked();
+}
+
+bool GSCpuBackend::OverlapsInFlightUnlocked(std::pair<uint32_t, uint32_t> range, bool includeReads) const
+{
+    const uint64_t tail = m_queueTail.load(std::memory_order_relaxed);
+    uint64_t first = tail;
+    for (uint32_t i = 0; i < m_workerCount; ++i)
+        first = std::min(first, m_workerProgress[i].done.load(std::memory_order_acquire));
+    for (uint64_t index = first; index < tail; ++index)
+    {
+        const QueuedPrimitive &item = m_queue[index & (kQueueSize - 1u)];
+        for (uint8_t w = 0; w < item.writeCount; ++w)
+            if (blocksOverlap(range, item.writes[w]))
+                return true;
+        if (includeReads && item.samples && blocksOverlap(range, item.reads))
+            return true;
+    }
+    return false;
 }
 
 GSCpuBackend::QueuedPrimitive &GSCpuBackend::ReserveQueueSlotUnlocked()
@@ -2687,13 +2717,19 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
         DumpLog("UPLOAD dbp=%u dbw=%u dpsm=0x%x pos=%u,%u size=%ux%u first=%u bytes=%u", unsigned(m_transfer.bitbltbuf.dbp),
                 unsigned(m_transfer.bitbltbuf.dbw), unsigned(m_transfer.bitbltbuf.dpsm), unsigned(m_transfer.trxpos.dsax),
                 unsigned(m_transfer.trxpos.dsay), unsigned(m_transfer.trxreg.rrw), unsigned(m_transfer.trxreg.rrh), firstPixel, sizeBytes);
-    const bool direct = m_workerCount == 0u || m_dumpRemaining != 0u;
+    bool direct = m_workerCount == 0u || m_dumpRemaining != 0u;
     consumed = WriteUploadPixels(m_transfer, firstPixel, totalPixels, data, sizeBytes, nullptr, direct);
     const uint32_t rrw = m_transfer.trxreg.rrw;
     const int firstRow = static_cast<int>(m_transfer.trxpos.dsay + firstPixel / rrw);
     const int lastRow = static_cast<int>(m_transfer.trxpos.dsay + (firstPixel + std::max(consumed, 1u) - 1u) / rrw);
     const auto target = rowBlocks(m_transfer.bitbltbuf.dbp, m_transfer.bitbltbuf.dbw, m_transfer.bitbltbuf.dpsm,
                                   firstRow, std::min(lastRow, 2047));
+    if (!direct && !OverlapsInFlightUnlocked(target, true))
+    {
+        WriteUploadPixels(m_transfer, firstPixel, totalPixels, data, sizeBytes, nullptr, true);
+        m_callerCacheStale = true;
+        direct = true;
+    }
     if (direct)
     {
         NoteDirectWrite(target);
@@ -2723,6 +2759,9 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
         item.uploadFirstPixel = firstPixel;
         item.uploadTotalPixels = totalPixels;
         item.uploadData.assign(data, data + sizeBytes);
+        item.writes[0] = target;
+        item.writeCount = 1u;
+        item.samples = false;
         NotePendingRange(m_pendingWrites, target);
         NoteBarrierRange(m_pixelWritesSinceBarrier, target);
         PublishQueueSlotUnlocked();
