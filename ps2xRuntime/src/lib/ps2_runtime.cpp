@@ -1669,6 +1669,7 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
             << " s1=0x" << s1
             << " v0=0x" << v0
             << " v1=0x" << v1
+            << " trace=" << formatDispatchHistory()
             << " a0Readable=" << (a0Readable ? "yes" : "no")
             << " a0[0]=0x" << a0Word0
             << " a0[4]=0x" << a0Word4
@@ -1729,6 +1730,8 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
 {
     ctx->pc = targetPc;
     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
+    pushDispatchPc(sourcePc);
+    pushDispatchPc(targetPc);
     if (isCall)
         countGuestCall(targetPc, kind == GuestBranchKind::IndirectCall);
 
