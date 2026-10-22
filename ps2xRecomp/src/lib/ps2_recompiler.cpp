@@ -33,6 +33,24 @@ namespace ps2recomp
             return ((address + 4) & 0xF0000000u) | (target << 2);
         }
 
+        std::vector<Instruction>::const_iterator includeTrailingDelaySlot(
+            std::vector<Instruction>::const_iterator begin,
+            std::vector<Instruction>::const_iterator sliceEnd,
+            std::vector<Instruction>::const_iterator end)
+        {
+            if (sliceEnd == begin || sliceEnd == end)
+            {
+                return sliceEnd;
+            }
+
+            const Instruction &last = *std::prev(sliceEnd);
+            if (last.hasDelaySlot && sliceEnd->address == last.address + 4u)
+            {
+                return std::next(sliceEnd);
+            }
+            return sliceEnd;
+        }
+
         bool isReservedCxxIdentifier(const std::string &name)
         {
             if (name.size() >= 2 && name[0] == '_' && name[1] == '_')
@@ -549,6 +567,7 @@ namespace ps2recomp
                         {
                             continue;
                         }
+                        sliceEndIt = includeTrailingDelaySlot(sliceIt, sliceEndIt, containingInstructions.end());
 
                         std::vector<Instruction> slicedInstructions(sliceIt, sliceEndIt);
                         decodedFunctions[target] = std::move(slicedInstructions);
@@ -722,6 +741,7 @@ namespace ps2recomp
                 {
                     continue;
                 }
+                sliceEndIt = includeTrailingDelaySlot(sliceBeginIt, sliceEndIt, sourceInstructions->end());
 
                 std::vector<Instruction> slicedInstructions(sliceBeginIt, sliceEndIt);
                 bool changed = (function.end != sliceEndAddress);
@@ -2254,7 +2274,9 @@ namespace ps2recomp
         uint32_t start = function.start;
         uint32_t end = function.end;
 
-        for (uint32_t address = start; address < end; address += 4)
+        for (uint32_t address = start;
+             address < end || (address == end && !instructions.empty() && instructions.back().hasDelaySlot);
+             address += 4)
         {
             try
             {
