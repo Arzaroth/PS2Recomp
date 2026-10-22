@@ -686,12 +686,48 @@ namespace
 
     // Texture rows a primitive can sample. Perspective-correct T/Q stays within the vertices'
     // range while Q keeps one sign; wrapping or mixed signs mean the whole texture.
+    // Texel row DrawSprite samples for pixel row `y` of an fst sprite (its fixed-point UV and,
+    // when filtering, the upper bilinear tap).
+    int spriteTexelRow(const GSPrimitiveBatch &batch, int y, int unclippedY0, int spanY, bool linear)
+    {
+        const float v0f = static_cast<float>(batch.vertices[0].v) / 16.0f;
+        const float v1f = static_cast<float>(batch.vertices[1].v) / 16.0f;
+        const float ty = (static_cast<float>(y - unclippedY0) + 0.5f) / static_cast<float>(std::max(spanY, 1));
+        const float texVf = v0f + (v1f - v0f) * ty;
+        const int fixedV = clampInt(static_cast<int>((texVf * 16.0f) + 0.5f), 0, 0xFFFF);
+        const float sampleV = static_cast<float>(fixedV) / 16.0f;
+        return linear ? floorToInt(sampleV - 0.5f) : static_cast<int>(sampleV);
+    }
+
     void textureRows(const GSPrimitiveBatch &batch, int &firstRow, int &lastRow)
     {
         const GSDrawState &state = batch.state;
         const int height = std::max<int>(state.textureHeight, 1);
         firstRow = 0;
         lastRow = height - 1;
+        if (state.prim.type == GS_PRIM_SPRITE && state.prim.fst && batch.vertexCount >= 2u)
+        {
+            // Exact rows instead of the +-2 margin: a full-screen copy starting at row 0 would
+            // otherwise wrap (REPEAT) onto the whole texture height.
+            const float ofy = static_cast<float>(state.context.xyoffset.ofy) / 16.0f;
+            const float fy0 = std::min(batch.vertices[0].y, batch.vertices[1].y) - ofy;
+            const float fy1 = std::max(batch.vertices[0].y, batch.vertices[1].y) - ofy;
+            const int unclippedY0 = static_cast<int>(std::ceil(fy0));
+            const int unclippedY1 = std::max(unclippedY0, static_cast<int>(std::ceil(fy1)) - 1);
+            const int spanY = unclippedY1 - unclippedY0 + 1;
+            const bool linear = state.linearFilter;
+            const int a = spriteTexelRow(batch, unclippedY0, unclippedY0, spanY, linear);
+            const int b = spriteTexelRow(batch, unclippedY1, unclippedY0, spanY, linear);
+            const int low = std::min(a, b);
+            const int high = std::max(a, b) + (linear ? 1 : 0);
+            const uint8_t wrapV = static_cast<uint8_t>((state.context.clamp >> 2) & 0x3u);
+            if (wrapV < 2u && low >= 0 && high < height)
+            {
+                firstRow = low;
+                lastRow = high;
+            }
+            return;
+        }
         const uint32_t count = std::min<uint32_t>(primitiveVertexCount(state.prim.type), batch.vertexCount);
         float minV = 0.0f;
         float maxV = 0.0f;
@@ -921,6 +957,7 @@ struct GSCpuBackend::DecodedTexture
     GSTexaReg texa{};
     uint64_t lastUse = 0;
     uint32_t tilesPerRow = 0;
+    uint64_t writeClock = 0; // NoteDirectWrite clock its tiles are newer than (immediate drawing)
     bool valid = false;
     std::unique_ptr<uint32_t[]> texels; // not cleared: tiles are written before use
     size_t texelCapacity = 0;
@@ -1259,6 +1296,7 @@ void GSCpuBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
         if (m_callerCacheStale)
         {
             m_texturePageCaches[0].Invalidate();
+            m_decodedCaches[0].Invalidate();
             m_callerCacheStale = false;
         }
         m_clutSnapshotStale = true;
@@ -1348,6 +1386,7 @@ void GSCpuBackend::TextureFlush()
 {
     std::lock_guard<std::mutex> lock(m_mutex);
     m_texturePageCaches[0].Invalidate();
+    m_decodedCaches[0].Invalidate();
     if (m_dumpRemaining != 0u)
         DumpLog("TEXFLUSH");
     if (m_workerCount == 0u || m_dumpRemaining != 0u)
@@ -1567,7 +1606,27 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
         if (m_workerCount != 0u)
             DrainUnlocked();
         const PixelPipeline pixel = MakePixelPipeline(state);
-        const TextureSampler texture = MakeTextureSampler(state);
+        TextureSampler texture = MakeTextureSampler(state);
+        // Drawn in pixel order, a primitive sampling its own target must see its own writes.
+        if (!feedback && state.prim.tme && primitiveArea(batch) >= kDecodedMinPixels)
+        {
+            texture.decoded = FindDecodedTexture(m_decodedCaches[0], texture);
+            if (texture.decoded)
+            {
+                // Unlike the few pages of the page cache, a whole decoded texture would outlive
+                // writes made without a TEXFLUSH.
+                const auto &tex0 = state.context.tex0;
+                const auto pages = rowBlocks(tex0.tbp0, tex0.tbw, tex0.psm, 0, std::max(texture.texH, 1) - 1);
+                const uint32_t firstPage = pages.first / 32u;
+                const uint32_t count = std::min<uint32_t>((pages.first % 32u + pages.second + 31u) / 32u, kVramBlocks / 32u);
+                bool stale = false;
+                for (uint32_t i = 0; i < count && !stale; ++i)
+                    stale = m_pageWriteClock[(firstPage + i) % (kVramBlocks / 32u)] > texture.decoded->writeClock;
+                if (stale)
+                    std::fill(texture.decoded->tileReady.begin(), texture.decoded->tileReady.end(), 0u);
+                texture.decoded->writeClock = m_writeClock;
+            }
+        }
         DrawWith(batch, RasterContext{&pixel, &texture, &m_texturePageCaches[0], 0u, 1u});
         NoteDirectWrite(blocks.frame);
         if (blocks.writesZ)
@@ -1776,6 +1835,11 @@ void GSCpuBackend::DrainUnlocked() const
 
 void GSCpuBackend::NoteDirectWrite(std::pair<uint32_t, uint32_t> blocks)
 {
+    ++m_writeClock;
+    const uint32_t firstPage = blocks.first / 32u;
+    const uint32_t pages = std::min<uint32_t>((blocks.first % 32u + blocks.second + 31u) / 32u, kVramBlocks / 32u);
+    for (uint32_t i = 0; i < pages; ++i)
+        m_pageWriteClock[(firstPage + i) % (kVramBlocks / 32u)] = m_writeClock;
     if (m_workerCount != 0u)
         NoteBarrierRange(m_pixelWritesSinceBarrier, blocks);
 }

@@ -167,6 +167,9 @@ private:
     bool m_barrierRequested = false;
     // Queued items wrote VRAM since m_texturePageCaches[0] (CLUT loads) was last emptied.
     bool m_callerCacheStale = false;
+    // NoteDirectWrite clock of the last write to each 8 KiB VRAM page.
+    uint64_t m_writeClock = 0;
+    std::array<uint64_t, 512> m_pageWriteClock{};
     // Z buffers written since the last barrier, with the color-page layout that decided
     // which worker wrote each depth word.
     mutable std::vector<uint64_t> m_zOwnerKeys;
