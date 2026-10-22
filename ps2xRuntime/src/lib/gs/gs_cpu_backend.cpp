@@ -2241,26 +2241,25 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch, const RasterContext
     const GSVertex &v1 = batch.vertices[1];
     const auto &ctx = state.context;
 
-    int ofx = ctx.xyoffset.ofx >> 4;
-    int ofy = ctx.xyoffset.ofy >> 4;
-
-    int x0 = static_cast<int>(v0.x) - ofx;
-    int y0 = static_cast<int>(v0.y) - ofy;
-    int x1 = static_cast<int>(v1.x) - ofx;
-    int y1 = static_cast<int>(v1.y) - ofy;
+    float fx0 = v0.x - static_cast<float>(ctx.xyoffset.ofx) / 16.0f;
+    float fy0 = v0.y - static_cast<float>(ctx.xyoffset.ofy) / 16.0f;
+    float fx1 = v1.x - static_cast<float>(ctx.xyoffset.ofx) / 16.0f;
+    float fy1 = v1.y - static_cast<float>(ctx.xyoffset.ofy) / 16.0f;
     u32 z1 = static_cast<u32>(v1.z);
 
-    if (x0 > x1)
-        std::swap(x0, x1);
-    if (y0 > y1)
-        std::swap(y0, y1);
+    if (fx0 > fx1)
+        std::swap(fx0, fx1);
+    if (fy0 > fy1)
+        std::swap(fy0, fy1);
 
-    const int unclippedX0 = x0;
-    const int unclippedY0 = y0;
-    const int spanX = std::max(1, x1 - x0);
-    const int spanY = std::max(1, y1 - y0);
-    const int unclippedX1 = unclippedX0 + spanX - 1;
-    const int unclippedY1 = unclippedY0 + spanY - 1;
+    // The GS covers the pixels whose integer coordinates satisfy x0 <= x < x1 (and the same for
+    // y), so a sprite ending at 63.5 includes pixel 63.
+    const int unclippedX0 = static_cast<int>(std::ceil(fx0));
+    const int unclippedY0 = static_cast<int>(std::ceil(fy0));
+    const int unclippedX1 = std::max(unclippedX0, static_cast<int>(std::ceil(fx1)) - 1);
+    const int unclippedY1 = std::max(unclippedY0, static_cast<int>(std::ceil(fy1)) - 1);
+    const int spanX = unclippedX1 - unclippedX0 + 1;
+    const int spanY = unclippedY1 - unclippedY0 + 1;
 
     // If the sprite rectangle is fully outside scissor, nothing should render.
     if (unclippedX1 < ctx.scissor.x0 || unclippedX0 > ctx.scissor.x1 ||
