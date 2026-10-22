@@ -119,6 +119,7 @@ namespace
     thread_local bool t_onGsWorker = false;
     // Back-pressure: the EE waits once this much packet data is queued ahead of the GS thread.
     constexpr size_t kMaxQueuedBytes = 32u * 1024u * 1024u;
+    constexpr uint32_t kWorkerSpinIterations = 2000u;
 }
 
 GS::GS()
@@ -270,8 +271,11 @@ void GS::enqueue(QueuedCommand &&command)
     m_queueIdle.wait(lock, [this]() { return m_queuedBytes < kMaxQueuedBytes; });
     m_queuedBytes += command.bytes.size();
     m_queue.push_back(std::move(command));
+    m_queuedCommands.store(m_queue.size(), std::memory_order_release);
+    const bool wake = m_workerSleeping;
     lock.unlock();
-    m_queueReady.notify_one();
+    if (wake)
+        m_queueReady.notify_one();
 }
 
 void GS::workerLoop()
@@ -281,13 +285,20 @@ void GS::workerLoop()
     for (;;)
     {
         QueuedCommand command;
+        // Packets of a frame arrive back to back: wait a little before sleeping, so the EE rarely
+        // has to wake this thread.
+        for (uint32_t spin = 0; spin < kWorkerSpinIterations && m_queuedCommands.load(std::memory_order_acquire) == 0u; ++spin)
+            std::this_thread::yield();
         {
             std::unique_lock<std::mutex> lock(m_queueMutex);
+            m_workerSleeping = true;
             m_queueReady.wait(lock, [this]() { return m_stopWorker || !m_queue.empty(); });
+            m_workerSleeping = false;
             if (m_queue.empty())
                 return;
             command = std::move(m_queue.front());
             m_queue.pop_front();
+            m_queuedCommands.store(m_queue.size(), std::memory_order_release);
             m_workerBusy = true;
         }
 

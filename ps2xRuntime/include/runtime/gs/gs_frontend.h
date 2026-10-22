@@ -5,6 +5,7 @@
 #include <deque>
 #include <condition_variable>
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -241,6 +242,8 @@ private:
     uint64_t m_finishesDrawn = 0;
     LagStats m_lagStats;
     bool m_workerBusy = false;
+    bool m_workerSleeping = false;
+    std::atomic<size_t> m_queuedCommands{0};
     bool m_stopWorker = false;
 
     // PS2X_GS_SHADOW_CHECK=1: a second, synchronous GS without batched rasterization receives every
