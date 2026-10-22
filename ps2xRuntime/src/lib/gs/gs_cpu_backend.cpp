@@ -735,9 +735,19 @@ namespace
             return;
         const int low = static_cast<int>(minCoord) - 2; // bilinear taps and rounding
         const int high = static_cast<int>(maxCoord) + 2;
-        const uint8_t wrap = static_cast<uint8_t>((state.context.clamp >> (columns ? 0 : 2)) & 0x3u);
-        // REGION_CLAMP/REGION_REPEAT remap texels to the region; REPEAT wraps out-of-range ones.
-        if (wrap >= 2u || (wrap == 0u && (low < 0 || high >= size)))
+        const uint64_t clamp = state.context.clamp;
+        const uint8_t wrap = static_cast<uint8_t>((clamp >> (columns ? 0 : 2)) & 0x3u);
+        if (wrap == 2u)
+        {
+            // REGION_CLAMP clamps every texel coordinate into [min, max], a monotonic mapping.
+            const int regionMin = static_cast<int>((clamp >> (columns ? 4 : 24)) & 0x3FFu);
+            const int regionMax = static_cast<int>((clamp >> (columns ? 14 : 34)) & 0x3FFu);
+            first = std::min(std::max(low, regionMin), regionMax);
+            last = std::min(std::max(high, regionMin), regionMax);
+            return;
+        }
+        // REGION_REPEAT remaps texels into the region; REPEAT wraps out-of-range ones.
+        if (wrap == 3u || (wrap == 0u && (low < 0 || high >= size)))
             return;
         first = std::max(low, 0);
         last = std::min(high, size - 1);
@@ -846,6 +856,34 @@ namespace
         textureSpan(batch, true, u0, u1);
         textureSpan(batch, false, v0, v1);
         return rectTouchesPages(written, ctx.tex0.tbp0, ctx.tex0.tbw, ctx.tex0.psm, u0, u1, v0, v1);
+    }
+
+    // PS2X_GS_LOG_SERIAL=1: logs the first primitives drawn serially because they sample their own
+    // target, with the rectangles the check used.
+    void logSerialPrimitive(const GSPrimitiveBatch &batch)
+    {
+        static const bool enabled = []
+        {
+            const char *value = std::getenv("PS2X_GS_LOG_SERIAL");
+            return value && *value == '1';
+        }();
+        static uint32_t logged = 0u;
+        if (!enabled || logged >= 200u)
+            return;
+        ++logged;
+        const auto &ctx = batch.state.context;
+        int x0 = 0, x1 = 0, y0 = 0, y1 = 0, u0 = 0, u1 = 0, v0 = 0, v1 = 0;
+        primitiveColumns(batch, x0, x1);
+        primitiveRows(batch, y0, y1);
+        textureSpan(batch, true, u0, u1);
+        textureSpan(batch, false, v0, v1);
+        std::fprintf(stderr,
+                     "[gs-serial] type=%u fbp=%u fbw=%u fpsm=0x%x zbp=%u zmask=%u rect=(%d,%d)-(%d,%d) tbp0=%u tbw=%u tpsm=0x%x "
+                     "tex=%dx%d fst=%u clamp=0x%llx texels=(%d,%d)-(%d,%d)\n",
+                     unsigned(batch.state.prim.type), unsigned(ctx.frame.fbp), unsigned(ctx.frame.fbw), unsigned(ctx.frame.psm),
+                     unsigned(ctx.zbuf.zbp), unsigned(ctx.zbuf.zmask), x0, y0, x1, y1, unsigned(ctx.tex0.tbp0),
+                     unsigned(ctx.tex0.tbw), unsigned(ctx.tex0.psm), int(batch.state.textureWidth), int(batch.state.textureHeight),
+                     unsigned(batch.state.prim.fst), static_cast<unsigned long long>(ctx.clamp), u0, v0, u1, v1);
     }
 }
 
@@ -1613,7 +1651,9 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
     const PrimitiveBlocks blocks = primitiveBlocks(batch);
     // A primitive sampling what it draws is drawn here, in pixel order: split among workers,
     // which of its own pixels it samples would depend on their timing.
-    const bool feedback = readsOwnWrites(batch, blocks);
+    const bool feedback = m_workerCount != 0u && readsOwnWrites(batch, blocks);
+    if (feedback)
+        logSerialPrimitive(batch);
     if (m_workerCount == 0u || m_dumpRemaining != 0u || feedback)
     {
         const PixelPipeline pixel = MakePixelPipeline(state);
