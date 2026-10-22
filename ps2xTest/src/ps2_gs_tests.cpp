@@ -1330,6 +1330,41 @@ void register_ps2_gs_tests()
             }
         });
 
+        tc.Run("sprite ending at a half pixel covers its last whole pixel", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+
+            constexpr uint64_t kFrame =
+                (150ull << 0) |
+                (1ull << 16) |
+                (static_cast<uint64_t>(GS_PSM_CT32) << 24);
+            constexpr uint64_t kScissor = (7ull << 16) | (3ull << 48);
+            constexpr uint64_t kXyz1 =
+                (static_cast<uint64_t>(3u * 16u + 8u) << 0) |
+                (static_cast<uint64_t>(1u * 16u) << 16);
+
+            gs.writeRegister(GS_REG_FRAME_1, kFrame);
+            gs.writeRegister(GS_REG_ZBUF_1, 1ull << 32);
+            gs.writeRegister(GS_REG_SCISSOR_1, kScissor);
+            gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
+            gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
+            gs.writeRegister(GS_REG_ALPHA_1, 0ull);
+            gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_SPRITE));
+            gs.writeRegister(GS_REG_RGBAQ, 0x80112233ull);
+            gs.writeRegister(GS_REG_XYZ2, 0ull);
+            gs.writeRegister(GS_REG_XYZ2, kXyz1);
+
+            for (uint32_t x = 0u; x < 4u; ++x)
+            {
+                t.Equals(readReferenceFramePSMCT32Pixel(vram, 150u, 1u, x, 0u), 0x80112233u,
+                         "pixels 0..3 lie inside [0, 3.5) and must be drawn");
+            }
+            t.Equals(readReferenceFramePSMCT32Pixel(vram, 150u, 1u, 4u, 0u), 0u,
+                     "pixel 4 lies outside [0, 3.5) and must stay untouched");
+        });
+
         tc.Run("fullscreen display copy tracks the preferred presentation source frame", [](TestCase &t)
         {
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
