@@ -777,47 +777,42 @@ inline __m128i ps2_ppacb(__m128i rs, __m128i rt)
 #define PS2_PSRLVW(a, b) _mm_custom_srlv_epi32((__m128i)(a), (__m128i)(b))
 #define PS2_PSRAVW(a, b) _mm_custom_srav_epi32((__m128i)(a), (__m128i)(b))
 
-inline __m128i _mm_custom_sllv_epi32(__m128i a, __m128i count)
+// PSLLVW/PSRLVW/PSRAVW shift words 0 and 2 of rt by the low 5 bits of words 0 and 2 of rs; each
+// 32-bit result is sign-extended into its 64-bit half.
+template <typename ShiftFn>
+inline __m128i ps2_variable_word_shift(__m128i value, __m128i shift, ShiftFn shiftWord)
 {
-    alignas(16) int32_t a_arr[4];
-    alignas(16) int32_t count_arr[4];
-    alignas(16) int32_t result[4];
-
-    std::memcpy(a_arr, &a, sizeof(a));
-    std::memcpy(count_arr, &count, sizeof(count));
-
-    for (int i = 0; i < 4; i++)
+    alignas(16) uint32_t valueWords[4];
+    alignas(16) uint32_t shiftWords[4];
+    alignas(16) int64_t result[2];
+    std::memcpy(valueWords, &value, sizeof(value));
+    std::memcpy(shiftWords, &shift, sizeof(shift));
+    for (int half = 0; half < 2; ++half)
     {
-        result[i] = a_arr[i] << (count_arr[i] & 0x1F);
+        const uint32_t shifted = shiftWord(valueWords[half * 2], shiftWords[half * 2] & 0x1Fu);
+        result[half] = static_cast<int64_t>(static_cast<int32_t>(shifted));
     }
-
     __m128i out;
     std::memcpy(&out, result, sizeof(out));
     return out;
 }
 
-inline __m128i _mm_custom_srlv_epi32(__m128i a, __m128i count)
+inline __m128i _mm_custom_sllv_epi32(__m128i value, __m128i shift)
 {
-    int32_t a_arr[4], count_arr[4], result[4];
-    _mm_storeu_si128((__m128i *)a_arr, a);
-    _mm_storeu_si128((__m128i *)count_arr, count);
-    for (int i = 0; i < 4; i++)
-    {
-        result[i] = (uint32_t)a_arr[i] >> (count_arr[i] & 0x1F);
-    }
-    return _mm_loadu_si128((__m128i *)result);
+    return ps2_variable_word_shift(value, shift, [](uint32_t word, uint32_t amount)
+                                   { return word << amount; });
 }
 
-inline __m128i _mm_custom_srav_epi32(__m128i a, __m128i count)
+inline __m128i _mm_custom_srlv_epi32(__m128i value, __m128i shift)
 {
-    int32_t a_arr[4], count_arr[4], result[4];
-    _mm_storeu_si128((__m128i *)a_arr, a);
-    _mm_storeu_si128((__m128i *)count_arr, count);
-    for (int i = 0; i < 4; i++)
-    {
-        result[i] = a_arr[i] >> (count_arr[i] & 0x1F);
-    }
-    return _mm_loadu_si128((__m128i *)result);
+    return ps2_variable_word_shift(value, shift, [](uint32_t word, uint32_t amount)
+                                   { return word >> amount; });
+}
+
+inline __m128i _mm_custom_srav_epi32(__m128i value, __m128i shift)
+{
+    return ps2_variable_word_shift(value, shift, [](uint32_t word, uint32_t amount)
+                                   { return static_cast<uint32_t>(static_cast<int32_t>(word) >> amount); });
 }
 
 // PMFHL function implementations
