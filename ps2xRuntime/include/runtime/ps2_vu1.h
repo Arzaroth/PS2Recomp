@@ -335,6 +335,14 @@ private:
     void advanceTo(uint64_t targetCycle);
     void flushPipelines();
     void progressXgkick(uint64_t cycles);
+    // Cycles of PATH1 progress not applied yet: the transfer only has to catch up before VU memory is
+    // written, before an XGKICK checks whether PATH1 is busy and when the run stops.
+    uint64_t m_xgkickBacklog = 0;
+    void catchUpXgkick()
+    {
+        if (m_xgkickBacklog != 0u)
+            progressXgkick(std::exchange(m_xgkickBacklog, uint64_t{0}));
+    }
     void resetXgkick();
     void finishXgkick();
     uint64_t calculatePairReadyCycle(const DecodedInstructionPair &decoded) const;

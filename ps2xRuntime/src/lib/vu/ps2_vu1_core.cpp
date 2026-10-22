@@ -927,6 +927,7 @@ void VU1Interpreter::queueStore(uint32_t address, const uint32_t words[4], uint8
     // reads VU memory, so writing it now is indistinguishable.
     if (!m_activeVuData || address + 16u > m_activeVuDataSize)
         return;
+    catchUpXgkick();
     if (m_cycle + 1u > m_lastWritebackCycle)
         m_lastWritebackCycle = m_cycle + 1u;
     uint32_t *target = reinterpret_cast<uint32_t *>(m_activeVuData + address);
@@ -1099,6 +1100,7 @@ void VU1Interpreter::resetXgkick()
     m_xgkick.issueCycle = 0u;
     m_xgkick.active = false;
     m_xgkick.currentTagEop = false;
+    m_xgkickBacklog = 0u;
 }
 
 void VU1Interpreter::startXgkick(uint32_t qwordAddress)
@@ -1128,7 +1130,8 @@ void VU1Interpreter::advanceTo(uint64_t targetCycle)
     m_cycle = targetCycle;
     m_state.cycles = m_cycle;
     commitReadyPipelines();
-    progressXgkick(elapsed);
+    if (m_xgkick.active)
+        m_xgkickBacklog += elapsed;
 }
 
 bool VU1Interpreter::pipelinesPending() const
@@ -1145,7 +1148,7 @@ bool VU1Interpreter::pipelinesPending() const
 
 void VU1Interpreter::flushPipelines()
 {
-    while (pipelinesPending())
+    for (catchUpXgkick(); pipelinesPending(); catchUpXgkick())
         advanceOneCycle();
 }
 
@@ -1908,6 +1911,9 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             break;
         }
 
+        const bool kicks = decoded.lowerUsage.pipeline == PipelineXgkick;
+        if (kicks)
+            catchUpXgkick();
         uint64_t readyCycle = calculatePairReadyCycle(decoded);
         while (readyCycle > m_cycle)
         {
@@ -1917,6 +1923,8 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                 break;
             }
             advanceTo(readyCycle);
+            if (kicks)
+                catchUpXgkick();
             readyCycle = calculatePairReadyCycle(decoded);
         }
         if (m_cycle >= budgetEnd)
@@ -2066,6 +2074,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             break;
     }
 
+    catchUpXgkick();
     if (!programEnded)
         hideInFlightWrites();
 
