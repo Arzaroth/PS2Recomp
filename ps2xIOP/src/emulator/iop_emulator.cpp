@@ -818,19 +818,40 @@ namespace ps2x::iop::detail
             module.entry = loaded.entry;
             module.gp = loaded.gp;
 
-            uint32_t args = 0u;
+            // Like loadcore: start(argc, argv) with argv[0] the module path, then one entry per
+            // NUL-separated argument. The block stays allocated, as resident modules may keep argv strings.
+            std::vector<std::string> argv{module.path};
             if (arguments && argumentSize)
             {
-                args = allocate(argumentSize + 1u, 16u);
-                if (args)
+                const char *text = static_cast<const char *>(arguments);
+                for (uint32_t start = 0u; start < argumentSize;)
                 {
-                    writeRam(args, arguments, argumentSize);
-                    write8(args + argumentSize, 0u);
+                    uint32_t end = start;
+                    while (end < argumentSize && text[end] != '\0')
+                        ++end;
+                    if (end > start)
+                        argv.emplace_back(text + start, end - start);
+                    start = end + 1u;
                 }
             }
-            const uint32_t startResult = callFunction(module.entry, argumentSize, args, 0u, 0u, module.gp);
-            if (args)
-                freeAllocation(args);
+            const uint32_t pointerBytes = static_cast<uint32_t>(argv.size() + 1u) * 4u;
+            uint32_t stringBytes = 0u;
+            for (const std::string &arg : argv)
+                stringBytes += static_cast<uint32_t>(arg.size()) + 1u;
+            const uint32_t argvBlock = allocate(pointerBytes + stringBytes, 16u);
+            if (argvBlock)
+            {
+                uint32_t cursor = argvBlock + pointerBytes;
+                for (size_t index = 0; index < argv.size(); ++index)
+                {
+                    write32(argvBlock + static_cast<uint32_t>(index) * 4u, cursor);
+                    writeRam(cursor, argv[index].c_str(), argv[index].size() + 1u);
+                    cursor += static_cast<uint32_t>(argv[index].size()) + 1u;
+                }
+                write32(argvBlock + static_cast<uint32_t>(argv.size()) * 4u, 0u);
+            }
+            const uint32_t argc = argvBlock ? static_cast<uint32_t>(argv.size()) : 0u;
+            const uint32_t startResult = callFunction(module.entry, argc, argvBlock, 0u, 0u, module.gp);
             module.resident = startResult == 0u || startResult == 2u;
             result.moduleId = module.id;
             result.startResult = static_cast<int32_t>(startResult);

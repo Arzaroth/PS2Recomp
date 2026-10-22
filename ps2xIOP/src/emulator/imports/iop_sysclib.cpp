@@ -73,8 +73,33 @@ namespace ps2x::iop::detail
         case 7:
             setV0(static_cast<uint32_t>(std::tolower(static_cast<unsigned char>(a0))));
             return true;
-        case 8:
-        case 9: // ctype table is optional for most IRXs.
+        case 8: // look_ctype_table: _U 0x01, _L 0x02, _N 0x04, _S 0x08, _P 0x10, _C 0x20, _X 0x40, _B 0x80
+        {
+            const int c = static_cast<int>(a0 & 0xFFu);
+            uint32_t flags = 0u;
+            if (c < 0x80)
+            {
+                if (std::isupper(c))
+                    flags |= 0x01u;
+                if (std::islower(c))
+                    flags |= 0x02u;
+                if (std::isdigit(c))
+                    flags |= 0x04u;
+                if (std::isspace(c))
+                    flags |= 0x08u;
+                if (std::ispunct(c))
+                    flags |= 0x10u;
+                if (std::iscntrl(c))
+                    flags |= 0x20u;
+                if (std::isxdigit(c))
+                    flags |= 0x40u;
+                if (c == ' ')
+                    flags |= 0x80u;
+            }
+            setV0(flags);
+            return true;
+        }
+        case 9: // get_ctype_table: no table in IOP memory
             setV0(0);
             return true;
         case 10: // memchr
