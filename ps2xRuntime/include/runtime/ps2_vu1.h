@@ -175,8 +175,7 @@ private:
     const PS2Memory *m_cachedMemory = nullptr;
     uint32_t m_cachedCodeSize = 0;
 
-    // Earliest readyCycle pending in the flag and Q/P queues; commitReadyPipelines() skips the rest.
-    uint64_t m_nextFlagCommit = 0;
+    // Earliest readyCycle pending in the Q/P queues; commitReadyPipelines() skips the rest.
     uint64_t m_nextScalarCommit = 0;
     static void noteCommitCycle(uint64_t &next, uint64_t readyCycle)
     {
@@ -187,6 +186,9 @@ private:
     uint32_t m_flagHead = 0;
     uint32_t m_flagCount = 0;
     FlagPipelineEntry *pushFlagEntry(bool upper, uint32_t overflowCode);
+    // Applies the flag writes whose latency has elapsed. Flags are committed lazily: only their
+    // readers (FMxxx, FSxxx, FCxxx), the Q status write and the end of a run need them current.
+    void commitFlags();
     template <typename Fn>
     void forEachFlagEntryIssuedThisCycle(Fn &&fn)
     {
@@ -202,6 +204,10 @@ private:
     std::array<ScalarPipelineEntry, 2> m_efu{};
     XgkickPipeline m_xgkick{};
     std::array<std::array<uint64_t, 4>, 32> m_vfReady{};
+    // Latest ready cycle ever set on any lane of each VF register (and of ACC): a read whose
+    // register is past this needs no per-lane check.
+    std::array<uint64_t, 32> m_vfReadyMax{};
+    uint64_t m_accReadyMax = 0;
     std::array<uint64_t, 16> m_viReady{};
     std::array<uint64_t, 4> m_accReady{};
 

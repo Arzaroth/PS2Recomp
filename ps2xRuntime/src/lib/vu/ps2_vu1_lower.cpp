@@ -175,6 +175,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
     }
     case 0x10: // FCEQ
     {
+        commitFlags();
         uint32_t imm24 = instr & 0xFFFFFF;
         if (1 != 0)
             m_state.vi[1] = ((m_state.clip & 0xFFFFFF) == imm24) ? 1 : 0;
@@ -187,6 +188,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
     }
     case 0x12: // FCAND
     {
+        commitFlags();
         uint32_t imm24 = instr & 0xFFFFFF;
         if (1 != 0)
             m_state.vi[1] = ((m_state.clip & imm24) != 0) ? 1 : 0;
@@ -194,6 +196,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
     }
     case 0x13: // FCOR
     {
+        commitFlags();
         uint32_t imm24 = instr & 0xFFFFFF;
         if (1 != 0)
             m_state.vi[1] = ((m_state.clip | imm24) == 0xFFFFFF) ? 1 : 0;
@@ -201,6 +204,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
     }
     case 0x14: // FSEQ
     {
+        commitFlags();
         const uint8_t it = VIT(instr);
         const uint16_t imm12 = static_cast<uint16_t>((((instr >> 21) & 0x1u) << 11) | (instr & 0x7FFu));
         if (it != 0)
@@ -215,6 +219,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
     }
     case 0x16: // FSAND
     {
+        commitFlags();
         const uint8_t it = VIT(instr);
         const uint16_t imm12 = static_cast<uint16_t>((((instr >> 21) & 0x1u) << 11) | (instr & 0x7FFu));
         if (it != 0)
@@ -223,6 +228,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
     }
     case 0x17: // FSOR
     {
+        commitFlags();
         const uint8_t it = VIT(instr);
         const uint16_t imm12 = static_cast<uint16_t>((((instr >> 21) & 0x1u) << 11) | (instr & 0x7FFu));
         if (it != 0)
@@ -231,6 +237,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
     }
     case 0x18: // FMEQ
     {
+        commitFlags();
         uint8_t it = VIT(instr);
         uint8_t is = VIS(instr);
         if (it != 0)
@@ -239,6 +246,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
     }
     case 0x1A: // FMAND
     {
+        commitFlags();
         uint8_t it = VIT(instr);
         uint8_t is = VIS(instr);
         if (it != 0)
@@ -247,6 +255,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
     }
     case 0x1B: // FMOR
     {
+        commitFlags();
         uint8_t it = VIT(instr);
         uint8_t is = VIS(instr);
         if (it != 0)
@@ -255,6 +264,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
     }
     case 0x1C: // FCGET
     {
+        commitFlags();
         const uint8_t it = VIT(instr);
         if (it != 0)
             m_state.vi[it] = static_cast<int32_t>(m_state.clip & 0x0FFFu);

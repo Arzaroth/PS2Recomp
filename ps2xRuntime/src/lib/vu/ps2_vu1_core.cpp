@@ -76,11 +76,13 @@ void VU1Interpreter::resetScheduler()
     m_efu = {};
     resetXgkick();
     m_vfReady = {};
+    m_vfReadyMax = {};
+    m_accReadyMax = 0;
     m_viReady = {};
     m_accReady = {};
     m_efuResourceReady = 0;
     m_lastWritebackCycle = 0;
-    m_nextFlagCommit = m_nextScalarCommit = 0;
+    m_nextScalarCommit = 0;
     m_workingClip = m_state.clip;
     m_viBranchBackupValue = 0;
     m_viBranchBackupReg = 0;
@@ -524,24 +526,23 @@ void VU1Interpreter::updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest,
     if (dest == 0u)
         return;
 
+    // A lane's Z/S/U/O flags land at bits lane, lane+4, lane+8 and lane+12 of MAC (x is bit 3).
+    static constexpr std::array<uint16_t, 16> kSpread = []
+    {
+        std::array<uint16_t, 16> spread{};
+        for (uint32_t flags = 0; flags < 16u; ++flags)
+            spread[flags] = static_cast<uint16_t>((flags & 1u) | ((flags & 2u) << 3) | ((flags & 4u) << 6) | ((flags & 8u) << 9));
+        return spread;
+    }();
     uint32_t mac = 0u;
     uint32_t status = 0u;
     for (uint32_t component = 0; component < 4u; ++component)
     {
-        const uint8_t lane = laneForComponent(component);
-        if ((dest & lane) == 0u)
+        if ((dest & laneForComponent(component)) == 0u)
             continue;
-
-        const uint32_t flags = laneFlags[component];
-        if ((flags & 0x1u) != 0u)
-            mac |= lane;
-        if ((flags & 0x2u) != 0u)
-            mac |= static_cast<uint32_t>(lane) << 4;
-        if ((flags & 0x4u) != 0u)
-            mac |= static_cast<uint32_t>(lane) << 8;
-        if ((flags & 0x8u) != 0u)
-            mac |= static_cast<uint32_t>(lane) << 12;
-        status |= flags;
+        const uint32_t flags = laneFlags[component] & 0xFu;
+        mac |= static_cast<uint32_t>(kSpread[flags]) << (3u - component);
+        status |= laneFlags[component];
     }
 
     FlagPipelineEntry *entry = pushFlagEntry(true, 0xFFFFFFFFu);
@@ -606,17 +607,25 @@ VU1Interpreter::FlagPipelineEntry *VU1Interpreter::pushFlagEntry(bool upper, uin
 {
     // Every flag write has the FMAC latency, so the queue is ordered by readiness and commits in issue order.
     if (m_flagCount == kMaxFlagEntries)
+        commitFlags(); // entries whose latency elapsed are only waiting for a reader
+    if (m_flagCount == kMaxFlagEntries)
     {
         reportReservedInstruction(upper, overflowCode);
         return nullptr;
     }
     FlagPipelineEntry &entry = m_flagPipeline[(m_flagHead + m_flagCount) % kMaxFlagEntries];
     ++m_flagCount;
-    entry = {};
-    entry.valid = true;
-    entry.issueCycle = m_cycle;
     entry.readyCycle = m_cycle + kFmacLatency;
-    noteCommitCycle(m_nextFlagCommit, entry.readyCycle);
+    entry.issueCycle = m_cycle;
+    entry.mac = 0u;
+    entry.status = 0u;
+    entry.extraSticky = 0u;
+    entry.clip = 0u;
+    entry.valid = true;
+    entry.writesMac = false;
+    entry.writesStatus = false;
+    entry.writesSticky = false;
+    entry.writesClip = false;
     return &entry;
 }
 
@@ -667,42 +676,43 @@ void VU1Interpreter::queueStore(uint32_t address, const uint32_t words[4], uint8
     }
 }
 
+void VU1Interpreter::commitFlags()
+{
+    while (m_flagCount != 0u && m_flagPipeline[m_flagHead].readyCycle <= m_cycle)
+    {
+        FlagPipelineEntry &entry = m_flagPipeline[m_flagHead];
+        if (entry.writesMac)
+            m_state.mac = entry.mac;
+        if (entry.writesStatus)
+        {
+            const uint32_t current = entry.status & 0xFu;
+            m_state.status = (m_state.status & 0xFF0u) | current | ((current | entry.extraSticky) << 6);
+        }
+        if (entry.writesSticky)
+        {
+            m_state.status = (m_state.status & 0x03Fu) | (entry.status & 0xFC0u);
+        }
+        if (entry.writesClip)
+            m_state.clip = entry.clip;
+        entry.valid = false;
+        m_flagHead = (m_flagHead + 1u) % kMaxFlagEntries;
+        --m_flagCount;
+    }
+}
+
 void VU1Interpreter::commitReadyPipelines()
 {
-    // Register and memory results are written at issue (see run()); only flags, Q and P are delayed.
-    if (m_cycle < m_nextFlagCommit && m_cycle < m_nextScalarCommit)
+    // Register and memory results are written at issue (see run()); only flags, Q and P are delayed,
+    // and flags wait for a reader (commitFlags).
+    if (m_cycle < m_nextScalarCommit)
         return;
 
-    if (m_cycle >= m_nextFlagCommit)
-    {
-        while (m_flagCount != 0u && m_flagPipeline[m_flagHead].readyCycle <= m_cycle)
-        {
-            FlagPipelineEntry &entry = m_flagPipeline[m_flagHead];
-            if (entry.writesMac)
-                m_state.mac = entry.mac;
-            if (entry.writesStatus)
-            {
-                const uint32_t current = entry.status & 0xFu;
-                m_state.status = (m_state.status & 0xFF0u) | current | ((current | entry.extraSticky) << 6);
-            }
-            if (entry.writesSticky)
-            {
-                m_state.status = (m_state.status & 0x03Fu) | (entry.status & 0xFC0u);
-            }
-            if (entry.writesClip)
-                m_state.clip = entry.clip;
-            entry = {};
-            m_flagHead = (m_flagHead + 1u) % kMaxFlagEntries;
-            --m_flagCount;
-        }
-        m_nextFlagCommit = m_flagCount != 0u ? m_flagPipeline[m_flagHead].readyCycle : UINT64_MAX;
-    }
-
-    if (m_cycle >= m_nextScalarCommit)
     {
         m_nextScalarCommit = UINT64_MAX;
         if (m_fdiv.valid && m_fdiv.readyCycle <= m_cycle)
         {
+            // Q's status bits land after every flag write ready by now, as with per-cycle commits.
+            commitFlags();
             m_state.q = m_fdiv.value;
             const uint32_t currentDi = m_fdiv.statusDi & 0x30u;
             m_state.status = (m_state.status & 0xFCFu) | currentDi | (currentDi << 6);
@@ -868,7 +878,8 @@ bool VU1Interpreter::pipelinesPending() const
     for (const ScalarPipelineEntry &entry : m_efu)
         if (entry.valid)
             return true;
-    if (m_flagCount != 0u)
+    // The queue is ordered by readiness: flags are pending while the newest one is.
+    if (m_flagCount != 0u && m_flagPipeline[(m_flagHead + m_flagCount - 1u) % kMaxFlagEntries].readyCycle > m_cycle)
         return true;
     return false;
 }
@@ -896,10 +907,14 @@ uint64_t VU1Interpreter::calculatePairReadyCycle(const DecodedInstructionPair &d
     for (const InstructionUsage *usage : {&decoded.upperUsage, &decoded.lowerUsage})
     {
         for (uint32_t index = 0; index < usage->vfReadCount; ++index)
-            laneReady(m_vfReady[usage->vfRead[index].reg], usage->vfRead[index].lanes);
+        {
+            const VfAccess &read = usage->vfRead[index];
+            if (m_vfReadyMax[read.reg] > ready)
+                laneReady(m_vfReady[read.reg], read.lanes);
+        }
         for (uint32_t mask = usage->viRead & 0xFFFEu; mask != 0u; mask &= mask - 1u)
             ready = std::max(ready, m_viReady[static_cast<uint32_t>(_tzcnt_u32(mask))]);
-        if (usage->accRead != 0u)
+        if (usage->accRead != 0u && m_accReadyMax > ready)
             laneReady(m_accReady, usage->accRead);
     }
 
@@ -948,6 +963,7 @@ void VU1Interpreter::markPairWrites(const DecodedInstructionPair &decoded)
                                      ? decoded.lowerUsage.vfLatency
                                      : decoded.lowerUsage.latency;
         setLanes(m_vfReady[lowerWrite.reg], lowerWrite.lanes, m_cycle + latency);
+        m_vfReadyMax[lowerWrite.reg] = std::max(m_vfReadyMax[lowerWrite.reg], m_cycle + latency);
         noteWriteback(m_cycle + latency);
     }
 
@@ -958,6 +974,7 @@ void VU1Interpreter::markPairWrites(const DecodedInstructionPair &decoded)
                                      ? decoded.upperUsage.vfLatency
                                      : decoded.upperUsage.latency;
         setLanes(m_vfReady[upperWrite.reg], upperWrite.lanes, m_cycle + latency);
+        m_vfReadyMax[upperWrite.reg] = std::max(m_vfReadyMax[upperWrite.reg], m_cycle + latency);
         noteWriteback(m_cycle + latency);
     }
 
@@ -972,6 +989,7 @@ void VU1Interpreter::markPairWrites(const DecodedInstructionPair &decoded)
     if (decoded.upperUsage.accWrite != 0u)
     {
         setLanes(m_accReady, decoded.upperUsage.accWrite, m_cycle + kAccForwardLatency);
+        m_accReadyMax = std::max(m_accReadyMax, m_cycle + kAccForwardLatency);
         noteWriteback(m_cycle + kAccForwardLatency);
     }
 }
@@ -1799,6 +1817,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         m_pendingHaltD = false;
         m_pendingHaltT = false;
     }
+    commitFlags();
     m_state.cycles = m_cycle;
     if (useVuRounding && previousRoundingMode != -1)
         std::fesetround(previousRoundingMode);
