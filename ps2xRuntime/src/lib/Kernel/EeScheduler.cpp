@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -406,8 +407,16 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
         return false;
     }
 
+    // PS2X_EE_SLICE_EQUAL=0 (diagnostic): only a strictly higher-priority ready thread preempts
+    // at the end of a time slice, never one of equal priority.
+    static const bool sliceEqual = []
+    {
+        const char *value = std::getenv("PS2X_EE_SLICE_EQUAL");
+        return !(value && *value == '0');
+    }();
     const GuestThread *running = currentThread();
-    if (running != nullptr && hasReadyAtOrAbovePriority(running->currentPriority))
+    if (running != nullptr && (sliceEqual || running->currentPriority > 0) &&
+        hasReadyAtOrAbovePriority(running->currentPriority - (sliceEqual ? 0 : 1)))
     {
         m_rescheduleRequested = true;
         m_timeSliceExpired = true;
