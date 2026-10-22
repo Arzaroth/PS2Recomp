@@ -4,6 +4,7 @@
 #include "emulator/imports/iop_cdvd.h"
 #include "emulator/imports/iop_imports.h"
 #include "emulator/imports/iop_loadcore.h"
+#include "emulator/imports/iop_sysclib.h"
 #include "emulator/imports/iop_timrman.h"
 #include "emulator/imports/iop_vblank.h"
 #include "emulator/iop_emulator_const.h"
@@ -331,6 +332,24 @@ namespace
 
     // RegisterVblankHandler: handlers run at each VBlank start with their argument and GP (Sony's
     // sound drivers wake their streaming threads this way); returning 0 releases them.
+    bool testSysclibCtypeFlags()
+    {
+        IopMemory memory;
+        IopSysclib sysclib(memory);
+        IopCpuState cpu{};
+        const auto flags = [&](char c)
+        {
+            cpu.gpr[4] = static_cast<uint8_t>(c);
+            cpu.gpr[2] = 0xFFFFFFFFu;
+            return sysclib.dispatchImport(8u, cpu) ? cpu.gpr[2] : 0xFFFFFFFFu;
+        };
+        return expect(flags('2') == 0x44u, "look_ctype_table: digit") &&
+               expect(flags('a') == 0x42u, "look_ctype_table: lower hex letter") &&
+               expect(flags('Z') == 0x01u, "look_ctype_table: upper letter") &&
+               expect(flags(' ') == 0x88u, "look_ctype_table: blank") &&
+               expect(flags('=') == 0x10u, "look_ctype_table: punctuation");
+    }
+
     bool testVblankHandlers()
     {
         IopMemory memory;
@@ -384,7 +403,7 @@ namespace
 int main()
 {
     if (!testLoadcoreRebootLibraryMode() || !testCdvdSpecialControl() || !testCdvdSearchFile() ||
-        !testTimrmanPeriodicCallback() || !testVblankHandlers())
+        !testTimrmanPeriodicCallback() || !testVblankHandlers() || !testSysclibCtypeFlags())
         return 1;
     std::cout << "ps2xIOP import tests passed\n";
     return 0;

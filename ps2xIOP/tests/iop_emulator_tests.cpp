@@ -186,6 +186,19 @@ namespace
         writeCodeIrx(host, address, code, sizeof(code));
     }
 
+    void writeArgvIrx(TestHost &host, uint32_t address)
+    {
+        const uint32_t code[] = {
+            0x8CA80004u, // lw    t0, 4(a1)    argv[1]
+            0x00000000u, // nop               (load delay)
+            0x91090000u, // lbu   t1, 0(t0)    argv[1][0]
+            0x00041200u, // sll   v0, a0, 8    argc << 8
+            0x03E00008u, // jr    ra
+            0x00491025u, // or    v0, v0, t1   (delay slot)
+        };
+        writeCodeIrx(host, address, code, sizeof(code));
+    }
+
     void writeRpcServerIrx(TestHost &host,
                            uint32_t address,
                            uint32_t sid = 0xF00DCAFEu)
@@ -996,6 +1009,14 @@ int main()
     if (!expect(iop.stopModule(result.moduleId, &stopResult), "Emulated module stop failed")) return 1;
     if (!expect(stopResult == 0, "Emulated module stop result mismatch")) return 1;
     if (!expect(iop.debugSnapshot().emulatorLoadedModules == 0u, "Module was not released")) return 1;
+
+    {
+        // loadcore passes start(argc, argv): argv[0] is the module path, then one string per NUL-separated argument.
+        static constexpr char kArguments[] = "thpri=39\0spucore=2";
+        writeArgvIrx(host, 0x100u);
+        const ModuleLoadResult argvModule = iop.loadModuleBuffer(0x100u, kArguments, sizeof(kArguments));
+        if (!expect(argvModule.startResult == static_cast<int32_t>((3u << 8u) | 't'), "Module start must get argc and argv strings")) return 1;
+    }
 
     // An unaligned load is LWR then LWL of the same register: LWL merges into the value LWR has
     // in flight in the load delay slot, as on the R3000A.
