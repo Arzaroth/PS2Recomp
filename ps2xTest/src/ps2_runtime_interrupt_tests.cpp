@@ -72,6 +72,9 @@ namespace
     constexpr uint32_t kInvocationQueuePc = 0x00160530u;
     constexpr uint32_t kInvocationQueueResumePc = 0x00160540u;
     constexpr uint32_t kInvocationQueueHandlerPc = 0x00160550u;
+    constexpr uint32_t kLatchWaitPc = 0x00160600u;
+    constexpr uint32_t kLatchResumePc = 0x00160610u;
+    constexpr uint32_t kLatchFinishPc = 0x00160620u;
 
     constexpr uint32_t kTimer2Count = 0x10001000u;
     constexpr uint32_t kTimer2Mode = 0x10001010u;
@@ -375,6 +378,33 @@ namespace
     }
 }
 
+namespace
+{
+    void schedulerLatchWait(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        g_dispatchTrace.push_back(1);
+        EeScheduler &scheduler = runtime->eeScheduler();
+        scheduler.addIrqHandler(false, 2u, kIntcHandlerPc, true, 0u, 0u, 0u);
+        scheduler.setIrqCauseEnabled(false, 2u, false);
+        ctx->pc = kLatchResumePc;
+        scheduler.waitVSync(scheduler.currentVSyncTick());
+    }
+
+    void schedulerLatchResume(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        g_dispatchTrace.push_back(3);
+        runtime->eeScheduler().setIrqCauseEnabled(false, 2u, true);
+        ctx->pc = kLatchFinishPc;
+    }
+
+    void schedulerLatchFinish(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        g_dispatchTrace.push_back(4);
+        ctx->pc = 0u;
+        runtime->requestStop();
+    }
+}
+
 void register_ps2_runtime_interrupt_tests()
 {
     MiniTest::Case("PS2RuntimeInterrupt", [](TestCase &tc)
@@ -544,6 +574,24 @@ void register_ps2_runtime_interrupt_tests()
                      "the dispatcher should run wait, IRQ frame, then the resumed base context in exact order");
             t.Equals(g_lastIntcArg.load(std::memory_order_relaxed), 0xCAFEu,
                      "the IRQ frame should receive its registered argument");
+        });
+
+        tc.Run("an IRQ raised while its cause is disabled runs once the cause is enabled", [](TestCase &t)
+        {
+            TestEnv env;
+            env.runtime.registerFunction(kLatchWaitPc, schedulerLatchWait);
+            env.runtime.registerFunction(kLatchResumePc, schedulerLatchResume);
+            env.runtime.registerFunction(kLatchFinishPc, schedulerLatchFinish);
+            env.runtime.registerFunction(kIntcHandlerPc, schedulerIntcHandler);
+
+            g_dispatchTrace.clear();
+            R5900Context mainContext{};
+            mainContext.pc = kLatchWaitPc;
+            env.runtime.eeScheduler().reset(env.rdram.data(), mainContext);
+            env.runtime.eeScheduler().run();
+
+            const std::vector<int> expected{1, 3, 2, 4};
+            t.IsTrue(g_dispatchTrace == expected, "the VBlank IRQ should stay pending until its cause is enabled");
         });
 
         tc.Run("IRQ callbacks use an isolated invocation stack", [](TestCase &t)

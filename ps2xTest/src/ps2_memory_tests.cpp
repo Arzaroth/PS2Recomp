@@ -361,6 +361,49 @@ void register_ps2_memory_tests()
             t.Equals(mem.readIORegister(kTimer0Count), 0u, "ZRET should clear COUNT when it equals COMP");
         });
 
+        tc.Run("GS CSR reads its FIFO as empty", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            t.Equals(mem.read32(0x12001000u) & 0xC000u, 0x4000u, "CSR.FIFO should read 01 (empty)");
+            mem.write32(0x12001000u, 0x8000u);
+            t.Equals(mem.read32(0x12001000u) & 0xC000u, 0x4000u, "CSR.FIFO should ignore writes");
+        });
+
+        tc.Run("GS SIGNAL written while CSR.SIGNAL is set waits for the acknowledge", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            ps2GsResetEvents();
+            GSRegisters &regs = mem.gs();
+
+            t.Equals(ps2GsPostEvent(regs, GsCpuEvent::Signal, 0x1u, 0x1u, 0u, 0u), 0x1u, "first SIGNAL raises CSR.SIGNAL");
+            t.Equals(ps2GsPostEvent(regs, GsCpuEvent::Signal, 0x2u, 0x2u, 0u, 0u), 0x0u, "second SIGNAL waits");
+            t.Equals(ps2GsPostEvent(regs, GsCpuEvent::Finish, 0u, 0u, 0u, 0u), 0x0u, "FINISH waits behind the SIGNAL");
+            t.Equals(static_cast<uint32_t>(regs.siglblid), 0x1u, "SIGLBLID shows only the first SIGNAL");
+
+            mem.write32(0x12001000u, 0x1u);
+            t.Equals(static_cast<uint32_t>(regs.siglblid), 0x3u, "acknowledging applies the waiting SIGNAL");
+            t.Equals(static_cast<uint32_t>(regs.csr.load()) & 0x3u, 0x1u, "CSR.SIGNAL is set again, FINISH still waits");
+
+            mem.write32(0x12001000u, 0x1u);
+            t.Equals(static_cast<uint32_t>(regs.csr.load()) & 0x3u, 0x2u, "the next acknowledge lets FINISH through");
+            ps2GsResetEvents();
+        });
+
+        tc.Run("GS CPU events take effect from their due cycle", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            ps2GsResetEvents();
+            GSRegisters &regs = mem.gs();
+
+            t.Equals(ps2GsPostEvent(regs, GsCpuEvent::Finish, 0u, 0u, 100u, 0u), 0x0u, "a future event waits");
+            t.Equals(ps2GsApplyDueEvents(regs, 99u), 0x0u, "not due yet");
+            t.Equals(ps2GsApplyDueEvents(regs, 100u), 0x2u, "due events raise their CSR bits");
+            ps2GsResetEvents();
+        });
+
         tc.Run("scratchpad alias accesses the same bytes as base", [](TestCase &t)
         {
             PS2Memory mem;
