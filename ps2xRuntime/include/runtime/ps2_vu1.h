@@ -4,6 +4,8 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <utility>
+#include <vector>
 
 class GS;
 class PS2Memory;
@@ -175,6 +177,16 @@ private:
     const uint8_t *m_cachedVuCode = nullptr;
     const PS2Memory *m_cachedMemory = nullptr;
     uint32_t m_cachedCodeSize = 0;
+
+    // VU1 only: per pair, whether a flag reader can observe its upper instruction's MAC and status result.
+    // Computed once per code image (by content hash) and valid while the decode stamp is m_flagsLiveStamp.
+    using FlagLiveness = std::array<bool, kMaxDecodedPairs>;
+    std::vector<std::pair<uint64_t, FlagLiveness>> m_flagLivenessCache;
+    const FlagLiveness *m_flagsLive = nullptr;
+    uint64_t m_flagsLiveStamp = 0;
+    bool m_elideDeadFlags = false;
+    bool m_currentFlagsLive = true;
+    void refreshFlagLiveness(const uint8_t *vuCode, uint32_t codeSize, uint64_t stamp);
 
     // Earliest readyCycle pending in the flag and Q/P queues; commitReadyPipelines() skips the rest.
     uint64_t m_nextFlagCommit = 0;

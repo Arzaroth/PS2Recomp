@@ -21,6 +21,132 @@ namespace
     {
         return static_cast<uint8_t>(1u << (3u - component));
     }
+
+    // Upper instructions that queue MAC and status flags (applyFmacFlags).
+    bool writesFmacFlags(uint32_t upper)
+    {
+        const uint32_t op = upper & 0x3Fu;
+        const uint32_t code = op >= 0x3Cu ? ((upper & 3u) | ((upper >> 4) & 0x7Cu)) : op;
+        if (op >= 0x30u && op < 0x3Cu)
+            return false;
+        return code <= 0x0Fu || (code >= 0x18u && code <= 0x1Cu) || code == 0x1Eu || (code >= 0x20u && code <= 0x2Au) ||
+               (code >= 0x2Cu && code <= 0x2Eu);
+    }
+
+    uint64_t hashCode(const uint8_t *code, uint32_t size)
+    {
+        uint64_t hash = 0xCBF29CE484222325ull ^ size;
+        for (uint32_t offset = 0; offset + 8u <= size; offset += 8u)
+        {
+            uint64_t word = 0;
+            std::memcpy(&word, code + offset, sizeof(word));
+            hash = (hash ^ word) * 0x100000001B3ull;
+            hash ^= hash >> 29;
+        }
+        return hash;
+    }
+
+    // A flag reader issued at cycle t sees the last flag write issued at or before t - 4, so an FMAC's flags
+    // are dead once four newer flag writers issued on every path before a reader. Program ends, halts and
+    // jumps to registers count as readers.
+    void computeFlagLiveness(const uint8_t *code, uint32_t codeSize, uint32_t pcMask, bool *live)
+    {
+        const uint32_t pairs = std::min<uint32_t>(codeSize / 8u, (pcMask + 1u) / 8u);
+        if (pairs == 0u)
+            return;
+        constexpr uint32_t kEnd = UINT32_MAX;
+        std::vector<uint8_t> writer(pairs), reader(pairs);
+        std::vector<std::array<uint32_t, 2>> successors(pairs);
+        bool statusRead = false, irregular = false;
+        for (uint32_t index = 0; index < pairs; ++index)
+        {
+            uint32_t lower = 0, upper = 0;
+            std::memcpy(&lower, code + index * 8u, sizeof(lower));
+            std::memcpy(&upper, code + index * 8u + 4u, sizeof(upper));
+            writer[index] = writesFmacFlags(upper);
+            successors[index] = {(index + 1u) % pairs, kEnd - 1u};
+            if ((upper & 0x18000000u) != 0u)
+                successors[index][0] = kEnd;
+            if ((upper & 0x80000000u) != 0u)
+                continue;
+            const uint32_t op = (lower >> 25) & 0x7Fu;
+            reader[index] = op == 0x18u || op == 0x1Au || op == 0x1Bu;
+            statusRead |= op == 0x14u || op == 0x16u || op == 0x17u;
+        }
+        for (uint32_t index = 0; index < pairs; ++index)
+        {
+            uint32_t lower = 0, upper = 0;
+            std::memcpy(&lower, code + index * 8u, sizeof(lower));
+            std::memcpy(&upper, code + index * 8u + 4u, sizeof(upper));
+            const uint32_t slot = (index + 1u) % pairs;
+            if ((upper & 0x40000000u) != 0u)
+                successors[slot] = {kEnd, kEnd};
+            if ((upper & 0x80000000u) != 0u)
+                continue;
+            const uint32_t op = (lower >> 25) & 0x7Fu;
+            const bool branch = op == 0x20u || op == 0x21u || op == 0x28u || op == 0x29u || (op >= 0x2Cu && op <= 0x2Fu);
+            const bool jump = op == 0x24u || op == 0x25u;
+            if (!branch && !jump)
+                continue;
+            uint32_t slotLower = 0, slotUpper = 0;
+            std::memcpy(&slotLower, code + slot * 8u, sizeof(slotLower));
+            std::memcpy(&slotUpper, code + slot * 8u + 4u, sizeof(slotUpper));
+            const uint32_t slotOp = (slotLower >> 25) & 0x7Fu;
+            if ((slotUpper & 0x80000000u) == 0u && slotOp >= 0x20u && slotOp <= 0x2Fu)
+                irregular = true;
+            const int32_t offset = static_cast<int32_t>(static_cast<int16_t>(static_cast<uint16_t>(lower << 5)) >> 5);
+            successors[slot][1] = jump ? kEnd : ((index * 8u + 8u + static_cast<uint32_t>(offset * 8)) & pcMask) / 8u;
+            if (successors[slot][1] != kEnd && successors[slot][1] >= pairs)
+                successors[slot][1] = kEnd;
+        }
+        if (statusRead || irregular)
+        {
+            std::fill(live, live + pairs, true);
+            return;
+        }
+
+        std::vector<uint8_t> visited(pairs);
+        std::vector<std::pair<uint32_t, uint8_t>> stack;
+        for (uint32_t start = 0; start < pairs; ++start)
+        {
+            live[start] = false;
+            if (!writer[start])
+                continue;
+            std::fill(visited.begin(), visited.end(), 0u);
+            stack.clear();
+            const auto push = [&](uint32_t from, uint8_t newer)
+            {
+                for (const uint32_t next : successors[from])
+                {
+                    if (next == kEnd - 1u)
+                        continue;
+                    if (next == kEnd)
+                        return false;
+                    if ((visited[next] & (1u << newer)) == 0u)
+                    {
+                        visited[next] |= static_cast<uint8_t>(1u << newer);
+                        stack.emplace_back(next, newer);
+                    }
+                }
+                return true;
+            };
+            bool observed = !push(start, 0u);
+            while (!observed && !stack.empty())
+            {
+                const auto [index, newer] = stack.back();
+                stack.pop_back();
+                if (reader[index])
+                {
+                    observed = true;
+                    break;
+                }
+                const uint8_t after = static_cast<uint8_t>(newer + (writer[index] ? 1u : 0u));
+                if (after < 4u)
+                    observed = !push(index, after);
+            }
+            live[start] = observed;
+        }
+    }
 }
 
 void VU1Interpreter::addVfRead(InstructionUsage &usage, uint8_t reg, uint8_t lanes)
@@ -62,7 +188,28 @@ uint8_t VU1Interpreter::vfReadLanes(const InstructionUsage &usage, uint8_t reg)
 VU1Interpreter::VU1Interpreter(Unit unit)
     : m_unit(unit)
 {
+    const char *exactFlags = std::getenv("PS2X_VU1_EXACT_FLAGS");
+    m_elideDeadFlags = unit == Unit::VU1 && !(exactFlags && *exactFlags && *exactFlags != '0');
     reset();
+}
+
+void VU1Interpreter::refreshFlagLiveness(const uint8_t *vuCode, uint32_t codeSize, uint64_t stamp)
+{
+    m_flagsLiveStamp = stamp;
+    const uint64_t hash = hashCode(vuCode, codeSize);
+    for (const auto &[cachedHash, liveness] : m_flagLivenessCache)
+        if (cachedHash == hash)
+        {
+            m_flagsLive = &liveness;
+            return;
+        }
+    if (m_flagLivenessCache.size() >= 16u)
+        m_flagLivenessCache.erase(m_flagLivenessCache.begin());
+    m_flagLivenessCache.emplace_back(hash, FlagLiveness{});
+    FlagLiveness &liveness = m_flagLivenessCache.back().second;
+    liveness.fill(true);
+    computeFlagLiveness(vuCode, codeSize, microAddressMask(), liveness.data());
+    m_flagsLive = &liveness;
 }
 
 void VU1Interpreter::resetScheduler()
@@ -634,6 +781,23 @@ void VU1Interpreter::applyFmacFlags(float *result, uint8_t dest)
     static constexpr uint8_t kReverse4[16] = {0x0, 0x8, 0x4, 0xC, 0x2, 0xA, 0x6, 0xE,
                                               0x1, 0x9, 0x5, 0xD, 0x3, 0xB, 0x7, 0xF};
     const int components = kReverse4[dest & 0xFu];
+    if (!m_currentFlagsLive)
+    {
+        if (components == 0)
+            return;
+        const __m128i bits = _mm_loadu_si128(reinterpret_cast<const __m128i *>(result));
+        const __m128i exponent = _mm_srli_epi32(_mm_and_si128(bits, _mm_set1_epi32(0x7F800000)), 23);
+        const __m128i ordinary = _mm_and_si128(_mm_cmpgt_epi32(exponent, _mm_set1_epi32(1)),
+                                               _mm_cmplt_epi32(exponent, _mm_set1_epi32(254)));
+        const int ordinaryComponents = _mm_movemask_ps(_mm_castsi128_ps(ordinary)) & components;
+        const int zeroComponents =
+            _mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(_mm_slli_epi32(bits, 1), _mm_setzero_si128()))) & components;
+        if ((ordinaryComponents | zeroComponents) == components && exactZeroLanes(zeroComponents))
+            return;
+        uint8_t laneFlags[4]{};
+        normalizeFmacResult(result, dest, laneFlags);
+        return;
+    }
     if (components != 0)
     {
         // Results with exponent 2..253 raise only the sign flag (see normalizeFmacResult).
@@ -1721,12 +1885,17 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         else if (m_unit == Unit::VU0 && vuCode == memory->getVU0Code())
             decodeStamp = memory->getVU0CodeGeneration() + 1u;
     }
+    if (m_elideDeadFlags && decodeStamp != 0u && decodeStamp != m_flagsLiveStamp)
+        refreshFlagLiveness(vuCode, codeSize, decodeStamp);
+    const FlagLiveness *flagsLive = m_elideDeadFlags && decodeStamp != 0u ? m_flagsLive : nullptr;
     while (m_cycle < budgetEnd && !m_stopRequested)
     {
         if (m_state.pc + 8u > codeSize)
             break;
 
         const uint32_t pairIndex = m_state.pc / 8u;
+        m_currentFlagsLive = flagsLive == nullptr || (m_state.pc & 7u) != 0u || pairIndex >= kMaxDecodedPairs ||
+                             (*flagsLive)[pairIndex];
         const DecodedInstructionPair &decoded =
             (decodeStamp != 0u && (m_state.pc & 7u) == 0u && pairIndex < kMaxDecodedPairs &&
              m_decodedPairStamp[pairIndex] == decodeStamp)
@@ -1920,6 +2089,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         m_pendingHaltT = false;
     }
     m_state.cycles = m_cycle;
+    m_currentFlagsLive = true;
     if (useVuRounding && previousRoundingMode != -1)
         std::fesetround(previousRoundingMode);
 }

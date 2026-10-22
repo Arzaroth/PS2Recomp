@@ -27,8 +27,21 @@ void (*g_ps2RecompiledFunctionTable[1])(uint8_t *, R5900Context *, PS2Runtime *)
 
 namespace
 {
-    std::string describeStateDifference(const VU1State &expected, const VU1State &actual)
+    // The interpreter skips MAC and status flags no instruction can read (PS2X_VU1_EXACT_FLAGS=1 keeps them):
+    // sticky status bits may then differ, and so may the flags of a run stopped mid-program.
+    std::string describeStateDifference(VU1State expected, VU1State actual, bool stoppedMidProgram)
     {
+        const char *exactFlags = std::getenv("PS2X_VU1_EXACT_FLAGS");
+        if (!(exactFlags && *exactFlags && *exactFlags != '0'))
+        {
+            expected.status &= 0x03Fu;
+            actual.status &= 0x03Fu;
+            if (stoppedMidProgram)
+            {
+                expected.mac = actual.mac = 0u;
+                expected.status = actual.status = 0u;
+            }
+        }
         std::string diff;
         char line[256];
         for (int reg = 0; reg < 32; ++reg)
@@ -180,7 +193,7 @@ int main(int argc, char **argv)
             const uint64_t expectedCycles = record.stateAfter.cycles - record.stateBefore.cycles;
             const uint64_t actualCycles = actual.cycles - cyclesBefore;
             totalCycles += expectedCycles;
-            std::string diff = describeStateDifference(record.stateAfter, actual);
+            std::string diff = describeStateDifference(record.stateAfter, actual, record.maxCycles < (1u << 20));
             const bool dataDiffers = data != record.dataAfter;
             const bool packetsDiffer = packets != record.packets;
             if (diff.empty() && !dataDiffers && !packetsDiffer)
