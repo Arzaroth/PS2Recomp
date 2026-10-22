@@ -89,8 +89,9 @@ private:
     };
     void StartWorkersUnlocked();
     void DrainUnlocked() const;
-    bool ReadsPendingWrite(const GSPrimitiveBatch &batch) const;
-    void NotePendingWrites(const GSPrimitiveBatch &batch);
+    // VRAM written by the caller after a drain: the next primitive sampling it gets a barrier,
+    // so workers drop decoded textures that predate the write.
+    void NoteDirectWrite(std::pair<uint32_t, uint32_t> blocks);
     void NotePendingRange(std::vector<std::pair<uint32_t, uint32_t>> &ranges, std::pair<uint32_t, uint32_t> range);
     void NoteBarrierRange(std::vector<std::pair<uint32_t, uint32_t>> &ranges, std::pair<uint32_t, uint32_t> range);
     // Writes (or, with write false, only counts) the pixels of an upload chunk; with rows, only
@@ -149,15 +150,20 @@ private:
     std::atomic<uint64_t> m_queueTail{0}; // primitives queued so far
     std::unique_ptr<WorkerProgress[]> m_workerProgress;
     uint32_t m_workerCount = 0;
-    // VRAM block ranges the queued primitives draw to (start, count): a texture read from one
-    // of them waits for the queue to drain (render to texture).
+    // VRAM block ranges the queued primitives draw to (start, count): a CLUT load from one of
+    // them waits for the queue to drain.
     mutable std::vector<std::pair<uint32_t, uint32_t>> m_pendingWrites;
     // Writes queued since the last in-queue barrier: a primitive sampling one of them gets a
-    // barrier (the workers wait for each other there) instead of draining the queue.
-    mutable std::vector<std::pair<uint32_t, uint32_t>> m_writesSinceBarrier;
-    // Texture ranges read since the last barrier: a queued upload over them gets a barrier.
+    // barrier (the workers wait for each other there) instead of draining the queue. Pixel
+    // writes (color, uploads) are made by the owner of their page, depth writes by the owner of
+    // the color page, so the two kinds overlapping also need a barrier.
+    std::vector<std::pair<uint32_t, uint32_t>> m_pixelWritesSinceBarrier;
+    std::vector<std::pair<uint32_t, uint32_t>> m_zWritesSinceBarrier;
+    // Texture ranges read since the last barrier: a queued write over them gets a barrier.
     mutable std::vector<std::pair<uint32_t, uint32_t>> m_readsSinceBarrier;
     bool m_barrierRequested = false;
+    // Queued items wrote VRAM since m_texturePageCaches[0] (CLUT loads) was last emptied.
+    bool m_callerCacheStale = false;
     // Z buffers written since the last barrier, with the color-page layout that decided
     // which worker wrote each depth word.
     mutable std::vector<uint64_t> m_zOwnerKeys;

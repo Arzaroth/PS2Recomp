@@ -736,6 +736,53 @@ namespace
         }
         return false;
     }
+
+    bool overlapsAny(std::pair<uint32_t, uint32_t> range, const std::vector<std::pair<uint32_t, uint32_t>> &ranges)
+    {
+        for (const auto &other : ranges)
+        {
+            if (blocksOverlap(range, other))
+                return true;
+        }
+        return false;
+    }
+
+    // VRAM blocks a primitive can write (whole page rows of its frame and Z buffers) and sample.
+    struct PrimitiveBlocks
+    {
+        std::pair<uint32_t, uint32_t> frame;
+        std::pair<uint32_t, uint32_t> z;
+        std::pair<uint32_t, uint32_t> texture;
+        bool writesZ = false;
+        bool samples = false;
+    };
+
+    PrimitiveBlocks primitiveBlocks(const GSPrimitiveBatch &batch)
+    {
+        const auto &ctx = batch.state.context;
+        PrimitiveBlocks blocks;
+        int firstRow = 0;
+        int lastRow = 0;
+        primitiveRows(batch, firstRow, lastRow);
+        blocks.frame = rowBlocks(GSInternal::framePageBaseToBlock(ctx.frame.fbp), ctx.frame.fbw, ctx.frame.psm, firstRow, lastRow);
+        blocks.writesZ = !ctx.zbuf.zmask;
+        if (blocks.writesZ)
+            blocks.z = rowBlocks(GSInternal::framePageBaseToBlock(ctx.zbuf.zbp), ctx.frame.fbw, ctx.zbuf.psm, firstRow, lastRow);
+        blocks.samples = batch.state.prim.tme;
+        if (blocks.samples)
+        {
+            textureRows(batch, firstRow, lastRow);
+            blocks.texture = rowBlocks(ctx.tex0.tbp0, ctx.tex0.tbw, ctx.tex0.psm, firstRow, lastRow);
+        }
+        return blocks;
+    }
+
+    // Samples what it draws: the result depends on the order its pixels are written in.
+    bool readsOwnWrites(const PrimitiveBlocks &blocks)
+    {
+        return blocks.samples && (blocksOverlap(blocks.texture, blocks.frame) ||
+                                  (blocks.writesZ && blocksOverlap(blocks.texture, blocks.z)));
+    }
 }
 
 struct GSCpuBackend::PixelPipeline
@@ -1075,6 +1122,10 @@ void GSCpuBackend::ResetUnlocked()
     m_transferState.direction = 3u;
     m_localToHostBuffer.clear();
     m_localToHostReadPos = 0u;
+    m_pixelWritesSinceBarrier.clear();
+    m_zWritesSinceBarrier.clear();
+    m_barrierRequested = false;
+    m_callerCacheStale = false;
 }
 
 // VU1 microprogram (MSCAL start pc) whose XGKICK is being drawn, for PS2X_GS_DUMP_AT; ~0u outside VU1.
@@ -1200,13 +1251,14 @@ void GSCpuBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
         // Queued primitives sample CLUT snapshots, so only the source rows matter.
         const auto source = tex0.csm == 0u ? rowBlocks(tex0.cbp, 1u, tex0.cpsm, 0, 15)
                                            : rowBlocks(tex0.cbp, texclut.cbw, tex0.cpsm, texclut.cov, texclut.cov);
-        for (const auto &written : m_pendingWrites)
+        if (overlapsAny(source, m_pendingWrites))
+            DrainUnlocked();
+        // Only CLUT loads use this cache while workers draw, so it would keep pages they have
+        // written since far longer than the immediate rasterizer's does.
+        if (m_callerCacheStale)
         {
-            if (blocksOverlap(source, written))
-            {
-                DrainUnlocked();
-                break;
-            }
+            m_texturePageCaches[0].Invalidate();
+            m_callerCacheStale = false;
         }
         m_clutSnapshotStale = true;
     }
@@ -1338,6 +1390,7 @@ void GSCpuBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t 
 {
     std::lock_guard<std::mutex> lock(m_mutex);
     DrainUnlocked();
+    NoteDirectWrite({GSMem::PageOf(psm, base, bw, x, y) * 32u % kVramBlocks, 32u});
     WriteVramUnlocked(psm, base, bw, x, y, value);
 }
 
@@ -1350,6 +1403,22 @@ void GSCpuBackend::WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, u
 
 void GSCpuBackend::SnapshotVram(std::vector<uint8_t> &out) const
 {
+    // Wait for what is queued now without the lock, so the producer keeps queuing meanwhile
+    // (presentation runs on its own thread); the drain under the lock then only covers what
+    // was queued since.
+    uint64_t queued = 0u;
+    uint32_t workers = 0u;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        queued = m_queueTail.load(std::memory_order_relaxed);
+        workers = m_workerCount;
+    }
+    for (uint32_t i = 0; i < workers; ++i)
+    {
+        while (m_workerProgress[i].done.load(std::memory_order_acquire) < queued)
+            std::this_thread::yield();
+    }
+
     std::lock_guard<std::mutex> lock(m_mutex);
     if (m_dumpRemaining != 0u)
     {
@@ -1488,22 +1557,38 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
 
     if (m_dumpRemaining != 0u)
         DumpPrimitiveUnlocked(batch);
-    if (m_workerCount == 0u || m_dumpRemaining != 0u)
+    const PrimitiveBlocks blocks = primitiveBlocks(batch);
+    // A primitive sampling what it draws is drawn here, in pixel order: split among workers,
+    // which of its own pixels it samples would depend on their timing.
+    const bool feedback = readsOwnWrites(blocks);
+    if (m_workerCount == 0u || m_dumpRemaining != 0u || feedback)
     {
+        if (m_workerCount != 0u)
+            DrainUnlocked();
         const PixelPipeline pixel = MakePixelPipeline(state);
         const TextureSampler texture = MakeTextureSampler(state);
         DrawWith(batch, RasterContext{&pixel, &texture, &m_texturePageCaches[0], 0u, 1u});
+        NoteDirectWrite(blocks.frame);
+        if (blocks.writesZ)
+            NoteDirectWrite(blocks.z);
         if (m_dumpRemaining != 0u && --m_dumpRemaining == 0u)
             DumpFinishUnlocked();
         return;
     }
 
-    // Render to texture: rather than stopping the producer, the workers wait for each other
-    // at this primitive. Depth words follow the owner of their color page, so a Z buffer
-    // reused under another color-page layout (double buffering) also gets a barrier.
-    bool barrier = m_barrierRequested || (state.prim.tme && ReadsPendingWrite(batch));
+    // Rather than stopping the producer, the workers wait for each other at this primitive when
+    // it samples what queued primitives draw (render to texture), draws over what they still
+    // sample, or mixes pixel and depth writes on the same pages (their owners differ). Depth
+    // words follow the owner of their color page, so a Z buffer reused under another color-page
+    // layout (double buffering) also gets a barrier.
+    bool barrier = m_barrierRequested ||
+                   (blocks.samples && (overlapsAny(blocks.texture, m_pixelWritesSinceBarrier) ||
+                                       overlapsAny(blocks.texture, m_zWritesSinceBarrier))) ||
+                   overlapsAny(blocks.frame, m_readsSinceBarrier) || overlapsAny(blocks.frame, m_zWritesSinceBarrier) ||
+                   (blocks.writesZ && (overlapsAny(blocks.z, m_readsSinceBarrier) ||
+                                       overlapsAny(blocks.z, m_pixelWritesSinceBarrier)));
     uint64_t zOwnerKey = 0;
-    const bool writesZ = !state.context.zbuf.zmask;
+    const bool writesZ = blocks.writesZ;
     if (writesZ)
     {
         const auto &frame = state.context.frame;
@@ -1519,7 +1604,8 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
     }
     if (barrier)
     {
-        m_writesSinceBarrier.clear();
+        m_pixelWritesSinceBarrier.clear();
+        m_zWritesSinceBarrier.clear();
         m_readsSinceBarrier.clear();
         m_zOwnerKeys.clear();
         m_barrierRequested = false;
@@ -1537,7 +1623,15 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
     item.upload = false;
     item.barrier = barrier;
     item.area = primitiveArea(batch);
-    NotePendingWrites(batch);
+    NotePendingRange(m_pendingWrites, blocks.frame);
+    NoteBarrierRange(m_pixelWritesSinceBarrier, blocks.frame);
+    if (blocks.writesZ)
+    {
+        NotePendingRange(m_pendingWrites, blocks.z);
+        NoteBarrierRange(m_zWritesSinceBarrier, blocks.z);
+    }
+    if (blocks.samples)
+        NoteBarrierRange(m_readsSinceBarrier, blocks.texture);
     PublishQueueSlotUnlocked();
 }
 
@@ -1555,6 +1649,7 @@ GSCpuBackend::QueuedPrimitive &GSCpuBackend::ReserveQueueSlotUnlocked()
 
 void GSCpuBackend::PublishQueueSlotUnlocked()
 {
+    m_callerCacheStale = true;
     m_queueTail.store(m_queueTail.load(std::memory_order_relaxed) + 1u, std::memory_order_seq_cst);
     if (m_sleepingWorkers.load(std::memory_order_seq_cst) != 0u)
     {
@@ -1645,6 +1740,7 @@ void GSCpuBackend::StartWorkersUnlocked()
     m_workerProgress = std::make_unique<WorkerProgress[]>(m_workerCount);
     for (uint32_t i = 0; i < m_workerCount; ++i)
         m_workers.emplace_back([this, i]() { WorkerMain(i); });
+    std::fprintf(stderr, "[gs] asynchronous rasterization on %u worker threads\n", m_workerCount);
 }
 
 void GSCpuBackend::DrainUnlocked() const
@@ -1655,27 +1751,17 @@ void GSCpuBackend::DrainUnlocked() const
         while (m_workerProgress[i].done.load(std::memory_order_acquire) < tail)
             cpuRelax();
     }
+    // The write lists stay: workers' decoded textures may predate those writes, and the next
+    // primitive sampling them needs the barrier that refreshes them.
     m_pendingWrites.clear();
-    m_writesSinceBarrier.clear();
     m_readsSinceBarrier.clear();
     m_zOwnerKeys.clear();
 }
 
-bool GSCpuBackend::ReadsPendingWrite(const GSPrimitiveBatch &batch) const
+void GSCpuBackend::NoteDirectWrite(std::pair<uint32_t, uint32_t> blocks)
 {
-    if (m_writesSinceBarrier.empty())
-        return false;
-    const auto &tex = batch.state.context.tex0;
-    int firstRow = 0;
-    int lastRow = 0;
-    textureRows(batch, firstRow, lastRow);
-    const auto texture = rowBlocks(tex.tbp0, tex.tbw, tex.psm, firstRow, lastRow);
-    for (const auto &written : m_writesSinceBarrier)
-    {
-        if (blocksOverlap(texture, written))
-            return true;
-    }
-    return false;
+    if (m_workerCount != 0u)
+        NoteBarrierRange(m_pixelWritesSinceBarrier, blocks);
 }
 
 void GSCpuBackend::NotePendingRange(std::vector<std::pair<uint32_t, uint32_t>> &ranges, std::pair<uint32_t, uint32_t> range)
@@ -1713,37 +1799,13 @@ void GSCpuBackend::NoteBarrierRange(std::vector<std::pair<uint32_t, uint32_t>> &
     if (ranges.size() >= kMaxPendingWrites)
     {
         // Too many ranges to track: the next item waits for everything before it.
-        m_writesSinceBarrier.clear();
+        m_pixelWritesSinceBarrier.clear();
+        m_zWritesSinceBarrier.clear();
         m_readsSinceBarrier.clear();
         m_barrierRequested = true;
         return;
     }
     ranges.push_back(range);
-}
-
-void GSCpuBackend::NotePendingWrites(const GSPrimitiveBatch &batch)
-{
-    const auto &ctx = batch.state.context;
-    int firstRow = 0;
-    int lastRow = 0;
-    primitiveRows(batch, firstRow, lastRow);
-    const auto frameRange = rowBlocks(GSInternal::framePageBaseToBlock(ctx.frame.fbp), ctx.frame.fbw, ctx.frame.psm, firstRow, lastRow);
-    NotePendingRange(m_pendingWrites, frameRange);
-    NoteBarrierRange(m_writesSinceBarrier, frameRange);
-    if (!ctx.zbuf.zmask)
-    {
-        const auto zRange = rowBlocks(GSInternal::framePageBaseToBlock(ctx.zbuf.zbp), ctx.frame.fbw, ctx.zbuf.psm, firstRow, lastRow);
-        NotePendingRange(m_pendingWrites, zRange);
-        NoteBarrierRange(m_writesSinceBarrier, zRange);
-    }
-    if (batch.state.prim.tme)
-    {
-        const auto &tex = ctx.tex0;
-        int firstTexRow = 0;
-        int lastTexRow = 0;
-        textureRows(batch, firstTexRow, lastTexRow);
-        NoteBarrierRange(m_readsSinceBarrier, rowBlocks(tex.tbp0, tex.tbw, tex.psm, firstTexRow, lastTexRow));
-    }
 }
 
 void GSCpuBackend::WorkerMain(uint32_t index)
@@ -1780,7 +1842,11 @@ void GSCpuBackend::WorkerMain(uint32_t index)
                     while (m_workerProgress[other].done.load(std::memory_order_acquire) < next)
                         cpuRelax();
                 }
-                // It samples what earlier primitives drew: decoded copies may be out of date.
+                // It samples what earlier primitives drew: cached pages and decoded copies may be
+                // out of date. (The immediate rasterizer's single page cache keeps written pages
+                // hidden until TEXFLUSH, like the GS texture buffer; a worker reads few enough
+                // pages that its cache would keep them far longer, so workers refresh here.)
+                m_texturePageCaches[index + 1u].Invalidate();
                 m_decodedCaches[index + 1u].Invalidate();
             }
             DrawQueued(item, index);
@@ -2541,28 +2607,31 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
         DumpLog("UPLOAD dbp=%u dbw=%u dpsm=0x%x pos=%u,%u size=%ux%u first=%u bytes=%u", unsigned(m_transfer.bitbltbuf.dbp),
                 unsigned(m_transfer.bitbltbuf.dbw), unsigned(m_transfer.bitbltbuf.dpsm), unsigned(m_transfer.trxpos.dsax),
                 unsigned(m_transfer.trxpos.dsay), unsigned(m_transfer.trxreg.rrw), unsigned(m_transfer.trxreg.rrh), firstPixel, sizeBytes);
-    if (m_workerCount == 0u || m_dumpRemaining != 0u)
+    const bool direct = m_workerCount == 0u || m_dumpRemaining != 0u;
+    consumed = WriteUploadPixels(m_transfer, firstPixel, totalPixels, data, sizeBytes, nullptr, direct);
+    const uint32_t rrw = m_transfer.trxreg.rrw;
+    const int firstRow = static_cast<int>(m_transfer.trxpos.dsay + firstPixel / rrw);
+    const int lastRow = static_cast<int>(m_transfer.trxpos.dsay + (firstPixel + std::max(consumed, 1u) - 1u) / rrw);
+    const auto target = rowBlocks(m_transfer.bitbltbuf.dbp, m_transfer.bitbltbuf.dbw, m_transfer.bitbltbuf.dpsm,
+                                  firstRow, std::min(lastRow, 2047));
+    if (direct)
     {
-        consumed = WriteUploadPixels(m_transfer, firstPixel, totalPixels, data, sizeBytes, nullptr, true);
+        NoteDirectWrite(target);
     }
     else
     {
         // Queued like a primitive: each worker writes the destination rows it owns, so pixel
-        // order with drawing is kept. Queued primitives reading the destination must finish
-        // first (barrier); later ones reading it get a barrier through the write ranges.
-        consumed = WriteUploadPixels(m_transfer, firstPixel, totalPixels, data, sizeBytes, nullptr, false);
-        const uint32_t rrw = m_transfer.trxreg.rrw;
-        const int firstRow = static_cast<int>(m_transfer.trxpos.dsay + firstPixel / rrw);
-        const int lastRow = static_cast<int>(m_transfer.trxpos.dsay + (firstPixel + std::max(consumed, 1u) - 1u) / rrw);
-        const auto target = rowBlocks(m_transfer.bitbltbuf.dbp, m_transfer.bitbltbuf.dbw, m_transfer.bitbltbuf.dpsm,
-                                      firstRow, std::min(lastRow, 2047));
-        bool barrier = m_barrierRequested;
-        for (const auto &read : m_readsSinceBarrier)
-            barrier = barrier || blocksOverlap(target, read);
+        // order with drawing is kept. Queued primitives reading the destination, or writing
+        // depth there, must finish first (barrier); later ones reading it get a barrier through
+        // the write ranges.
+        const bool barrier = m_barrierRequested || overlapsAny(target, m_readsSinceBarrier) ||
+                             overlapsAny(target, m_zWritesSinceBarrier);
         if (barrier)
         {
-            m_writesSinceBarrier.clear();
+            m_pixelWritesSinceBarrier.clear();
+            m_zWritesSinceBarrier.clear();
             m_readsSinceBarrier.clear();
+            m_zOwnerKeys.clear();
             m_barrierRequested = false;
         }
         QueuedPrimitive &item = ReserveQueueSlotUnlocked();
@@ -2575,7 +2644,7 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
         item.uploadTotalPixels = totalPixels;
         item.uploadData.assign(data, data + sizeBytes);
         NotePendingRange(m_pendingWrites, target);
-        NoteBarrierRange(m_writesSinceBarrier, target);
+        NoteBarrierRange(m_pixelWritesSinceBarrier, target);
         PublishQueueSlotUnlocked();
     }
 
@@ -2697,6 +2766,8 @@ void GSCpuBackend::PerformLocalToLocalTransfer()
         return;
     }
 
+    NoteDirectWrite(rowBlocks(m_transfer.bitbltbuf.dbp, m_transfer.bitbltbuf.dbw, m_transfer.bitbltbuf.dpsm,
+                              static_cast<int>(m_transfer.trxpos.dsay), static_cast<int>(m_transfer.trxpos.dsay + rrh - 1u)));
     for (uint32_t pixel = 0; pixel < total; ++pixel)
     {
         uint32_t x = pixel % rrw;
@@ -2826,6 +2897,7 @@ bool GSCpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
 
     const uint32_t fbp = GSInternal::framePageBaseToBlock(context.frame.fbp);
     const uint32_t fbw = std::max<uint32_t>(context.frame.fbw, 1u);
+    NoteDirectWrite(rowBlocks(fbp, fbw, context.frame.psm, static_cast<int>(y0), static_cast<int>(y1)));
     if (context.frame.psm == GS_PSM_CT32 || context.frame.psm == GS_PSM_CT24)
     {
         const uint32_t source = static_cast<uint32_t>(r) |
