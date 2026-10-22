@@ -122,6 +122,21 @@ namespace ps2x::iop::detail
                 }
             }
 
+            static uint32_t transferLogCount = 0;
+            for (uint32_t i = 0u; i < pendingCount; ++i)
+            {
+                if (transferLogCount < 64u || (transferLogCount % 512u) == 0u)
+                {
+                    char message[160];
+                    std::snprintf(message, sizeof(message),
+                                  "[IOP sif dma] #%u iop 0x%x -> ee 0x%x (%u bytes) ra=0x%x",
+                                  transferLogCount, pending[i].source, pending[i].destination, pending[i].size,
+                                  cpu.gpr[31]);
+                    m_host.log(LogLevel::Info, message);
+                }
+                ++transferLogCount;
+            }
+
             const uint32_t dmaId = m_nextDmaId++;
             if (m_nextDmaId == 0u || m_nextDmaId > static_cast<uint32_t>(std::numeric_limits<int32_t>::max()))
             {
@@ -179,10 +194,24 @@ namespace ps2x::iop::detail
         case 8:
         case 9:
         case 14: // InitRpc
-        case 15:
-        case 16:
             setV0(0);
             return true;
+        case 15: // sceSifBindRpc
+        case 16: // sceSifCallRpc
+        {
+            static uint32_t logged = 0;
+            if (logged++ < 32u)
+            {
+                char message[160];
+                std::snprintf(message, sizeof(message),
+                              "[IOP sifcmd] unsupported %s client=0x%x a1=0x%x a2=0x%x a3=0x%x ra=0x%x",
+                              ordinal == 15 ? "sceSifBindRpc" : "sceSifCallRpc",
+                              cpu.gpr[4], cpu.gpr[5], cpu.gpr[6], cpu.gpr[7], cpu.gpr[31]);
+                m_host.log(LogLevel::Warning, message);
+            }
+            setV0(0);
+            return true;
+        }
         case 12: // sceSifSendCmd
         case 13: // isceSifSendCmd
         {

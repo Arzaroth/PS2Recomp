@@ -677,6 +677,18 @@ namespace ps2_stubs
 
         if (ok)
         {
+            static uint32_t transferLogCount = 0;
+            for (uint32_t i = 0; i < pendingCount; ++i)
+            {
+                if (transferLogCount < 64u || (transferLogCount % 512u) == 0u)
+                {
+                    RUNTIME_LOG("[EE sif dma] #" << transferLogCount << std::hex << " ee 0x" << pending[i].src
+                                                 << " -> iop 0x" << pending[i].dest << std::dec << " ("
+                                                 << pending[i].size << " bytes)" << std::hex << " ra=0x"
+                                                 << getRegU32(ctx, 31) << std::dec << std::endl);
+                }
+                ++transferLogCount;
+            }
             for (uint32_t i = 0; i < pendingCount; ++i)
             {
                 const Ps2SifDmaTransfer &xfer = pending[i];
