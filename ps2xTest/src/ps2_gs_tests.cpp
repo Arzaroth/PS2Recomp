@@ -1214,6 +1214,55 @@ void register_ps2_gs_tests()
             }
         });
 
+        tc.Run("asynchronous rasterization orders depth tests after color writes to the Z buffer", [](TestCase &t)
+        {
+            // Soulcalibur III's shadow pass: a buffer drawn as color is then the Z buffer of a primitive that tests
+            // depth without writing it. Its pages are owned by other workers than the frame's (base off by one page).
+            constexpr uint64_t kFbw = 4u;
+            constexpr uint64_t kDepthFbp = 65u;
+            auto xyz = [](uint32_t x, uint32_t y, uint32_t z)
+            {
+                return static_cast<uint64_t>(x << 4) | (static_cast<uint64_t>(y << 4) << 16) | (static_cast<uint64_t>(z) << 32);
+            };
+            auto draw = [&](std::vector<uint8_t> &vram, bool async)
+            {
+                GSCpuBackend::SetAsyncRasterization(async);
+                GS gs;
+                gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+                gs.writeRegister(GS_REG_SCISSOR_1, (255ull << 16) | (255ull << 48));
+                gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
+                for (uint32_t frame = 0u; frame < 16u; ++frame)
+                {
+                    gs.writeRegister(GS_REG_FRAME_1, kDepthFbp | (kFbw << 16) | (static_cast<uint64_t>(GS_PSM_CT32) << 24));
+                    gs.writeRegister(GS_REG_ZBUF_1, 300ull | (1ull << 32));
+                    gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
+                    gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_SPRITE));
+                    for (uint32_t band = 0u; band < 16u; ++band)
+                    {
+                        gs.writeRegister(GS_REG_RGBAQ, ((band * 7u + frame * 3u) & 0xFu) << 20);
+                        gs.writeRegister(GS_REG_XYZ2, xyz(0u, band * 16u, 0u));
+                        gs.writeRegister(GS_REG_XYZ2, xyz(256u, band * 16u + 16u, 0u));
+                    }
+
+                    gs.writeRegister(GS_REG_FRAME_1, 0ull | (kFbw << 16) | (static_cast<uint64_t>(GS_PSM_CT32) << 24));
+                    gs.writeRegister(GS_REG_ZBUF_1, kDepthFbp | (1ull << 32));
+                    gs.writeRegister(GS_REG_TEST_1, 0x50000ull);
+                    gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_SPRITE));
+                    gs.writeRegister(GS_REG_RGBAQ, 0x80000000ull | (frame * 0x10u));
+                    gs.writeRegister(GS_REG_XYZ2, xyz(0u, 0u, 0x800000u));
+                    gs.writeRegister(GS_REG_XYZ2, xyz(256u, 256u, 0x800000u));
+                }
+                (void)gs.ReadVram(GS_PSM_CT32, 0u, static_cast<uint32_t>(kFbw), 0u, 0u);
+                GSCpuBackend::SetAsyncRasterization(false);
+            };
+
+            std::vector<uint8_t> immediate(PS2_GS_VRAM_SIZE, 0u);
+            std::vector<uint8_t> async(PS2_GS_VRAM_SIZE, 0u);
+            draw(immediate, false);
+            draw(async, true);
+            t.IsTrue(immediate == async, "worker threads should depth-test against the colors drawn before");
+        });
+
         tc.Run("FBA forces the framebuffer alpha high bit on CT32 writes", [](TestCase &t)
         {
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
