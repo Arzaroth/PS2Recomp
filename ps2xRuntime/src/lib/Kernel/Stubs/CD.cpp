@@ -212,6 +212,41 @@ namespace ps2_stubs
 
     namespace
     {
+        // A drive read takes time: sceCdSync(1) reports the drive busy until the EE cycle the read
+        // would end at (a seek when it does not follow the previous read, then the sectors at the
+        // drive's rate). The data itself is copied when the read is issued.
+        constexpr uint64_t kEeCyclesPerSecond = 294912000u;
+        constexpr uint64_t kCdSeekCycles = kEeCyclesPerSecond / 50u;
+        uint64_t g_cdReadEndCycle = 0u;
+        uint32_t g_cdNextLbn = 0u;
+
+        // PS2X_CD_SECTORS_PER_SECOND: drive rate, 0 for reads that complete at once.
+        uint64_t cdSectorsPerSecond()
+        {
+            static const uint64_t rate = []() -> uint64_t
+            {
+                const char *value = std::getenv("PS2X_CD_SECTORS_PER_SECOND");
+                return value && *value ? std::strtoull(value, nullptr, 0) : kDvdSectorsPerSecondX4;
+            }();
+            return rate;
+        }
+
+        void noteCdRead(PS2Runtime *runtime, uint32_t lbn, uint32_t sectors)
+        {
+            const uint64_t rate = cdSectorsPerSecond();
+            if (!runtime || rate == 0u)
+                return;
+            const uint64_t now = runtime->eeScheduler().currentCycle();
+            const uint64_t seek = lbn == g_cdNextLbn ? 0u : kCdSeekCycles;
+            g_cdReadEndCycle = std::max(g_cdReadEndCycle, now) + seek + sectors * kEeCyclesPerSecond / rate;
+            g_cdNextLbn = lbn + sectors;
+        }
+
+        bool cdBusy(PS2Runtime *runtime)
+        {
+            return runtime && runtime->eeScheduler().currentCycle() < g_cdReadEndCycle;
+        }
+
         // libcdvd N-command callback set by sceCdCallback: called with the finished command,
         // in interrupt context, once an asynchronous command such as sceCdRead completes.
         uint32_t g_cdCallbackFunction = 0u;
@@ -355,6 +390,7 @@ namespace ps2_stubs
             }
             ++readLogCount;
             g_cdStreamingLbn = selected.lbn + selected.sectors;
+            noteCdRead(runtime, selected.lbn, selected.sectors);
             setReturnS32(ctx, 1); // command accepted/success
             // The read completes immediately here; report it like the drive interrupt would.
             queueCdCallback(runtime, kCdFuncRead);
@@ -366,7 +402,11 @@ namespace ps2_stubs
 
     void sceCdSync(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        setReturnS32(ctx, 0); // 0 = completed/not busy
+        // Mode 0 blocks until the read ends; the EE then spends the remaining time waiting.
+        if (getRegU32(ctx, 4) == 0u && cdBusy(runtime))
+            runtime->eeScheduler().accountCycles(static_cast<uint32_t>(
+                std::min<uint64_t>(g_cdReadEndCycle - runtime->eeScheduler().currentCycle(), UINT32_MAX)));
+        setReturnS32(ctx, cdBusy(runtime) ? 1 : 0);
     }
 
     void sceCdGetError(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
