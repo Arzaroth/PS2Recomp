@@ -1073,6 +1073,71 @@ void register_ps2_gs_tests()
             t.IsTrue(immediate == async, "worker threads should produce exactly the immediate rasterizer's VRAM");
         });
 
+        tc.Run("asynchronous rasterization loads a CLUT drawn by queued primitives", [](TestCase &t)
+        {
+            // Each frame draws a palette, flushes the texture buffer, loads it (CLD=1) and samples it: the
+            // load must see that frame's palette even though the workers have not drawn it yet when the
+            // TEX0 write arrives.
+            constexpr uint64_t kClutFbp = 10u;
+            constexpr uint64_t kTextureFbp = 20u;
+            constexpr uint32_t kFrames = 6u;
+            auto xyz = [](uint32_t x, uint32_t y)
+            {
+                return static_cast<uint64_t>(x << 4) | (static_cast<uint64_t>(y << 4) << 16);
+            };
+            auto paletteColor = [](uint32_t frame)
+            {
+                return 0x80000000u | ((frame * 0x25u + 0x11u) & 0xFFu) | (((0xE0u - frame * 0x1Bu) & 0xFFu) << 8) | ((frame * 0x09u) << 16);
+            };
+            auto sprite = [&](GS &gs, uint64_t fbp, uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1, uint64_t prim, uint32_t rgba)
+            {
+                gs.writeRegister(GS_REG_FRAME_1, fbp | (1ull << 16) | (static_cast<uint64_t>(GS_PSM_CT32) << 24));
+                gs.writeRegister(GS_REG_PRIM, prim);
+                gs.writeRegister(GS_REG_RGBAQ, rgba);
+                gs.writeRegister(GS_REG_UV, 0ull);
+                gs.writeRegister(GS_REG_XYZ2, xyz(x0, y0));
+                gs.writeRegister(GS_REG_UV, (16ull << 4) | ((16ull << 4) << 16));
+                gs.writeRegister(GS_REG_XYZ2, xyz(x1, y1));
+            };
+            auto drawFrames = [&](std::vector<uint8_t> &vram, bool async)
+            {
+                GSCpuBackend::SetAsyncRasterization(async);
+                GS gs;
+                gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+                gs.writeRegister(GS_REG_SCISSOR_1, (63ull << 16) | (127ull << 48));
+                gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
+                gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
+                gs.writeRegister(GS_REG_ZBUF_1, 300ull | (1ull << 32));
+                gs.writeRegister(GS_REG_CLAMP_1, (1ull << 0) | (1ull << 2));
+                sprite(gs, kTextureFbp, 0u, 0u, 64u, 32u, GS_PRIM_SPRITE, 0x03020100u);
+                for (uint32_t frame = 0u; frame < kFrames; ++frame)
+                {
+                    sprite(gs, kClutFbp, 0u, 0u, 16u, 16u, GS_PRIM_SPRITE, paletteColor(frame));
+                    gs.writeRegister(GS_REG_TEXFLUSH, 0ull);
+                    gs.writeRegister(GS_REG_TEX0_1, (kTextureFbp * 32ull) | (1ull << 14) | (static_cast<uint64_t>(GS_PSM_T8) << 20) |
+                                                        (4ull << 26) | (4ull << 30) | (1ull << 34) | (1ull << 35) |
+                                                        ((kClutFbp * 32ull) << 37) | (1ull << 61));
+                    sprite(gs, 0u, 0u, frame * 16u, 16u, frame * 16u + 16u, static_cast<uint64_t>(GS_PRIM_SPRITE) | (1ull << 4) | (1ull << 8),
+                           0x80808080u);
+                }
+                std::vector<uint32_t> colors;
+                for (uint32_t frame = 0u; frame < kFrames; ++frame)
+                    colors.push_back(gs.ReadVram(GS_PSM_CT32, 0u, 1u, 8u, frame * 16u + 8u));
+                GSCpuBackend::SetAsyncRasterization(false);
+                return colors;
+            };
+
+            std::vector<uint8_t> immediate(PS2_GS_VRAM_SIZE, 0u);
+            std::vector<uint8_t> async(PS2_GS_VRAM_SIZE, 0u);
+            const std::vector<uint32_t> expected = drawFrames(immediate, false);
+            const std::vector<uint32_t> actual = drawFrames(async, true);
+            for (uint32_t frame = 0u; frame < kFrames; ++frame)
+            {
+                t.Equals(expected[frame], paletteColor(frame), "the immediate rasterizer samples each frame's palette");
+                t.Equals(actual[frame], expected[frame], "the asynchronous rasterizer samples each frame's palette");
+            }
+        });
+
         tc.Run("asynchronous rasterization orders repeated render-to-texture copies", [](TestCase &t)
         {
             // Drakengard's field copy: each frame is drawn into an offscreen buffer, copied into
