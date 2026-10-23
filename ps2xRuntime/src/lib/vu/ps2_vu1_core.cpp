@@ -194,9 +194,9 @@ VU1Interpreter::VU1Interpreter(Unit unit)
     reset();
 }
 
-std::vector<std::pair<uint64_t, VU1Interpreter::CompiledRun>> &VU1Interpreter::compiledPrograms()
+std::vector<VU1Interpreter::CompiledProgram> &VU1Interpreter::compiledPrograms()
 {
-    static std::vector<std::pair<uint64_t, CompiledRun>> programs;
+    static std::vector<CompiledProgram> programs;
     return programs;
 }
 
@@ -226,11 +226,13 @@ void VU1Interpreter::refreshFlagLiveness(const uint8_t *vuCode, uint32_t codeSiz
         m_flagLivenessCache.erase(m_flagLivenessCache.begin());
     CodeImageInfo &image = m_flagLivenessCache.emplace_back();
     image.hash = hash;
-    computeMicrocodeFlagLiveness(vuCode, codeSize, microAddressMask(), image.liveness.data());
-    if (codeSize == kCompiledCodeSize)
-        for (const auto &[compiledHash, run] : compiledPrograms())
-            if (compiledHash == hash)
-                image.compiled = run;
+    if (m_elideDeadFlags)
+        computeMicrocodeFlagLiveness(vuCode, codeSize, microAddressMask(), image.liveness.data());
+    else
+        image.liveness.fill(true);
+    for (const CompiledProgram &program : compiledPrograms())
+        if (program.hash == hash && program.codeSize == codeSize)
+            image.compiled = program.run;
     if (!image.compiled)
         if (const char *dir = std::getenv("PS2X_VU1_DUMP_CODE"); dir && *dir)
         {
@@ -1804,10 +1806,12 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         else if (m_unit == Unit::VU0 && vuCode == memory->getVU0Code())
             decodeStamp = memory->getVU0CodeGeneration() + 1u;
     }
-    if (m_elideDeadFlags && decodeStamp != 0u && decodeStamp != m_flagsLiveStamp)
+    if (decodeStamp != 0u && decodeStamp != m_flagsLiveStamp)
         refreshFlagLiveness(vuCode, codeSize, decodeStamp);
     const FlagLiveness *flagsLive = m_elideDeadFlags && decodeStamp != 0u ? m_flagsLive : nullptr;
-    const CompiledRun compiled = flagsLive ? m_compiledRun : nullptr;
+    // VU1 programs are compiled with flag liveness, VU0 ones (whose flags the EE reads) without.
+    const CompiledRun compiled =
+        decodeStamp != 0u && (m_elideDeadFlags || m_unit == Unit::VU0) ? m_compiledRun : nullptr;
     while (m_cycle < budgetEnd && !m_stopRequested)
     {
         if (compiled)

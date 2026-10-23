@@ -1,7 +1,7 @@
-// Compiles VU1 microcode images ahead of time into C++ that the runtime uses in place of the interpreter
+// Compiles VU0/VU1 microcode images ahead of time into C++ that the runtime uses in place of the interpreter
 // when the uploaded code matches (see VU1Interpreter::CompiledRun).
 //   ps2_vu1_compile <out.cpp> <image.bin>...
-// Images are whole 16 KiB VU1 code memories, as written by PS2X_VU1_DUMP_CODE=<dir>. Each pair becomes the
+// Images are whole VU1 (16 KiB) or VU0 (4 KiB) code memories, as written by PS2X_VU1_DUMP_CODE=<dir>. Each pair becomes the
 // interpreter's step with its decoding as a constant, so timing and results stay those of the interpreter.
 #include "../src/lib/vu/ps2_vu1_step.h"
 
@@ -90,21 +90,30 @@ int main(int argc, char **argv)
                       "#include \"../lib/vu/ps2_vu1_step.h\"\n\n"
                       "namespace\n{\n    using A = Vu1CompiledAccess;\n"
                       "    using PairFn = A::Result (*)(VU1Interpreter &, uint64_t, uint8_t *, uint32_t, GS &, PS2Memory *);\n";
-    VU1Interpreter vu;
+    VU1Interpreter vu0(VU1Interpreter::Unit::VU0);
+    VU1Interpreter vu1(VU1Interpreter::Unit::VU1);
     for (int arg = 2; arg < argc; ++arg)
     {
-        std::vector<uint8_t> code(A::kCodeSize);
+        // VU0 code memory is 4 KiB, VU1's 16 KiB.
         FILE *in = std::fopen(argv[arg], "rb");
-        if (!in || std::fread(code.data(), 1, code.size(), in) != code.size())
+        std::vector<uint8_t> code(0x4000u + 1u);
+        const size_t size = in ? std::fread(code.data(), 1, code.size(), in) : 0u;
+        if (in)
+            std::fclose(in);
+        if (size != 0x1000u && size != 0x4000u)
         {
-            std::fprintf(stderr, "%s: not a %u-byte VU1 code image\n", argv[arg], A::kCodeSize);
+            std::fprintf(stderr, "%s: not a 4 KiB VU0 or 16 KiB VU1 code image\n", argv[arg]);
             return 1;
         }
-        std::fclose(in);
+        code.resize(size);
+        const bool isVu0 = size == 0x1000u;
+        const VU1Interpreter &vu = isVu0 ? vu0 : vu1;
         const uint64_t hash = A::hash(code.data(), static_cast<uint32_t>(code.size()));
-        std::vector<uint8_t> live(code.size() / 8u);
-        A::flagLiveness(code.data(), static_cast<uint32_t>(code.size()), reinterpret_cast<bool *>(live.data()));
-        const std::string id = format("%016llx", static_cast<unsigned long long>(hash));
+        // VU0 flags stay exact: the EE reads them (CFC2) between and during microprograms.
+        std::vector<uint8_t> live(code.size() / 8u, 1u);
+        if (!isVu0)
+            A::flagLiveness(code.data(), static_cast<uint32_t>(code.size()), reinterpret_cast<bool *>(live.data()));
+        const std::string id = format("%s%016llx", isVu0 ? "vu0_" : "vu1_", static_cast<unsigned long long>(hash));
 
         std::string table;
         for (uint32_t pc = 0; pc < code.size(); pc += 8u)
@@ -127,13 +136,13 @@ int main(int argc, char **argv)
                           ".suppressedLowerVf = %uu, .writtenVi = %uu};\n",
                           int(d.iBit), int(d.eBit), int(d.mBit), int(d.dBit), int(d.tBit), unsigned(d.upperVfShadowReg),
                           unsigned(d.suppressedLowerVf), unsigned(d.writtenVi));
-            out += format("        return A::step(vu, d, %s, budgetEnd, [&]() { %s; },\n", live[pc / 8u] ? "true" : "false",
-                          upperCall(d.upper).c_str());
+            out += format("        return A::step(vu, d, %s, budgetEnd, %zuu, [&]() { %s; },\n", live[pc / 8u] ? "true" : "false",
+                          code.size(), upperCall(d.upper).c_str());
             out += format("                       [&]() { A::lower(vu, 0x%08Xu, vuData, dataSize, gs, memory, 0x%08Xu); });\n    }\n",
                           d.lower, d.upper);
             table += "        &" + name + ",\n";
         }
-        out += format("\n    constexpr PairFn kTable%s[%u] = {\n", id.c_str(), A::kCodeSize / 8u) + table + "    };\n";
+        out += format("\n    constexpr PairFn kTable%s[%zu] = {\n", id.c_str(), code.size() / 8u) + table + "    };\n";
         out += format("\n    A::Result run%s(VU1Interpreter &vu, uint64_t budgetEnd, uint8_t *vuData, uint32_t dataSize, GS &gs, "
                       "PS2Memory *memory)\n    {\n"
                       "        while (A::running(vu, budgetEnd))\n        {\n"
@@ -143,8 +152,9 @@ int main(int argc, char **argv)
                       "            if (const A::Result result = pair(vu, budgetEnd, vuData, dataSize, gs, memory); result != A::Result::Next)\n"
                       "                return result;\n"
                       "        }\n        return A::Result::Stop;\n    }\n",
-                      id.c_str(), A::kCodeSize, id.c_str());
-        out += format("\n    const bool kRegistered%s = (A::registerProgram(0x%sull, &run%s), true);\n", id.c_str(), id.c_str(), id.c_str());
+                      id.c_str(), static_cast<unsigned>(code.size()), id.c_str());
+        out += format("\n    const bool kRegistered%s = (A::registerProgram(0x%016llxull, %zuu, &run%s), true);\n", id.c_str(),
+                      static_cast<unsigned long long>(hash), code.size(), id.c_str());
         std::printf("%s -> %s\n", argv[arg], id.c_str());
     }
     out += "}\n";

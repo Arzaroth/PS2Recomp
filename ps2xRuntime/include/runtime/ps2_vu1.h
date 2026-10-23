@@ -194,12 +194,17 @@ private:
     // VU1 only: per pair, whether a flag reader can observe its upper instruction's MAC and status result.
     // Computed once per code image (by content hash) and valid while the decode stamp is m_flagsLiveStamp.
     using FlagLiveness = std::array<bool, kMaxDecodedPairs>;
-    // A microprogram compiled ahead of time (ps2_vu1_compile) for one VU1 code image: runs pairs from the
-    // current pc and returns Next where it has no code, for the interpreter to run that pair.
+    // A microprogram compiled ahead of time (ps2_vu1_compile) for one VU0 or VU1 code image: runs pairs from
+    // the current pc and returns Next where it has no code, for the interpreter to run that pair.
     using CompiledRun = StepResult (*)(VU1Interpreter &vu, uint64_t budgetEnd, uint8_t *vuData, uint32_t dataSize,
                                        GS &gs, PS2Memory *memory);
-    static constexpr uint32_t kCompiledCodeSize = 0x4000u;
-    static std::vector<std::pair<uint64_t, CompiledRun>> &compiledPrograms();
+    struct CompiledProgram
+    {
+        uint64_t hash = 0;
+        uint32_t codeSize = 0;
+        CompiledRun run = nullptr;
+    };
+    static std::vector<CompiledProgram> &compiledPrograms();
     static uint64_t hashMicrocode(const uint8_t *code, uint32_t size);
     static void computeMicrocodeFlagLiveness(const uint8_t *code, uint32_t size, uint32_t pcMask, bool *live);
     struct CodeImageInfo

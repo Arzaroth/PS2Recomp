@@ -321,17 +321,16 @@ struct Vu1CompiledAccess
     using Operand = VU1Interpreter::FmacOperand;
     using UpperHandler = VU1Interpreter::UpperHandler;
     using Run = VU1Interpreter::CompiledRun;
-    static constexpr uint32_t kCodeSize = VU1Interpreter::kCompiledCodeSize;
 
     static bool running(const VU1Interpreter &vu, uint64_t budgetEnd) { return vu.m_cycle < budgetEnd && !vu.m_stopRequested; }
     static uint32_t pc(const VU1Interpreter &vu) { return vu.m_state.pc; }
 
     template <typename Upper, typename Lower>
     __attribute__((always_inline)) static Result step(VU1Interpreter &vu, const Pair &decoded, bool flagsLive, uint64_t budgetEnd,
-                                                      Upper &&upper, Lower &&lower)
+                                                      uint32_t codeSize, Upper &&upper, Lower &&lower)
     {
         vu.m_currentFlagsLive = flagsLive;
-        return vu.stepPair(decoded, budgetEnd, VU1Interpreter::kCompiledCodeSize, upper, lower);
+        return vu.stepPair(decoded, budgetEnd, codeSize, upper, lower);
     }
     template <Kind K, Operand O, bool ToAcc>
     __attribute__((always_inline)) static void fmac(VU1Interpreter &vu, uint32_t upper)
@@ -349,13 +348,16 @@ struct Vu1CompiledAccess
         [[clang::always_inline]] vu.execLower(lower, vuData, dataSize, gs, memory, upper);
     }
 
-    static void registerProgram(uint64_t hash, Run run) { VU1Interpreter::compiledPrograms().emplace_back(hash, run); }
+    static void registerProgram(uint64_t hash, uint32_t codeSize, Run run)
+    {
+        VU1Interpreter::compiledPrograms().push_back({hash, codeSize, run});
+    }
 
     // For the generator.
     static uint64_t hash(const uint8_t *code, uint32_t size) { return VU1Interpreter::hashMicrocode(code, size); }
     static void flagLiveness(const uint8_t *code, uint32_t size, bool *live)
     {
-        VU1Interpreter::computeMicrocodeFlagLiveness(code, size, 0x3FFFu, live);
+        VU1Interpreter::computeMicrocodeFlagLiveness(code, size, size - 1u, live);
     }
     static Pair decode(const VU1Interpreter &vu, const uint8_t *code, uint32_t pc) { return vu.decodeInstructionPair(code, pc); }
     static UpperHandler upperHandler(uint32_t upper) { return VU1Interpreter::selectUpperHandler(upper); }
