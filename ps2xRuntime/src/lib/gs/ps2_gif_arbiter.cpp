@@ -60,19 +60,83 @@ namespace ps2_gif_path_stats
     }
 }
 
-void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool path2DirectHl)
+void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool path2DirectHl, bool continueTags)
 {
     if (!data || sizeBytes < 16 || !m_processFn)
         return;
 
     ps2_gif_path_stats::notePacket(pathId, data, sizeBytes);
     GifArbiterPacket pkt;
+    if (continueTags)
+        pkt.data = completeTags(pathId, data, sizeBytes);
+    else
+        pkt.data.assign(data, data + sizeBytes);
+    if (pkt.data.size() < 16u)
+        return;
     pkt.pathId = pathId;
     pkt.path2DirectHl = (pathId == GifPathId::Path2) && path2DirectHl;
-    pkt.path3Image = (pathId == GifPathId::Path3) && isImagePacket(data, sizeBytes);
-    pkt.data.resize(sizeBytes);
-    std::memcpy(pkt.data.data(), data, sizeBytes);
+    pkt.path3Image = (pathId == GifPathId::Path3) && isImagePacket(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
     m_queue.push_back(std::move(pkt));
+}
+
+std::vector<uint8_t> GifArbiter::completeTags(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes)
+{
+    PathContinuation &pending = m_continuations[static_cast<size_t>(pathId) & 3u];
+    std::vector<uint8_t> packet;
+    packet.reserve(sizeBytes + pending.bytes.size() + 16u);
+    if (pending.loopsLeft != 0u)
+    {
+        constexpr uint64_t kNloopMask = 0x7FFFull;
+        constexpr uint64_t kPre = 1ull << 46;
+        const uint64_t tagLo = (pending.tagLo & ~(kNloopMask | kPre)) | pending.loopsLeft;
+        packet.resize(16u);
+        std::memcpy(packet.data(), &tagLo, 8u);
+        std::memcpy(packet.data() + 8u, &pending.tagHi, 8u);
+        packet.insert(packet.end(), pending.bytes.begin(), pending.bytes.end());
+    }
+    packet.insert(packet.end(), data, data + sizeBytes);
+    pending.loopsLeft = 0u;
+    pending.bytes.clear();
+
+    size_t offset = 0;
+    while (offset + 16u <= packet.size())
+    {
+        uint64_t tagLo = 0;
+        uint64_t tagHi = 0;
+        std::memcpy(&tagLo, packet.data() + offset, 8u);
+        std::memcpy(&tagHi, packet.data() + offset + 8u, 8u);
+        const uint32_t nloop = static_cast<uint32_t>(tagLo & 0x7FFFu);
+        const uint32_t flg = static_cast<uint32_t>((tagLo >> 58) & 0x3u);
+        uint32_t nreg = static_cast<uint32_t>((tagLo >> 60) & 0xFu);
+        if (nreg == 0u)
+            nreg = 16u;
+        const size_t loopBytes = flg == 0u ? nreg * 16u : flg == 1u ? nreg * 8u : 16u;
+        const size_t dataBytes = flg == 1u ? ((static_cast<size_t>(nloop) * nreg + 1u) & ~size_t{1}) * 8u : nloop * loopBytes;
+        if (offset + 16u + dataBytes <= packet.size())
+        {
+            offset += 16u + dataBytes;
+            continue;
+        }
+        // The tag continues in the path's next transfer. A REGLIST cut must fall on a whole quadword.
+        uint32_t loops = static_cast<uint32_t>((packet.size() - offset - 16u) / loopBytes);
+        if (flg == 1u && loops != 0u && ((loops * nreg) & 1u) != 0u)
+            --loops;
+        const size_t cut = offset + 16u + loops * loopBytes;
+        pending.tagLo = tagLo;
+        pending.tagHi = tagHi;
+        pending.loopsLeft = nloop - loops;
+        pending.bytes.assign(packet.begin() + static_cast<std::ptrdiff_t>(cut), packet.end());
+        if (loops == 0u)
+        {
+            packet.resize(offset);
+            break;
+        }
+        const uint64_t partLo = (tagLo & ~(0x7FFFull | (1ull << 15))) | loops;
+        std::memcpy(packet.data() + offset, &partLo, 8u);
+        packet.resize(cut);
+        break;
+    }
+    return packet;
 }
 
 void GifArbiter::drain()
