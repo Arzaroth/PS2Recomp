@@ -1,4 +1,5 @@
 #include "MiniTest.h"
+#include "runtime/gs/gs_draw_estimate.h"
 #include "runtime/ps2_memory.h"
 #include "ps2_runtime.h"
 #include "ps2_stubs.h"
@@ -4896,6 +4897,37 @@ void register_ps2_gs_tests()
             }
             t.IsTrue(pattern2Ok,
                      "second T4HL transfer to a different DBP should be byte-correct, proving the discarded excess bytes from the first transfer did not leak into subsequent transfer state");
+        });
+
+        tc.Run("GS draw estimate charges scissored sprite and triangle area", [](TestCase &t)
+        {
+            const auto xyz2 = [](uint32_t x, uint32_t y) { return static_cast<uint64_t>(x << 4) | (static_cast<uint64_t>(y << 4) << 16); };
+            GsDrawEstimate estimate;
+            estimate.writeRegister(GS_REG_XYOFFSET_1, (100ull << 4) | ((200ull << 4) << 32));
+            estimate.writeRegister(GS_REG_PRIM, 6u);
+            estimate.writeRegister(GS_REG_XYZ2, xyz2(100, 200));
+            estimate.writeRegister(GS_REG_XYZ2, xyz2(164, 232));
+            t.Equals(estimate.takeCycles(), 32ull + 64ull * 32ull / 2ull, "a 64x32 sprite fills 2048 pixels at half an EE cycle each");
+            t.Equals(estimate.takeCycles(), 0ull, "taking the estimate restarts it");
+
+            estimate.writeRegister(GS_REG_SCISSOR_1, (15ull << 16) | (15ull << 48));
+            estimate.writeRegister(GS_REG_PRIM, 6u);
+            estimate.writeRegister(GS_REG_XYZ2, xyz2(100, 200));
+            estimate.writeRegister(GS_REG_XYZ2, xyz2(164, 264));
+            t.Equals(estimate.takeCycles(), 32ull + 16ull * 16ull / 2ull, "only the scissored 16x16 pixels are filled");
+
+            estimate.writeRegister(GS_REG_SCISSOR_1, (2047ull << 16) | (2047ull << 48));
+            estimate.writeRegister(GS_REG_PRIM, 4u);
+            estimate.writeRegister(GS_REG_XYZ2, xyz2(100, 200));
+            estimate.writeRegister(GS_REG_XYZ2, xyz2(132, 200));
+            estimate.writeRegister(GS_REG_XYZ2, xyz2(100, 232));
+            estimate.writeRegister(GS_REG_XYZ2, xyz2(132, 232));
+            t.Equals(estimate.takeCycles(), 2ull * (32ull + 512ull / 2ull), "a 32x32 triangle strip quad is two 512-pixel triangles");
+
+            estimate.writeRegister(GS_REG_PRIM, 6u);
+            estimate.writeRegister(GS_REG_XYZ3, xyz2(100, 200));
+            estimate.writeRegister(GS_REG_XYZ3, xyz2(164, 232));
+            t.Equals(estimate.takeCycles(), 0ull, "XYZ3 adds vertices without drawing");
         });
     });
 }
