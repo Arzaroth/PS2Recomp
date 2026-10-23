@@ -1,3 +1,6 @@
+#ifndef PS2_VU1_LOWER_H
+#define PS2_VU1_LOWER_H
+
 #include "runtime/ps2_vu1.h"
 #include "runtime/gs/ps2_gif_arbiter.h"
 #include "runtime/gs/gs_frontend.h"
@@ -8,9 +11,9 @@
 #include <cstring>
 #include <limits>
 
-namespace
+namespace ps2_vu1_lower_ops
 {
-    float vuEatan(float value)
+    inline float vuEatan(float value)
     {
         constexpr float coefficients[] = {
             0.999999344348907f,
@@ -30,7 +33,7 @@ namespace
         return quarterPi + value * polynomial;
     }
 
-    float vuEsin(float value)
+    inline float vuEsin(float value)
     {
         constexpr float coefficients[] = {
             1.0f,
@@ -46,7 +49,7 @@ namespace
         return value * polynomial;
     }
 
-    float vuEexp(float value)
+    inline float vuEexp(float value)
     {
         constexpr float coefficients[] = {
             0.249998688697815f,
@@ -65,11 +68,12 @@ namespace
         return polynomial != 0.0f ? 1.0f / polynomial : std::numeric_limits<float>::max();
     }
 }
+using namespace ps2_vu1_lower_ops;
 
 // ============================================================================
 // Lower instructions
 // ============================================================================
-void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSize, GS &gs, PS2Memory *memory, uint32_t upperInstr)
+inline void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSize, GS &gs, PS2Memory *memory, uint32_t upperInstr)
 {
     (void)upperInstr;
     if (instr == 0x00000000 || instr == 0x8000033C) // NOP
@@ -790,3 +794,5 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
         break;
     }
 }
+
+#endif

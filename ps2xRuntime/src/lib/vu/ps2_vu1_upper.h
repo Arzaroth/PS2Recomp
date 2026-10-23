@@ -1,3 +1,6 @@
+#ifndef PS2_VU1_UPPER_H
+#define PS2_VU1_UPPER_H
+
 #include "runtime/ps2_vu1.h"
 #include "ps2_vu1_detail.h"
 
@@ -9,9 +12,9 @@
 #include <cstring>
 #include <limits>
 
-namespace
+namespace ps2_vu1_upper_ops
 {
-    int32_t vuFloatToInt(float value, float scale)
+    inline int32_t vuFloatToInt(float value, float scale)
     {
         const double scaled = static_cast<double>(value) * static_cast<double>(scale);
         if (scaled >= static_cast<double>(std::numeric_limits<int32_t>::max()))
@@ -26,7 +29,7 @@ namespace
     // interpreter's FE_TOWARDZERO mode does. A plain IEEE sum differs by one ulp when the small
     // operand has the opposite sign: Valkyrie Profile 2 derives its file decryption key on VU0
     // and depends on the exact PS2 result (PCSX2 hardcodes these additions as a "TriAce hack").
-    float vuAdd(float a, float b)
+    inline float vuAdd(float a, float b)
     {
 
         uint32_t ua = 0u;
@@ -46,14 +49,14 @@ namespace
         return a + b;
     }
 
-    float vuSub(float a, float b)
+    inline float vuSub(float a, float b)
     {
         return vuAdd(a, -b);
     }
 
     // MAX/MINI compare raw sign-magnitude bit patterns and pass the chosen operand through unchanged, so
     // denormals (often integer data, e.g. colors unpacked by VIF) and exponent-255 values survive.
-    int64_t vuMinMaxKey(float value)
+    inline int64_t vuMinMaxKey(float value)
     {
         uint32_t bits = 0u;
         std::memcpy(&bits, &value, sizeof(bits));
@@ -61,11 +64,11 @@ namespace
         return (bits & 0x80000000u) != 0u ? -magnitude : magnitude;
     }
 
-    float vuMax(float a, float b) { return vuMinMaxKey(a) > vuMinMaxKey(b) ? a : b; }
-    float vuMini(float a, float b) { return vuMinMaxKey(a) < vuMinMaxKey(b) ? a : b; }
+    inline float vuMax(float a, float b) { return vuMinMaxKey(a) > vuMinMaxKey(b) ? a : b; }
+    inline float vuMini(float a, float b) { return vuMinMaxKey(a) < vuMinMaxKey(b) ? a : b; }
 
     // normalizeOperand() on four lanes: denormals become signed zero, exponent 255 becomes +-FLT_MAX.
-    void normalizeVector(const float *source, float *target)
+    inline void normalizeVector(const float *source, float *target)
     {
         const __m128i bits = _mm_loadu_si128(reinterpret_cast<const __m128i *>(source));
         const __m128i exponentMask = _mm_set1_epi32(0x7F800000);
@@ -80,9 +83,9 @@ namespace
     }
 }
 
-namespace
+namespace ps2_vu1_upper_ops
 {
-    __m128 normalizeLanes(__m128 value)
+    inline __m128 normalizeLanes(__m128 value)
     {
         alignas(16) float lanes[4];
         _mm_store_ps(lanes, value);
@@ -91,7 +94,7 @@ namespace
     }
 
     // vuAdd on four lanes. 1 << shift comes from converting 2^shift, since SSE4 has no variable shift.
-    __m128 vuAdd4(__m128 a, __m128 b)
+    inline __m128 vuAdd4(__m128 a, __m128 b)
     {
         const __m128i ua = _mm_castps_si128(a);
         const __m128i ub = _mm_castps_si128(b);
@@ -113,20 +116,21 @@ namespace
         return _mm_add_ps(_mm_castsi128_ps(maskedA), _mm_castsi128_ps(maskedB));
     }
 
-    __m128 destLaneMask(uint8_t dest)
+    inline __m128 destLaneMask(uint8_t dest)
     {
         return _mm_castsi128_ps(_mm_set_epi32((dest & 1u) ? -1 : 0, (dest & 2u) ? -1 : 0, (dest & 4u) ? -1 : 0,
                                               (dest & 8u) ? -1 : 0));
     }
 }
+using namespace ps2_vu1_upper_ops;
 
-void VU1Interpreter::execUpperNop(uint32_t instr)
+inline void VU1Interpreter::execUpperNop(uint32_t instr)
 {
     m_currentUpperInstruction = instr;
 }
 
 template <VU1Interpreter::FmacKind Kind, VU1Interpreter::FmacOperand Operand, bool ToAcc>
-void VU1Interpreter::execFmac(uint32_t instr)
+inline void VU1Interpreter::execFmac(uint32_t instr)
 {
     m_currentUpperInstruction = instr;
     const uint8_t dest = DEST(instr);
@@ -191,7 +195,7 @@ void VU1Interpreter::execFmac(uint32_t instr)
     _mm_storeu_ps(target, _mm_blendv_ps(_mm_loadu_ps(target), r, destLaneMask(dest)));
 }
 
-VU1Interpreter::UpperHandler VU1Interpreter::selectUpperHandler(uint32_t upper)
+inline VU1Interpreter::UpperHandler VU1Interpreter::selectUpperHandler(uint32_t upper)
 {
     using K = FmacKind;
     using O = FmacOperand;
@@ -257,7 +261,7 @@ VU1Interpreter::UpperHandler VU1Interpreter::selectUpperHandler(uint32_t upper)
 // ============================================================================
 // Upper instructions (FMAC pipeline)
 // ============================================================================
-void VU1Interpreter::execUpper(uint32_t instr)
+inline void VU1Interpreter::execUpper(uint32_t instr)
 {
     m_currentUpperInstruction = instr;
     uint8_t dest = DEST(instr);
@@ -775,3 +779,5 @@ void VU1Interpreter::execUpper(uint32_t instr)
         return;
     }
 }
+
+#endif

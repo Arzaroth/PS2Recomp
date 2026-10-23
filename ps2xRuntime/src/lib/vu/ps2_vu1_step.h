@@ -4,6 +4,8 @@
 // The interpreter's per-pair step, inline so code generated for a known microprogram can constant-fold it
 // for each decoded pair.
 #include "runtime/ps2_vu1.h"
+#include "ps2_vu1_lower.h"
+#include "ps2_vu1_upper.h"
 
 #include <algorithm>
 #include <cstring>
