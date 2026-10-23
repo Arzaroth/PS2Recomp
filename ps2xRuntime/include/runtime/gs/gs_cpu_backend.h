@@ -56,7 +56,8 @@ public:
 private:
     bool m_asyncAllowed = true;
     void ResetUnlocked();
-    void LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &texclut);
+    // Loads the CLUT entries tex0 selects into clut, reading VRAM through the caller's page cache or directly.
+    void LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &texclut, std::array<uint16_t, 512> &clut, bool callerCache);
     uint32_t ReadVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const;
     uint32_t ReadTextureVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y);
     void WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value);

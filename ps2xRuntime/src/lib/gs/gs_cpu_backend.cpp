@@ -1327,7 +1327,8 @@ void GSCpuBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
         }
         m_clutSnapshotStale = true;
     }
-    LoadClutUnlocked(tex0, texclut);
+    ++m_clutSerial;
+    LoadClutUnlocked(tex0, texclut, m_clut, true);
 }
 
 const std::array<uint16_t, 512> *GSCpuBackend::ClutSnapshotUnlocked(uint64_t queueIndex)
@@ -1354,9 +1355,9 @@ const std::array<uint16_t, 512> *GSCpuBackend::ClutSnapshotUnlocked(uint64_t que
     return &m_clutSnapshots[m_clutSnapshotSlot];
 }
 
-void GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
+void GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &texclut, std::array<uint16_t, 512> &clut,
+                                    bool callerCache)
 {
-    ++m_clutSerial;
     const bool fourBit = isFourBitIndexedPsm(tex0.psm);
     const bool sixteenBit = tex0.cpsm == GS_PSM_CT16 || tex0.cpsm == GS_PSM_CT16S;
     const bool thirtyTwoBit = tex0.cpsm == GS_PSM_CT32 || tex0.cpsm == GS_PSM_CT24;
@@ -1389,16 +1390,17 @@ void GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &t
             sourceY = static_cast<uint32_t>(texclut.cov);
         }
 
-        const uint32_t raw = ReadTextureVramUnlocked(tex0.cpsm, tex0.cbp, sourceWidth, sourceX, sourceY); 
+        const uint32_t raw = callerCache ? ReadTextureVramUnlocked(tex0.cpsm, tex0.cbp, sourceWidth, sourceX, sourceY)
+                                         : ReadVramUnlocked(tex0.cpsm, tex0.cbp, sourceWidth, sourceX, sourceY);
         const uint32_t destination = (loadCsm1Suffix ? entry : destinationBase + entry) & (sixteenBit ? 0x1FFu : 0x0FFu);
         if (sixteenBit)
         {
-            m_clut[destination] = static_cast<uint16_t>(raw);
+            clut[destination] = static_cast<uint16_t>(raw);
         }
         else
         {
-            m_clut[destination] = static_cast<uint16_t>(raw & 0xFFFFu);
-            m_clut[destination + 256u] = static_cast<uint16_t>(raw >> 16u);
+            clut[destination] = static_cast<uint16_t>(raw & 0xFFFFu);
+            clut[destination + 256u] = static_cast<uint16_t>(raw >> 16u);
         }
     }
 }
