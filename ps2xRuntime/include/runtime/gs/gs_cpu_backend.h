@@ -69,6 +69,12 @@ private:
     PixelPipeline MakePixelPipeline(const GSDrawState &state) const;
     TextureSampler MakeTextureSampler(const GSDrawState &state) const;
     const std::array<uint16_t, 512> *ClutSnapshotUnlocked(uint64_t queueIndex);
+    uint32_t AcquireClutSlotUnlocked();
+    // A CLUT load from VRAM that queued primitives still draw is queued too (DeferClutLoadUnlocked): a
+    // worker fills the next snapshot slot when the queue reaches it. m_clut catches up on the next
+    // synchronous use (ResolveDeferredClutUnlocked).
+    void DeferClutLoadUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &texclut, std::pair<uint32_t, uint32_t> source);
+    void ResolveDeferredClutUnlocked();
 
     void DrawPrimitive(const GSPrimitiveBatch &batch);
     void DrawSprite(const GSPrimitiveBatch &batch, const RasterContext &raster);
@@ -106,6 +112,7 @@ private:
     bool OverlapsInFlightUnlocked(std::pair<uint32_t, uint32_t> range, bool includeReads) const;
     void PublishQueueSlotUnlocked();
     void DrawQueued(const QueuedPrimitive &item, uint32_t index);
+    void FillDeferredClut(const QueuedPrimitive &item, uint64_t queueIndex);
     void DrawWith(const GSPrimitiveBatch &batch, const RasterContext &raster);
     void WorkerMain(uint32_t index);
 
@@ -148,6 +155,10 @@ private:
     std::vector<uint64_t> m_clutSnapshotLastUse; // queue index + 1 of the slot's last user
     uint32_t m_clutSnapshotSlot = 0;
     bool m_clutSnapshotStale = true;
+    // Queue index + 1 of the deferred load that last filled each slot.
+    std::unique_ptr<std::atomic<uint64_t>[]> m_clutSlotFilled;
+    bool m_clutDeferred = false;     // m_clutSnapshotSlot holds a deferred load newer than m_clut
+    uint64_t m_clutDeferredReady = 0; // its m_clutSlotFilled value once filled
     std::vector<GSMem::TexturePageCache> m_texturePageCaches; // [0] caller (CLUT loads), [1 + i] worker i
     std::vector<DecodedTextureCache> m_decodedCaches;           // same indexing, used by workers only
     uint64_t m_clutSerial = 1;                                  // bumped whenever m_clut changes

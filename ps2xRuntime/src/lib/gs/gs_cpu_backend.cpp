@@ -964,6 +964,18 @@ struct GSCpuBackend::QueuedPrimitive
     uint8_t writeCount = 0;
     std::pair<uint32_t, uint32_t> reads{};
     bool samples = false;
+    // Deferred CLUT load instead of a primitive: worker clutFiller copies slot clutBase (once it holds
+    // clutBaseReady) to slot clutSlot and loads into it from clutSource.
+    bool clutLoad = false;
+    GSTex0Reg clutTex0{};
+    GSTexClutReg clutTexclut{};
+    std::pair<uint32_t, uint32_t> clutSource{};
+    uint32_t clutFiller = 0;
+    uint32_t clutBase = 0;
+    uint64_t clutBaseReady = 0;
+    // A primitive sampling a deferred CLUT waits until slot clutSlot holds clutReady.
+    uint32_t clutSlot = 0;
+    uint64_t clutReady = 0;
 };
 
 // Texels converted to RGBA (TEXA and CLUT applied) in a linear array, filled by 32x32 tiles on
@@ -1174,6 +1186,7 @@ void GSCpuBackend::ResetUnlocked()
 {
     m_clut.fill(0u);
     m_clutSnapshotStale = true;
+    m_clutDeferred = false;
     ++m_clutSerial;
     for (DecodedTextureCache &cache : m_decodedCaches)
         cache.Invalidate();
@@ -1315,8 +1328,12 @@ void GSCpuBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
         // Queued primitives sample CLUT snapshots, so only the source rows matter.
         const auto source = tex0.csm == 0u ? rowBlocks(tex0.cbp, 1u, tex0.cpsm, 0, 15)
                                            : rowBlocks(tex0.cbp, texclut.cbw, tex0.cpsm, texclut.cov, texclut.cov);
-        if (OverlapsInFlightUnlocked(source, false))
-            DrainUnlocked();
+        if (OverlapsInFlightUnlocked(source, false) && m_dumpRemaining == 0u)
+        {
+            DeferClutLoadUnlocked(tex0, texclut, source);
+            return;
+        }
+        ResolveDeferredClutUnlocked();
         // Only CLUT loads use this cache while workers draw, so it would keep pages they have
         // written since far longer than the immediate rasterizer's does.
         if (m_callerCacheStale)
@@ -1331,28 +1348,95 @@ void GSCpuBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
     LoadClutUnlocked(tex0, texclut, m_clut, true);
 }
 
+uint32_t GSCpuBackend::AcquireClutSlotUnlocked()
+{
+    if (m_clutSnapshots.empty())
+    {
+        m_clutSnapshots.resize(kClutSnapshots);
+        m_clutSnapshotLastUse.assign(kClutSnapshots, 0u);
+        m_clutSlotFilled = std::make_unique<std::atomic<uint64_t>[]>(kClutSnapshots);
+    }
+    m_clutSnapshotSlot = (m_clutSnapshotSlot + 1u) % kClutSnapshots;
+    // The slot's previous users must be drawn before it is overwritten.
+    const uint64_t lastUse = m_clutSnapshotLastUse[m_clutSnapshotSlot];
+    for (uint32_t i = 0; i < m_workerCount; ++i)
+    {
+        while (m_workerProgress[i].done.load(std::memory_order_acquire) < lastUse)
+            cpuRelax();
+    }
+    return m_clutSnapshotSlot;
+}
+
 const std::array<uint16_t, 512> *GSCpuBackend::ClutSnapshotUnlocked(uint64_t queueIndex)
 {
-    if (m_clutSnapshotStale || m_clutSnapshots.empty())
+    if (!m_clutDeferred && (m_clutSnapshotStale || m_clutSnapshots.empty()))
     {
-        if (m_clutSnapshots.empty())
-        {
-            m_clutSnapshots.resize(kClutSnapshots);
-            m_clutSnapshotLastUse.assign(kClutSnapshots, 0u);
-        }
-        m_clutSnapshotSlot = (m_clutSnapshotSlot + 1u) % kClutSnapshots;
-        // The slot's previous users must be drawn before it is overwritten.
-        const uint64_t lastUse = m_clutSnapshotLastUse[m_clutSnapshotSlot];
-        for (uint32_t i = 0; i < m_workerCount; ++i)
-        {
-            while (m_workerProgress[i].done.load(std::memory_order_acquire) < lastUse)
-                cpuRelax();
-        }
-        m_clutSnapshots[m_clutSnapshotSlot] = m_clut;
+        m_clutSnapshots[AcquireClutSlotUnlocked()] = m_clut;
         m_clutSnapshotStale = false;
     }
     m_clutSnapshotLastUse[m_clutSnapshotSlot] = queueIndex + 1u;
     return &m_clutSnapshots[m_clutSnapshotSlot];
+}
+
+void GSCpuBackend::DeferClutLoadUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &texclut, std::pair<uint32_t, uint32_t> source)
+{
+    const uint64_t index = m_queueTail.load(std::memory_order_relaxed);
+    ClutSnapshotUnlocked(index);
+    const uint32_t base = m_clutSnapshotSlot;
+    const uint64_t baseReady = m_clutDeferred ? m_clutDeferredReady : 0u;
+    const uint32_t slot = AcquireClutSlotUnlocked();
+    m_clutSnapshotLastUse[slot] = index + 1u;
+
+    QueuedPrimitive &item = ReserveQueueSlotUnlocked();
+    item.textureFlush = false;
+    item.upload = false;
+    item.barrier = false;
+    item.writeCount = 0u;
+    item.samples = false;
+    item.clutLoad = true;
+    item.clutTex0 = tex0;
+    item.clutTexclut = texclut;
+    item.clutSource = source;
+    item.clutFiller = (source.first / 32u) % m_workerCount;
+    item.clutBase = base;
+    item.clutBaseReady = baseReady;
+    item.clutSlot = slot;
+    item.clutReady = 0u;
+    PublishQueueSlotUnlocked();
+
+    m_clutDeferred = true;
+    m_clutDeferredReady = index + 1u;
+    m_clutSnapshotStale = false;
+    ++m_clutSerial;
+}
+
+void GSCpuBackend::ResolveDeferredClutUnlocked()
+{
+    if (!m_clutDeferred)
+        return;
+    while (m_clutSlotFilled[m_clutSnapshotSlot].load(std::memory_order_acquire) < m_clutDeferredReady)
+        cpuRelax();
+    m_clut = m_clutSnapshots[m_clutSnapshotSlot];
+    m_clutDeferred = false;
+}
+
+void GSCpuBackend::FillDeferredClut(const QueuedPrimitive &item, uint64_t queueIndex)
+{
+    // Every queued write to the source pages comes before this item, from the pages' owners.
+    const uint32_t firstPage = item.clutSource.first / 32u;
+    const uint32_t pages = std::min<uint32_t>((item.clutSource.first % 32u + item.clutSource.second + 31u) / 32u, m_workerCount);
+    for (uint32_t i = 0; i < pages; ++i)
+    {
+        const uint32_t owner = (firstPage + i) % m_workerCount;
+        while (m_workerProgress[owner].done.load(std::memory_order_acquire) < queueIndex)
+            cpuRelax();
+    }
+    while (m_clutSlotFilled[item.clutBase].load(std::memory_order_acquire) < item.clutBaseReady)
+        cpuRelax();
+    std::array<uint16_t, 512> &clut = m_clutSnapshots[item.clutSlot];
+    clut = m_clutSnapshots[item.clutBase];
+    LoadClutUnlocked(item.clutTex0, item.clutTexclut, clut, false);
+    m_clutSlotFilled[item.clutSlot].store(queueIndex + 1u, std::memory_order_release);
 }
 
 void GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &texclut, std::array<uint16_t, 512> &clut,
@@ -1426,6 +1510,8 @@ void GSCpuBackend::TextureFlush()
     item.barrier = false;
     item.writeCount = 0u;
     item.samples = false;
+    item.clutLoad = false;
+    item.clutReady = 0u;
     PublishQueueSlotUnlocked();
 }
 
@@ -1634,7 +1720,10 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
     if (m_workerCount == 0u || m_dumpRemaining != 0u || feedback)
     {
         if (m_workerCount != 0u)
+        {
             DrainUnlocked();
+            ResolveDeferredClutUnlocked();
+        }
         const PixelPipeline pixel = MakePixelPipeline(state);
         TextureSampler texture = MakeTextureSampler(state);
         // Drawn in pixel order, a primitive sampling its own target must see its own writes.
@@ -1708,7 +1797,14 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
     item.pixel = MakePixelPipeline(state);
     item.texture = MakeTextureSampler(state);
     if (state.prim.tme && (isFourBitIndexedPsm(state.context.tex0.psm) || isEightBitIndexedPsm(state.context.tex0.psm)))
+    {
         item.texture.clut = ClutSnapshotUnlocked(m_queueTail.load(std::memory_order_relaxed));
+        item.clutSlot = m_clutSnapshotSlot;
+        item.clutReady = m_clutDeferred ? m_clutDeferredReady : 0u;
+    }
+    else
+        item.clutReady = 0u;
+    item.clutLoad = false;
     item.textureFlush = false;
     item.upload = false;
     item.barrier = barrier;
@@ -1776,6 +1872,13 @@ void GSCpuBackend::PublishQueueSlotUnlocked()
 
 void GSCpuBackend::DrawQueued(const QueuedPrimitive &item, uint32_t index)
 {
+    if (item.clutLoad)
+        return;
+    if (item.clutReady != 0u)
+    {
+        while (m_clutSlotFilled[item.clutSlot].load(std::memory_order_acquire) < item.clutReady)
+            cpuRelax();
+    }
     if (item.textureFlush)
     {
         m_texturePageCaches[index + 1u].Invalidate();
@@ -1986,6 +2089,8 @@ void GSCpuBackend::WorkerMain(uint32_t index)
                 m_texturePageCaches[index + 1u].Invalidate();
                 m_decodedCaches[index + 1u].Invalidate();
             }
+            if (item.clutLoad && item.clutFiller == index)
+                FillDeferredClut(item, next);
             DrawQueued(item, index);
             m_workerProgress[index].done.store(next + 1u, std::memory_order_release);
         }
@@ -2779,6 +2884,8 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
         }
         QueuedPrimitive &item = ReserveQueueSlotUnlocked();
         item.textureFlush = false;
+        item.clutLoad = false;
+        item.clutReady = 0u;
         item.upload = true;
         item.barrier = barrier;
         item.area = 0;
