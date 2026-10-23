@@ -101,7 +101,7 @@ namespace ps2_vu1_upper_ops
     }
 
     // vuAdd on four lanes. 1 << shift comes from converting 2^shift, since SSE4 has no variable shift.
-    inline __m128 vuAdd4(__m128 a, __m128 b)
+    __attribute__((always_inline)) inline __m128 vuAdd4(__m128 a, __m128 b)
     {
         const __m128i ua = _mm_castps_si128(a);
         const __m128i ub = _mm_castps_si128(b);

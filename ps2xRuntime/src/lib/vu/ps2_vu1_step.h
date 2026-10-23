@@ -11,6 +11,68 @@
 #include <cstring>
 #include <immintrin.h>
 
+__attribute__((always_inline)) inline float VU1Interpreter::normalizeOperand(float value) const
+{
+    uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    const uint32_t exponent = (bits >> 23) & 0xFFu;
+    if (exponent == 0u)
+    {
+        bits &= 0x80000000u;
+    }
+    else if (exponent == 0xFFu)
+    {
+        bits = (bits & 0x80000000u) | 0x7F7FFFFFu;
+    }
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+__attribute__((always_inline)) inline float VU1Interpreter::normalizeResult(float value, uint32_t &laneFlags) const
+{
+    uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    const uint32_t sign = bits & 0x80000000u;
+    const uint32_t magnitude = bits & 0x7FFFFFFFu;
+    const uint32_t exponent = (bits >> 23) & 0xFFu;
+
+    laneFlags = sign != 0u ? 0x2u : 0u;
+    if (magnitude == 0u)
+    {
+        laneFlags |= 0x1u;
+    }
+    else if (exponent == 0u)
+    {
+        laneFlags |= 0x5u;
+        bits = sign;
+    }
+    else if (exponent == 0xFFu)
+    {
+        laneFlags |= 0x8u;
+        bits = sign | 0x7F7FFFFFu;
+    }
+
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+__attribute__((always_inline)) inline void VU1Interpreter::applyDest(float *dst, const float *result, uint8_t dest)
+{
+    if (dest & 0x8u)
+        dst[0] = result[0];
+    if (dest & 0x4u)
+        dst[1] = result[1];
+    if (dest & 0x2u)
+        dst[2] = result[2];
+    if (dest & 0x1u)
+        dst[3] = result[3];
+}
+
+__attribute__((always_inline)) inline void VU1Interpreter::applyDestAcc(const float *result, uint8_t dest)
+{
+    applyDest(m_state.acc, result, dest);
+}
+
 inline uint32_t VU1Interpreter::microAddressMask() const
 {
     return m_unit == Unit::VU1 ? 0x3FFFu : 0x0FFFu;
@@ -60,7 +122,7 @@ __attribute__((always_inline)) inline void VU1Interpreter::advanceTo(uint64_t ta
 __attribute__((always_inline)) inline uint64_t VU1Interpreter::calculatePairReadyCycle(const DecodedInstructionPair &decoded) const
 {
     uint64_t ready = m_cycle;
-    const auto laneReady = [&ready](const std::array<uint64_t, 4> &laneCycles, uint8_t lanes)
+    const auto laneReady = [&ready](const std::array<uint64_t, 4> &laneCycles, uint8_t lanes) __attribute__((always_inline))
     {
         if (lanes & 0x8u)
             ready = std::max(ready, laneCycles[0]);
@@ -71,7 +133,7 @@ __attribute__((always_inline)) inline uint64_t VU1Interpreter::calculatePairRead
         if (lanes & 0x1u)
             ready = std::max(ready, laneCycles[3]);
     };
-    const auto vfReady = [&](const InstructionUsage &usage)
+    const auto vfReady = [&](const InstructionUsage &usage) __attribute__((always_inline))
     {
         for (uint32_t index = 0; index < usage.vfReadCount; ++index)
         {

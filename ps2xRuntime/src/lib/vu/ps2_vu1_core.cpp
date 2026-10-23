@@ -289,68 +289,6 @@ float VU1Interpreter::broadcast(const float *vf, uint8_t bc)
     return normalizeOperand(vf[bc & 3u]);
 }
 
-float VU1Interpreter::normalizeOperand(float value) const
-{
-    uint32_t bits = 0;
-    std::memcpy(&bits, &value, sizeof(bits));
-    const uint32_t exponent = (bits >> 23) & 0xFFu;
-    if (exponent == 0u)
-    {
-        bits &= 0x80000000u;
-    }
-    else if (exponent == 0xFFu)
-    {
-        bits = (bits & 0x80000000u) | 0x7F7FFFFFu;
-    }
-    std::memcpy(&value, &bits, sizeof(value));
-    return value;
-}
-
-float VU1Interpreter::normalizeResult(float value, uint32_t &laneFlags) const
-{
-    uint32_t bits = 0;
-    std::memcpy(&bits, &value, sizeof(bits));
-    const uint32_t sign = bits & 0x80000000u;
-    const uint32_t magnitude = bits & 0x7FFFFFFFu;
-    const uint32_t exponent = (bits >> 23) & 0xFFu;
-
-    laneFlags = sign != 0u ? 0x2u : 0u;
-    if (magnitude == 0u)
-    {
-        laneFlags |= 0x1u;
-    }
-    else if (exponent == 0u)
-    {
-        laneFlags |= 0x5u;
-        bits = sign;
-    }
-    else if (exponent == 0xFFu)
-    {
-        laneFlags |= 0x8u;
-        bits = sign | 0x7F7FFFFFu;
-    }
-
-    std::memcpy(&value, &bits, sizeof(value));
-    return value;
-}
-
-void VU1Interpreter::applyDest(float *dst, const float *result, uint8_t dest)
-{
-    if (dest & 0x8u)
-        dst[0] = result[0];
-    if (dest & 0x4u)
-        dst[1] = result[1];
-    if (dest & 0x2u)
-        dst[2] = result[2];
-    if (dest & 0x1u)
-        dst[3] = result[3];
-}
-
-void VU1Interpreter::applyDestAcc(const float *result, uint8_t dest)
-{
-    applyDest(m_state.acc, result, dest);
-}
-
 void VU1Interpreter::normalizeFmacResult(float *result, uint8_t dest,
                                          uint8_t laneFlags[4])
 {
