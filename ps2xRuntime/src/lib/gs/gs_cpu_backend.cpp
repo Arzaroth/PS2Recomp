@@ -1953,6 +1953,8 @@ void GSCpuBackend::StartWorkersUnlocked()
     // 8 stripes buys little.
     const uint32_t hardware = std::max(1u, std::thread::hardware_concurrency());
     m_workerCount = std::clamp(hardware > 4u ? hardware - 4u : 1u, 1u, 8u);
+    if (const char *threads = std::getenv("PS2X_GS_RASTER_THREADS"); threads && *threads)
+        m_workerCount = std::clamp<uint32_t>(static_cast<uint32_t>(std::atoi(threads)), 1u, 16u);
     m_texturePageCaches.resize(m_workerCount + 1u);
     m_decodedCaches.resize(m_workerCount + 1u);
     m_queue.resize(kQueueSize);
