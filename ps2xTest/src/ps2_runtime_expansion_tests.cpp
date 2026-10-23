@@ -1028,6 +1028,34 @@ void register_ps2_runtime_expansion_tests()
                      "SQRT.S fd, ft should compute sqrt(ft): " + generated);
         });
 
+        tc.Run("sprintf reads a double from one 64-bit argument register, a3 included", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            R5900Context ctx{};
+
+            constexpr uint32_t kDestAddr = 0x00002000u;
+            constexpr uint32_t kFormatAddr = 0x00002100u;
+            constexpr char kFormat[] = "%d %.2f %.1f";
+
+            std::memcpy(rdram.data() + kFormatAddr, kFormat, sizeof(kFormat));
+            setRegU32(ctx, 4, kDestAddr);
+            setRegU32(ctx, 5, kFormatAddr);
+            setRegU32(ctx, 6, 25u); // a2
+            const double first = -9.16, second = 0.5;
+            int64_t firstBits = 0, secondBits = 0;
+            std::memcpy(&firstBits, &first, sizeof(firstBits));
+            std::memcpy(&secondBits, &second, sizeof(secondBits));
+            ctx.r[7] = _mm_set_epi64x(0, firstBits);  // a3
+            ctx.r[8] = _mm_set_epi64x(0, secondBits); // t0
+
+            ps2_stubs::sprintf(rdram.data(), &ctx, &runtime);
+
+            const std::string rendered(reinterpret_cast<const char *>(rdram.data() + kDestAddr));
+            t.Equals(rendered, std::string("25 -9.16 0.5"),
+                     "a double in a3 is the whole register, and the next one comes from t0");
+        });
+
         tc.Run("multiply-add matrix writes rd only when R5900 requires it", [](TestCase &t)
         {
             R5900Decoder decoder;

@@ -799,7 +799,14 @@ namespace
 
         uint64_t nextU64()
         {
-            // O32 ABI aligns 64-bit variadic values on even 32-bit slots.
+            // The EE passes each argument, doubles included, in one 64-bit register (a0-a3, t0-t3).
+            if (m_slotIndex < 8u)
+            {
+                const uint64_t value = static_cast<uint64_t>(_mm_cvtsi128_si64(m_ctx->r[4 + m_slotIndex]));
+                ++m_slotIndex;
+                return value;
+            }
+            // Past the registers: 64-bit values on even 32-bit stack slots.
             if ((m_slotIndex & 1u) != 0u)
             {
                 ++m_slotIndex;
