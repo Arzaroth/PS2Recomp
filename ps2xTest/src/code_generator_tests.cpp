@@ -570,6 +570,36 @@ void register_code_generator_tests()
                  "cross-function jump into the middle of a function should become an external entry candidate");
     });
 
+    tc.Run("control-flow analysis reports a branch's fallthrough into the next function as an external entry", [](TestCase &t) {
+        // Soulcalibur III's 0x1FFFE8 ends on a branch whose delay slot is 0x200000, the next function's start.
+        Function caller;
+        caller.name = "caller";
+        caller.start = 0x4000;
+        caller.end = 0x4008;
+        caller.isRecompiled = true;
+        caller.isStub = false;
+
+        Function next;
+        next.name = "next";
+        next.start = 0x4008;
+        next.end = 0x4020;
+        next.isRecompiled = true;
+        next.isStub = false;
+
+        std::vector<Instruction> instructions{makeNop(0x4000), makeBranch(0x4004, 4)};
+        std::vector<Function> functions{caller, next};
+        std::vector<Section> sections = {
+            {".text", 0x4000u, 0x2000u, 0u, true, false, false, true, nullptr}
+        };
+
+        CodeGenerator gen({}, sections);
+        CodeGenerator::AnalysisResult analysis =
+            gen.collectInternalBranchTargets(caller, instructions, &functions);
+
+        t.IsTrue(analysis.externalEntryPoints.contains(0x400Cu),
+                 "the not-taken path after the delay slot should become an external entry candidate");
+    });
+
     tc.Run("control-flow analysis promotes JALR fallthrough as a resumable entry", [](TestCase &t) {
         Function func;
         func.name = "jalr_resume";
