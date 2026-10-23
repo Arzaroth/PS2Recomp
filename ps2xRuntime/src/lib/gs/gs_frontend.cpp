@@ -198,11 +198,10 @@ GS::LagStats GS::takeLagStats()
 // worker then skips them). Only packed A+D can address these registers.
 namespace
 {
-    // The GS reaches a register some time after the EE sends it: the VU1/GS work before it. Games
-    // pace their threads on these events (their handlers wake the main thread while lower-priority
-    // threads ran), so delivering them as soon as they are sent starves those threads.
-    constexpr uint64_t kGsEventLatencyCycles = 200000u;
-    constexpr uint64_t kGsBytesPerEeCycle = 1u;
+    // The GS reaches a register once it has drawn what was sent before it (GsDrawEstimate). Games pace
+    // their threads on these events (their handlers wake the main thread while lower-priority threads
+    // ran), so delivering them as soon as they are sent starves those threads.
+    constexpr uint64_t kGsEventBaseCycles = 2000u;
 
     uint64_t envCycles(const char *name, uint64_t fallback)
     {
@@ -210,13 +209,20 @@ namespace
         return value && *value ? std::strtoull(value, nullptr, 0) : fallback;
     }
 
-    // PS2X_GS_EVENT_LATENCY / PS2X_GS_EVENT_BYTES_PER_CYCLE override the model.
-    uint64_t gsEventDelay(uint32_t offsetBytes)
+    // PS2X_GS_PIXEL_CYCLES (EE cycles per 1024 pixels) and PS2X_GS_PRIM_CYCLES override the drawing rates.
+    GsDrawEstimate::Rates gsDrawRates()
     {
-        static const uint64_t latency = envCycles("PS2X_GS_EVENT_LATENCY", kGsEventLatencyCycles);
-        static const uint64_t bytesPerCycle = std::max<uint64_t>(envCycles("PS2X_GS_EVENT_BYTES_PER_CYCLE", kGsBytesPerEeCycle), 1u);
-        return latency + offsetBytes / bytesPerCycle;
+        const GsDrawEstimate::Rates defaults;
+        return {envCycles("PS2X_GS_PIXEL_CYCLES", defaults.cyclesPer1024Pixels),
+                envCycles("PS2X_GS_PRIM_CYCLES", defaults.cyclesPerPrimitive)};
     }
+}
+
+// PS2X_GS_EVENT_LATENCY overrides the base latency.
+uint64_t GS::gsEventDelay()
+{
+    static const uint64_t base = envCycles("PS2X_GS_EVENT_LATENCY", kGsEventBaseCycles);
+    return base + m_drawEstimate.takeCycles();
 }
 
 void GS::postQueuedCpuEvents(const uint8_t *data, uint32_t sizeBytes)
@@ -232,6 +238,8 @@ void GS::postQueuedCpuEvents(const uint8_t *data, uint32_t sizeBytes)
         uint32_t nreg = static_cast<uint32_t>((tagLo >> 60) & 0xFu);
         if (nreg == 0u)
             nreg = 16u;
+        if ((tagLo >> 46) & 1u)
+            m_drawEstimate.setPrim((tagLo >> 47) & 0x7FFu);
         if (flg == GIF_FMT_PACKED)
         {
             for (uint32_t loop = 0; loop < nloop; ++loop)
@@ -240,21 +248,28 @@ void GS::postQueuedCpuEvents(const uint8_t *data, uint32_t sizeBytes)
                 {
                     if (offset + 16u > sizeBytes)
                         return;
-                    if (((tagHi >> (r * 4u)) & 0xFu) == 0xEu)
+                    const uint32_t desc = static_cast<uint32_t>((tagHi >> (r * 4u)) & 0xFu);
+                    const uint64_t lo = loadLE64(data + offset);
+                    const uint64_t hi = loadLE64(data + offset + 8u);
+                    if (desc == 0x0u)
+                        m_drawEstimate.setPrim(lo);
+                    else if (desc == 0x4u || desc == 0x5u)
+                        m_drawEstimate.vertex(static_cast<uint32_t>(lo), static_cast<uint32_t>(lo >> 32), ((hi >> 47) & 1u) == 0u);
+                    else if (desc == 0xEu)
                     {
-                        const uint64_t lo = loadLE64(data + offset);
-                        const uint64_t delay = gsEventDelay(offset);
-                        switch (static_cast<uint8_t>(loadLE64(data + offset + 8u) & 0xFFu))
+                        const uint8_t address = static_cast<uint8_t>(hi & 0xFFu);
+                        m_drawEstimate.writeRegister(address, lo);
+                        switch (address)
                         {
                         case GS_REG_SIGNAL:
-                            postCpuEvent(GsCpuEvent::Signal, lo, delay);
+                            postCpuEvent(GsCpuEvent::Signal, lo, gsEventDelay());
                             break;
                         case GS_REG_FINISH:
-                            postCpuEvent(GsCpuEvent::Finish, lo, delay);
+                            postCpuEvent(GsCpuEvent::Finish, lo, gsEventDelay());
                             waitForGsFrames();
                             break;
                         case GS_REG_LABEL:
-                            postCpuEvent(GsCpuEvent::Label, lo, delay);
+                            postCpuEvent(GsCpuEvent::Label, lo, gsEventDelay());
                             break;
                         default:
                             break;
@@ -266,10 +281,15 @@ void GS::postQueuedCpuEvents(const uint8_t *data, uint32_t sizeBytes)
         }
         else if (flg == GIF_FMT_REGLIST)
         {
-            offset += ((nloop * nreg + 1u) & ~1u) * 8u;
+            const uint32_t words = nloop * nreg;
+            for (uint32_t word = 0; word < words && offset + (word + 1u) * 8u <= sizeBytes; ++word)
+                m_drawEstimate.writeRegister(static_cast<uint8_t>((tagHi >> ((word % nreg) * 4u)) & 0xFu),
+                                             loadLE64(data + offset + word * 8u));
+            offset += ((words + 1u) & ~1u) * 8u;
         }
         else
         {
+            m_drawEstimate.addImageBytes(nloop * 16u);
             offset += nloop * 16u;
         }
     }
@@ -434,6 +454,8 @@ void GS::waitForIdle()
 void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
 {
     waitForIdle();
+    m_drawEstimate = GsDrawEstimate{};
+    m_drawEstimate.setRates(gsDrawRates());
     m_localMemoryStorage = vram;
     m_localMemorySize = vramSize;
     m_privRegs = privRegs;
@@ -1471,6 +1493,8 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
 
 void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
 {
+    if (!t_onGsWorker)
+        m_drawEstimate.writeRegister(regAddr, value);
     const bool interestingReg =
         regAddr == GS_REG_PRIM ||
         regAddr == GS_REG_RGBAQ ||
@@ -1867,7 +1891,7 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     }
     case GS_REG_SIGNAL:
         if (!t_onGsWorker)
-            postCpuEvent(GsCpuEvent::Signal, value, gsEventDelay(0u));
+            postCpuEvent(GsCpuEvent::Signal, value, gsEventDelay());
         break;
     case GS_REG_FINISH:
         if (m_backend)
@@ -1877,7 +1901,7 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
         }
         if (!t_onGsWorker)
         {
-            postCpuEvent(GsCpuEvent::Finish, value, gsEventDelay(0u));
+            postCpuEvent(GsCpuEvent::Finish, value, gsEventDelay());
         }
         if (t_onGsWorker)
         {
@@ -1887,7 +1911,7 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
         break;
     case GS_REG_LABEL:
         if (!t_onGsWorker)
-            postCpuEvent(GsCpuEvent::Label, value, gsEventDelay(0u));
+            postCpuEvent(GsCpuEvent::Label, value, gsEventDelay());
         break;
     case 0x59:
         if (m_privRegs)
