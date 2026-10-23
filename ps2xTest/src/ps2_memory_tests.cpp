@@ -365,6 +365,7 @@ void register_ps2_memory_tests()
         {
             PS2Memory mem;
             t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            ps2GsResetEvents();
             t.Equals(mem.read32(0x12001000u) & 0xC000u, 0x4000u, "CSR.FIFO should read 01 (empty)");
             mem.write32(0x12001000u, 0x8000u);
             t.Equals(mem.read32(0x12001000u) & 0xC000u, 0x4000u, "CSR.FIFO should ignore writes");
