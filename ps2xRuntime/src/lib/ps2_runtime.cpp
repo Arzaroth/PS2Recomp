@@ -2704,6 +2704,12 @@ uint64_t ps2CurrentEeCycle()
     return runtime ? runtime->eeScheduler().currentCycle() : 0u;
 }
 
+bool ps2GsFifoEmpty()
+{
+    PS2Runtime *runtime = g_gsCsrEdgeRuntime.load(std::memory_order_acquire);
+    return !runtime || runtime->gs().fifoEmpty();
+}
+
 bool ps2ScheduleGsInterruptCheck(uint64_t delayCycles)
 {
     PS2Runtime *runtime = g_gsCsrEdgeRuntime.load(std::memory_order_acquire);

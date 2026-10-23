@@ -14,6 +14,8 @@
 
 void ps2NotifyGsCsrEdge();
 uint64_t ps2CurrentEeCycle();
+bool ps2GsFifoEmpty();
+bool ps2GsDrawing();
 
 namespace
 {
@@ -166,11 +168,19 @@ namespace
         }
     }
 
-    // CSR.FIFO (bits 14-15, read-only) reads as empty: the GS consumes every packet as it arrives
-    // in emulated time. Games poll it to wait for the GS to go idle.
-    inline uint64_t readCsr(const std::atomic<uint64_t> &csr)
+    // CSR.FIFO (bits 14-15, read-only) reads as empty once the GS has drawn everything sent to it: the
+    // estimated drawing time has elapsed in EE cycles, no SIGNAL/FINISH/LABEL waits for its drawing or
+    // for its handler's acknowledge, and the GS thread is idle. Before that it is neither empty nor
+    // almost full. Games poll it to wait for the GS to go idle.
+    inline uint64_t readCsr(const GSRegisters &regs)
     {
-        return (csr.load() & ~0xC000ull) | 0x4000ull;
+        const uint64_t csr = regs.csr.load();
+        bool drawing = ps2GsDrawing() || (csr & ~(regs.imr >> 8) & 0x3ull) != 0u;
+        {
+            std::lock_guard<std::mutex> lock(g_gsEventMutex);
+            drawing = drawing || !g_gsPendingEvents.empty();
+        }
+        return (csr & ~0xC000ull) | (!drawing && ps2GsFifoEmpty() ? 0x4000ull : 0u);
     }
 
     // Atomically apply a 32-bit write to one half (off=0 low dword, off=4 high
@@ -869,7 +879,7 @@ uint32_t PS2Memory::read32(uint32_t address)
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
         {
-            uint64_t val = readCsr(gs_regs.csr);
+            uint64_t val = readCsr(gs_regs);
             return (uint32_t)(val >> (off * 8));
         }
         uint64_t *reg = gsRegPtr(gs_regs, address);
@@ -916,7 +926,7 @@ uint64_t PS2Memory::read64(uint32_t address)
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
         {
-            return readCsr(gs_regs.csr);
+            return readCsr(gs_regs);
         }
         uint64_t *reg = gsRegPtr(gs_regs, address);
         return reg ? *reg : 0;
@@ -2477,7 +2487,7 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
         {
-            return static_cast<uint32_t>((readCsr(gs_regs.csr) >> (off * 8u)) & 0xFFFFFFFFull);
+            return static_cast<uint32_t>((readCsr(gs_regs) >> (off * 8u)) & 0xFFFFFFFFull);
         }
         if (uint64_t *reg = gsRegPtr(gs_regs, address))
         {

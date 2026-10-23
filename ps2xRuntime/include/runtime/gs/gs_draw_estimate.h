@@ -88,9 +88,15 @@ public:
     }
 
     // A host-to-local transfer moves a quadword per GS cycle.
-    void addImageBytes(uint64_t bytes) { m_cycles += bytes / 8u; }
+    void addImageBytes(uint64_t bytes)
+    {
+        m_cycles += bytes / 8u;
+        m_total += bytes / 8u;
+    }
 
+    // Since the previous SIGNAL/FINISH/LABEL, and since the start.
     uint64_t takeCycles() { return std::exchange(m_cycles, 0u); }
+    uint64_t totalCycles() const { return m_total; }
 
 private:
     struct Rect
@@ -111,7 +117,9 @@ private:
 
     void addPrimitive(uint64_t pixels)
     {
-        m_cycles += m_rates.cyclesPerPrimitive + pixels * m_rates.cyclesPer1024Pixels / 1024u;
+        const uint64_t cycles = m_rates.cyclesPerPrimitive + pixels * m_rates.cyclesPer1024Pixels / 1024u;
+        m_cycles += cycles;
+        m_total += cycles;
     }
 
     void draw()
@@ -170,4 +178,5 @@ private:
     int32_t m_offsetX[2]{}, m_offsetY[2]{};
     Rect m_scissor[2]{};
     uint64_t m_cycles = 0u;
+    uint64_t m_total = 0u;
 };

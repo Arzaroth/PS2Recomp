@@ -129,6 +129,8 @@ public:
     void submitGIFPacket(const uint8_t *data, uint32_t sizeBytes);
     // Blocks until every queued packet has been processed (no-op on the GS thread itself).
     void waitForIdle();
+    // No packet queued for the GS thread or being drawn by it: what CSR.FIFO reports as empty.
+    bool fifoEmpty() const;
     bool processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes);
     void uploadImageNative(uint64_t bitbltbuf,
                            uint64_t trxpos,
@@ -187,6 +189,9 @@ private:
     void postCpuEvent(GsCpuEvent event, uint64_t value, uint64_t delayCycles);
     void postQueuedCpuEvents(const uint8_t *data, uint32_t sizeBytes);
     uint64_t gsEventDelay();
+    // Extends the time the GS stays busy (CSR.FIFO not empty) by the drawing scanned since the last call.
+    void noteQueuedDrawing();
+    uint64_t m_notedDrawingCycles = 0;
     void waitForGsFrames();
     void enqueue(QueuedCommand &&command);
     void workerLoop();
@@ -234,7 +239,7 @@ private:
     // GS thread: packets from the EE side are rasterized concurrently with EE/VU1 work.
     bool m_asyncEnabled = false;
     std::thread m_worker;
-    std::mutex m_queueMutex;
+    mutable std::mutex m_queueMutex;
     std::condition_variable m_queueReady;
     std::condition_variable m_queueIdle;
     std::deque<QueuedCommand> m_queue;
