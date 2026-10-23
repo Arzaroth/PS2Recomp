@@ -38,8 +38,12 @@ struct VU1State
     uint32_t branchDelay;
 };
 
+struct Vu1CompiledAccess;
+
 class VU1Interpreter
 {
+    friend struct Vu1CompiledAccess;
+
 public:
     enum class Unit : uint8_t
     {
@@ -190,8 +194,23 @@ private:
     // VU1 only: per pair, whether a flag reader can observe its upper instruction's MAC and status result.
     // Computed once per code image (by content hash) and valid while the decode stamp is m_flagsLiveStamp.
     using FlagLiveness = std::array<bool, kMaxDecodedPairs>;
-    std::vector<std::pair<uint64_t, FlagLiveness>> m_flagLivenessCache;
+    // A microprogram compiled ahead of time (ps2_vu1_compile) for one VU1 code image: runs pairs from the
+    // current pc and returns Next where it has no code, for the interpreter to run that pair.
+    using CompiledRun = StepResult (*)(VU1Interpreter &vu, uint64_t budgetEnd, uint8_t *vuData, uint32_t dataSize,
+                                       GS &gs, PS2Memory *memory);
+    static constexpr uint32_t kCompiledCodeSize = 0x4000u;
+    static std::vector<std::pair<uint64_t, CompiledRun>> &compiledPrograms();
+    static uint64_t hashMicrocode(const uint8_t *code, uint32_t size);
+    static void computeMicrocodeFlagLiveness(const uint8_t *code, uint32_t size, uint32_t pcMask, bool *live);
+    struct CodeImageInfo
+    {
+        uint64_t hash = 0;
+        FlagLiveness liveness{};
+        CompiledRun compiled = nullptr;
+    };
+    std::vector<CodeImageInfo> m_flagLivenessCache;
     const FlagLiveness *m_flagsLive = nullptr;
+    CompiledRun m_compiledRun = nullptr;
     uint64_t m_flagsLiveStamp = 0;
     bool m_elideDeadFlags = false;
     bool m_currentFlagsLive = true;
@@ -280,8 +299,11 @@ private:
     PacketObserver m_packetObserver;
     uint64_t m_externalCodeGeneration = 0;
 
-    StepResult stepPair(const DecodedInstructionPair &decoded, uint64_t budgetEnd, uint32_t codeSize, uint8_t *vuData,
-                        uint32_t dataSize, GS &gs, PS2Memory *memory);
+    // upper() and lower() execute the pair's instructions: through decoded's handlers when interpreting,
+    // with the instruction words as constants in compiled microprograms.
+    template <typename Upper, typename Lower>
+    StepResult stepPair(const DecodedInstructionPair &decoded, uint64_t budgetEnd, uint32_t codeSize, Upper &&upper,
+                        Lower &&lower);
     void run(uint8_t *vuCode, uint32_t codeSize,
              uint8_t *vuData, uint32_t dataSize,
              GS &gs, PS2Memory *memory, uint32_t maxCycles);

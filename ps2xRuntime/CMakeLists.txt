@@ -534,10 +534,15 @@ endif()
 
 ps2x_stage_ffmpeg_runtime_dlls(ps2EntryRunner)
 
-# Offline VU1 interpreter check/benchmark against runs recorded with PS2X_VU1_RECORD.
+# Offline VU1 interpreter check/benchmark against runs recorded with PS2X_VU1_RECORD, and the VU1
+# microprogram compiler.
 if(NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
-    add_executable(ps2_vu1_replay tools/ps2_vu1_replay.cpp)
+    # Microprograms compiled by ps2_vu1_compile into the runner are replayed through the same code.
+    file(GLOB PS2X_VU1_COMPILED_SRC CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/vu1_*.cpp")
+    add_executable(ps2_vu1_replay tools/ps2_vu1_replay.cpp ${PS2X_VU1_COMPILED_SRC})
     target_link_libraries(ps2_vu1_replay PRIVATE ps2_runtime)
+    add_executable(ps2_vu1_compile tools/ps2_vu1_compile.cpp)
+    target_link_libraries(ps2_vu1_compile PRIVATE ps2_runtime)
     if(WIN32)
         target_sources(ps2_vu1_replay PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/profiling/sampling_profiler.cpp")
     endif()

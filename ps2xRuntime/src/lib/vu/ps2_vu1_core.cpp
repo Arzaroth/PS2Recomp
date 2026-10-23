@@ -194,23 +194,56 @@ VU1Interpreter::VU1Interpreter(Unit unit)
     reset();
 }
 
+std::vector<std::pair<uint64_t, VU1Interpreter::CompiledRun>> &VU1Interpreter::compiledPrograms()
+{
+    static std::vector<std::pair<uint64_t, CompiledRun>> programs;
+    return programs;
+}
+
+uint64_t VU1Interpreter::hashMicrocode(const uint8_t *code, uint32_t size)
+{
+    return hashCode(code, size);
+}
+
+void VU1Interpreter::computeMicrocodeFlagLiveness(const uint8_t *code, uint32_t size, uint32_t pcMask, bool *live)
+{
+    std::fill(live, live + std::min<uint32_t>(size / 8u, kMaxDecodedPairs), true);
+    computeFlagLiveness(code, size, pcMask, live);
+}
+
 void VU1Interpreter::refreshFlagLiveness(const uint8_t *vuCode, uint32_t codeSize, uint64_t stamp)
 {
     m_flagsLiveStamp = stamp;
     const uint64_t hash = hashCode(vuCode, codeSize);
-    for (const auto &[cachedHash, liveness] : m_flagLivenessCache)
-        if (cachedHash == hash)
+    for (const CodeImageInfo &image : m_flagLivenessCache)
+        if (image.hash == hash)
         {
-            m_flagsLive = &liveness;
+            m_flagsLive = &image.liveness;
+            m_compiledRun = image.compiled;
             return;
         }
     if (m_flagLivenessCache.size() >= 16u)
         m_flagLivenessCache.erase(m_flagLivenessCache.begin());
-    m_flagLivenessCache.emplace_back(hash, FlagLiveness{});
-    FlagLiveness &liveness = m_flagLivenessCache.back().second;
-    liveness.fill(true);
-    computeFlagLiveness(vuCode, codeSize, microAddressMask(), liveness.data());
-    m_flagsLive = &liveness;
+    CodeImageInfo &image = m_flagLivenessCache.emplace_back();
+    image.hash = hash;
+    computeMicrocodeFlagLiveness(vuCode, codeSize, microAddressMask(), image.liveness.data());
+    if (codeSize == kCompiledCodeSize)
+        for (const auto &[compiledHash, run] : compiledPrograms())
+            if (compiledHash == hash)
+                image.compiled = run;
+    if (!image.compiled)
+        if (const char *dir = std::getenv("PS2X_VU1_DUMP_CODE"); dir && *dir)
+        {
+            char path[1024];
+            std::snprintf(path, sizeof(path), "%s/%016llx.bin", dir, static_cast<unsigned long long>(hash));
+            if (FILE *out = std::fopen(path, "wb"))
+            {
+                std::fwrite(vuCode, 1, codeSize, out);
+                std::fclose(out);
+            }
+        }
+    m_flagsLive = &image.liveness;
+    m_compiledRun = image.compiled;
 }
 
 void VU1Interpreter::resetScheduler()
@@ -1774,8 +1807,22 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     if (m_elideDeadFlags && decodeStamp != 0u && decodeStamp != m_flagsLiveStamp)
         refreshFlagLiveness(vuCode, codeSize, decodeStamp);
     const FlagLiveness *flagsLive = m_elideDeadFlags && decodeStamp != 0u ? m_flagsLive : nullptr;
+    const CompiledRun compiled = flagsLive ? m_compiledRun : nullptr;
     while (m_cycle < budgetEnd && !m_stopRequested)
     {
+        if (compiled)
+        {
+            const StepResult step = compiled(*this, budgetEnd, vuData, dataSize, gs, memory);
+            if (step == StepResult::Stop)
+                break;
+            if (step == StepResult::Ended)
+            {
+                programEnded = true;
+                break;
+            }
+            if (m_cycle >= budgetEnd || m_stopRequested)
+                break;
+        }
         if (m_state.pc + 8u > codeSize)
             break;
 
@@ -1788,7 +1835,9 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                 ? m_decodedCodeCache[pairIndex]
                 : getDecodedInstructionPairForPc(vuCode, codeSize, memory, m_state.pc);
         m_currentFlagsLive = flagsLiveHere;
-        const StepResult step = stepPair(decoded, budgetEnd, codeSize, vuData, dataSize, gs, memory);
+        const StepResult step = stepPair(
+            decoded, budgetEnd, codeSize, [this, &decoded]() { (this->*decoded.upperHandler)(decoded.upper); },
+            [&]() { execLower(decoded.lower, vuData, dataSize, gs, memory, decoded.upper); });
         if (step == StepResult::Stop)
             break;
         if (step == StepResult::Ended)
