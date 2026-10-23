@@ -812,6 +812,7 @@ namespace
         std::pair<uint32_t, uint32_t> z;
         std::pair<uint32_t, uint32_t> texture;
         bool writesZ = false;
+        bool readsZ = false;
         bool samples = false;
     };
 
@@ -824,7 +825,8 @@ namespace
         primitiveRows(batch, firstRow, lastRow);
         blocks.frame = rowBlocks(GSInternal::framePageBaseToBlock(ctx.frame.fbp), ctx.frame.fbw, ctx.frame.psm, firstRow, lastRow);
         blocks.writesZ = !ctx.zbuf.zmask;
-        if (blocks.writesZ)
+        blocks.readsZ = ((ctx.test >> 17) & 3u) >= 2u;
+        if (blocks.writesZ || blocks.readsZ)
             blocks.z = rowBlocks(GSInternal::framePageBaseToBlock(ctx.zbuf.zbp), ctx.frame.fbw, ctx.zbuf.psm, firstRow, lastRow);
         blocks.samples = batch.state.prim.tme;
         if (blocks.samples)
@@ -1788,11 +1790,12 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
                    (blocks.samples && (overlapsAny(blocks.texture, m_pixelWritesSinceBarrier) ||
                                        overlapsAny(blocks.texture, m_zWritesSinceBarrier))) ||
                    overlapsAny(blocks.frame, m_readsSinceBarrier) || overlapsAny(blocks.frame, m_zWritesSinceBarrier) ||
-                   (blocks.writesZ && (overlapsAny(blocks.z, m_readsSinceBarrier) ||
-                                       overlapsAny(blocks.z, m_pixelWritesSinceBarrier)));
+                   (blocks.writesZ && overlapsAny(blocks.z, m_readsSinceBarrier)) ||
+                   ((blocks.writesZ || blocks.readsZ) && overlapsAny(blocks.z, m_pixelWritesSinceBarrier));
     uint64_t zOwnerKey = 0;
     const bool writesZ = blocks.writesZ;
-    if (writesZ)
+    const bool usesZ = writesZ || blocks.readsZ;
+    if (usesZ)
     {
         const auto &frame = state.context.frame;
         uint32_t pageWidth = 0;
@@ -1813,7 +1816,7 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
         m_zOwnerKeys.clear();
         m_barrierRequested = false;
     }
-    if (writesZ && std::find(m_zOwnerKeys.begin(), m_zOwnerKeys.end(), zOwnerKey) == m_zOwnerKeys.end())
+    if (usesZ && std::find(m_zOwnerKeys.begin(), m_zOwnerKeys.end(), zOwnerKey) == m_zOwnerKeys.end())
         m_zOwnerKeys.push_back(zOwnerKey);
 
     QueuedPrimitive &item = ReserveQueueSlotUnlocked();
@@ -1844,10 +1847,9 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
     NotePendingRange(m_pendingWrites, blocks.frame);
     NoteBarrierRange(m_pixelWritesSinceBarrier, blocks.frame);
     if (blocks.writesZ)
-    {
         NotePendingRange(m_pendingWrites, blocks.z);
+    if (usesZ)
         NoteBarrierRange(m_zWritesSinceBarrier, blocks.z);
-    }
     if (blocks.samples)
         NoteBarrierRange(m_readsSinceBarrier, blocks.texture);
     PublishQueueSlotUnlocked();
