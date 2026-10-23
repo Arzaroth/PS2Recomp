@@ -1051,6 +1051,66 @@ void register_ps2_memory_tests()
             t.IsTrue(secondOk, "second queued PATH3 packet should flush in-order");
         });
 
+        tc.Run("GIF arbiter continues a GIF tag across DMA transfers", [](TestCase &t)
+        {
+            std::vector<std::vector<uint8_t>> packets;
+            GifArbiter arbiter([&](const uint8_t *data, uint32_t sizeBytes)
+            {
+                packets.emplace_back(data, data + sizeBytes);
+            });
+            auto tagLo = [](const std::vector<uint8_t> &packet)
+            {
+                uint64_t value = 0;
+                std::memcpy(&value, packet.data(), sizeof(value));
+                return value;
+            };
+
+            // REGLIST, 2 registers a loop: the first transfer holds 1 of 4 loops.
+            std::vector<uint8_t> first;
+            appendU64(first, makeGifTagPrim(4u, 6u, GIF_FMT_REGLIST, 2u, true));
+            appendU64(first, 0x51ull);
+            appendU64(first, 0x10ull);
+            appendU64(first, 0x11ull);
+            std::vector<uint8_t> second;
+            for (uint64_t word = 0x20u; word < 0x26u; ++word)
+                appendU64(second, word);
+            arbiter.submit(GifPathId::Path3, first.data(), static_cast<uint32_t>(first.size()), false, true);
+            arbiter.submit(GifPathId::Path3, second.data(), static_cast<uint32_t>(second.size()), false, true);
+            arbiter.drain();
+
+            t.Equals(packets.size(), static_cast<size_t>(2u), "each transfer should reach the GS");
+            t.Equals(packets[0].size(), static_cast<size_t>(32u), "the first packet should end after its whole loop");
+            t.Equals(tagLo(packets[0]) & 0x7FFFull, 1ull, "the first packet's tag should count the loop it holds");
+            t.Equals((tagLo(packets[0]) >> 15) & 1ull, 0ull, "the first packet's tag should not end the packet");
+            t.Equals(packets[1].size(), static_cast<size_t>(16u + 48u), "the second packet should carry the remaining loops");
+            t.Equals(tagLo(packets[1]) & 0x7FFFull, 3ull, "the continuation tag should count the remaining loops");
+            t.Equals((tagLo(packets[1]) >> 15) & 1ull, 1ull, "the continuation tag should keep EOP");
+            t.Equals((tagLo(packets[1]) >> 46) & 1ull, 0ull, "the continuation tag should not set PRIM again");
+            uint64_t carried = 0;
+            std::memcpy(&carried, packets[1].data() + 16u, sizeof(carried));
+            t.Equals(carried, 0x20ull, "the continuation should start with the next transfer's data");
+
+            // PACKED, 2 registers a loop, split inside a loop.
+            packets.clear();
+            std::vector<uint8_t> packed;
+            appendU64(packed, makeGifTag(2u, GIF_FMT_PACKED, 2u, true));
+            appendU64(packed, 0x55ull);
+            for (uint64_t word = 0; word < 6u; ++word)
+                appendU64(packed, word);
+            std::vector<uint8_t> rest;
+            appendU64(rest, 0x66ull);
+            appendU64(rest, 0x67ull);
+            arbiter.submit(GifPathId::Path3, packed.data(), static_cast<uint32_t>(packed.size()), false, true);
+            arbiter.submit(GifPathId::Path3, rest.data(), static_cast<uint32_t>(rest.size()), false, true);
+            arbiter.drain();
+            t.Equals(packets.size(), static_cast<size_t>(2u), "both PACKED transfers should reach the GS");
+            t.Equals(packets[0].size(), static_cast<size_t>(16u + 32u), "the first PACKED packet should hold one whole loop");
+            t.Equals(packets[1].size(), static_cast<size_t>(16u + 32u), "the second PACKED packet should hold the split loop");
+            std::memcpy(&carried, packets[1].data() + 16u, sizeof(carried));
+            t.Equals(carried, 4ull, "the PACKED continuation should start with the data after the last whole loop");
+            t.Equals(tagLo(packets[1]) & 0x7FFFull, 1ull, "the PACKED continuation should count one loop");
+        });
+
         tc.Run("GIF arbiter prioritizes PATH1 then PATH2 then PATH3", [](TestCase &t)
         {
             std::vector<uint8_t> order;
