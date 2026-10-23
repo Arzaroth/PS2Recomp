@@ -177,7 +177,11 @@ inline void VU1Interpreter::execFmac(uint32_t instr)
         const __m128i ordinary = _mm_and_si128(_mm_cmpgt_epi32(exponent, _mm_set1_epi32(1)),
                                                _mm_cmplt_epi32(exponent, _mm_set1_epi32(254)));
         const int lanes = _mm_movemask_ps(destLaneMask(dest));
-        exact = (_mm_movemask_ps(_mm_castsi128_ps(ordinary)) & lanes) != lanes;
+        // An exact zero (see exactZeroLanes): any sum or difference, or a product with a zero factor.
+        int zero = _mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(_mm_slli_epi32(_mm_castps_si128(r), 1), _mm_setzero_si128())));
+        if constexpr (Kind == FmacKind::Mul || Kind == FmacKind::Madd || Kind == FmacKind::Msub)
+            zero &= _mm_movemask_ps(_mm_or_ps(_mm_cmpeq_ps(s, _mm_setzero_ps()), _mm_cmpeq_ps(t, _mm_setzero_ps())));
+        exact = ((_mm_movemask_ps(_mm_castsi128_ps(ordinary)) | zero) & lanes) != lanes;
     }
     if (exact)
     {
