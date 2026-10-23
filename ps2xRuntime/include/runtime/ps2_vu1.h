@@ -112,6 +112,12 @@ private:
     };
 
     using UpperHandler = void (VU1Interpreter::*)(uint32_t);
+    enum class StepResult : uint8_t
+    {
+        Next,
+        Stop,
+        Ended
+    };
 
     struct DecodedInstructionPair
     {
@@ -274,6 +280,8 @@ private:
     PacketObserver m_packetObserver;
     uint64_t m_externalCodeGeneration = 0;
 
+    StepResult stepPair(const DecodedInstructionPair &decoded, uint64_t budgetEnd, uint32_t codeSize, uint8_t *vuData,
+                        uint32_t dataSize, GS &gs, PS2Memory *memory);
     void run(uint8_t *vuCode, uint32_t codeSize,
              uint8_t *vuData, uint32_t dataSize,
              GS &gs, PS2Memory *memory, uint32_t maxCycles);
