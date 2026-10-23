@@ -1693,7 +1693,10 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
     item.writes[0] = blocks.frame;
     item.writes[1] = blocks.z;
     item.writeCount = blocks.writesZ ? 2u : 1u;
-    item.reads = blocks.texture;
+    // Workers decode textures by 32x32 tiles, so they may read rows of it the primitive never samples.
+    if (blocks.samples)
+        item.reads = rowBlocks(ctx.tex0.tbp0, ctx.tex0.tbw, ctx.tex0.psm, 0,
+                               std::min(2047, (1 << std::min<uint32_t>(ctx.tex0.th, 10u)) - 1));
     item.samples = blocks.samples;
     NotePendingRange(m_pendingWrites, blocks.frame);
     NoteBarrierRange(m_pixelWritesSinceBarrier, blocks.frame);
@@ -2728,6 +2731,7 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
     {
         WriteUploadPixels(m_transfer, firstPixel, totalPixels, data, sizeBytes, nullptr, true);
         m_callerCacheStale = true;
+        NoteBarrierRange(m_pixelWritesSinceBarrier, target);
         direct = true;
     }
     if (direct)
