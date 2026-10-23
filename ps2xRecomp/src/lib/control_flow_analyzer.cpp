@@ -160,6 +160,13 @@ namespace ps2recomp
                 {
                     queueExternalEntryTarget(target);
                 }
+
+                // A branch whose delay slot is the next function's first instruction continues, when not
+                // taken, after that delay slot: inside the next function.
+                if (inst.address + 8u >= function.end)
+                {
+                    queueExternalEntryTarget(inst.address + 8u);
+                }
             }
             else if (isStaticJump)
             {
