@@ -417,6 +417,7 @@ struct Vu1CompiledAccess
     using Operand = VU1Interpreter::FmacOperand;
     using UpperHandler = VU1Interpreter::UpperHandler;
     using Run = VU1Interpreter::CompiledRun;
+    static constexpr uint32_t kAccLatency = VU1Interpreter::kAccForwardLatency;
 
     static bool running(const VU1Interpreter &vu, uint64_t budgetEnd) { return vu.m_cycle < budgetEnd && !vu.m_stopRequested; }
     static uint32_t pc(const VU1Interpreter &vu) { return vu.m_state.pc; }
@@ -427,6 +428,10 @@ struct Vu1CompiledAccess
     {
         vu.m_currentFlagsLive = flagsLive;
         return vu.stepPair<Sequential>(decoded, budgetEnd, codeSize, upper, lower);
+    }
+    static bool controlPending(const VU1Interpreter &vu)
+    {
+        return vu.m_state.branchPending || vu.m_state.ebit || vu.m_state.haltAfterDelaySlot;
     }
     template <Kind K, Operand O, bool ToAcc>
     __attribute__((always_inline)) static void fmac(VU1Interpreter &vu, uint32_t upper)

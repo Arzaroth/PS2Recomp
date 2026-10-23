@@ -2,7 +2,8 @@
 // when the uploaded code matches (see VU1Interpreter::CompiledRun).
 //   ps2_vu1_compile <out.cpp> <image.bin>...
 // Images are whole VU1 (16 KiB) or VU0 (4 KiB) code memories, as written by PS2X_VU1_DUMP_CODE=<dir>. Each pair becomes the
-// interpreter's step with its decoding as a constant, so timing and results stay those of the interpreter.
+// interpreter's step with its decoding as a constant, so timing and results stay those of the interpreter; the pairs from
+// each branch target up to the next one form a single function.
 #include "../src/lib/vu/ps2_vu1_step.h"
 
 #include <cstdio>
@@ -115,41 +116,166 @@ int main(int argc, char **argv)
             A::flagLiveness(code.data(), static_cast<uint32_t>(code.size()), reinterpret_cast<bool *>(live.data()));
         const std::string id = format("%s%016llx", isVu0 ? "vu0_" : "vu1_", static_cast<unsigned long long>(hash));
 
-        std::string table;
+        const uint32_t pairCount = static_cast<uint32_t>(code.size() / 8u);
+        std::vector<A::Pair> pairs;
         for (uint32_t pc = 0; pc < code.size(); pc += 8u)
+            pairs.push_back(A::decode(vu, code.data(), pc));
+        // A pair that may leave control anywhere but the next pair, or start a program end.
+        const auto redirects = [&](uint32_t index)
         {
-            const A::Pair d = A::decode(vu, code.data(), pc);
-            if (d.upperUsage.reserved || d.lowerUsage.reserved)
+            const A::Pair &d = pairs[index];
+            return d.lowerUsage.pipeline == A::Pipeline::PipelineBranch || d.eBit || d.dBit || d.tBit;
+        };
+        const auto reserved = [&](uint32_t index) { return pairs[index].upperUsage.reserved || pairs[index].lowerUsage.reserved; };
+
+        // Segments are entered at their first pair only; other entry points (microprogram starts, JR targets,
+        // resumes after a cycle budget) run on the interpreter up to the next leader.
+        std::vector<bool> leader(pairCount, false);
+        leader[0] = true;
+        for (uint32_t index = 0; index < pairCount; ++index)
+        {
+            const A::Pair &d = pairs[index];
+            if (redirects(index))
+                leader[(index + 2u) % pairCount] = true;
+            const uint32_t opcode = d.lower >> 25;
+            if (d.lowerUsage.pipeline == A::Pipeline::PipelineBranch && opcode != 0x24u && opcode != 0x25u)
             {
-                table += "        nullptr,\n";
-                continue;
+                const int32_t imm = static_cast<int32_t>(d.lower << 21) >> 21;
+                leader[static_cast<uint32_t>(static_cast<int32_t>(index) + 1 + imm) % pairCount] = true;
             }
-            const std::string name = format("p%s_%04x", id.c_str(), pc);
-            out += format("\n    A::Result %s(VU1Interpreter &vu, uint64_t budgetEnd, uint8_t *vuData, uint32_t dataSize, GS &gs, "
-                          "PS2Memory *memory)\n    {\n",
-                          name.c_str());
-            out += format("        static constexpr A::Pair d{.lower = 0x%08Xu, .upper = 0x%08Xu, .upperHandler = nullptr,\n",
-                          d.lower, d.upper);
-            out += "            .lowerUsage = {" + usage(d.lowerUsage) + "},\n";
-            out += "            .upperUsage = {" + usage(d.upperUsage) + "},\n";
-            out += format("            .iBit = %d, .eBit = %d, .mBit = %d, .dBit = %d, .tBit = %d, .upperVfShadowReg = %uu, "
-                          ".suppressedLowerVf = %uu, .writtenVi = %uu};\n",
-                          int(d.iBit), int(d.eBit), int(d.mBit), int(d.dBit), int(d.tBit), unsigned(d.upperVfShadowReg),
-                          unsigned(d.suppressedLowerVf), unsigned(d.writtenVi));
-            out += format("        return A::step<false>(vu, d, %s, budgetEnd, %zuu, [&]() { %s; },\n", live[pc / 8u] ? "true" : "false",
-                          code.size(), upperCall(d.upper).c_str());
-            out += format("                       [&]() { A::lower(vu, 0x%08Xu, vuData, dataSize, gs, memory, 0x%08Xu); });\n    }\n",
-                          d.lower, d.upper);
-            table += "        &" + name + ",\n";
         }
-        out += format("\n    constexpr PairFn kTable%s[%zu] = {\n", id.c_str(), code.size() / 8u) + table + "    };\n";
-        out += format("\n    A::Result run%s(VU1Interpreter &vu, uint64_t budgetEnd, uint8_t *vuData, uint32_t dataSize, GS &gs, "
-                      "PS2Memory *memory)\n    {\n"
+
+        const auto functionHead = [](const std::string &name)
+        {
+            return format("\n    __attribute__((no_stack_protector)) A::Result %s(VU1Interpreter &vu, uint64_t budgetEnd, uint8_t *vuData, "
+                          "uint32_t dataSize, GS &gs, PS2Memory *memory)\n    {\n",
+                          name.c_str());
+        };
+        const auto pairBody = [&](uint32_t index, const A::Usage &lowerUsage, const A::Usage &upperUsage, bool more)
+        {
+            const A::Pair &d = pairs[index];
+            const uint32_t pc = index * 8u;
+            const bool sequential = !redirects(index) && !redirects(index == 0u ? pairCount - 1u : index - 1u) &&
+                                    index + 1u < pairCount;
+            std::string body = format("        {\n            // 0x%04x\n", pc);
+            body += format("            static constexpr A::Pair d{.lower = 0x%08Xu, .upper = 0x%08Xu, .upperHandler = nullptr,\n",
+                           d.lower, d.upper);
+            body += "                .lowerUsage = {" + usage(lowerUsage) + "},\n";
+            body += "                .upperUsage = {" + usage(upperUsage) + "},\n";
+            body += format("                .iBit = %d, .eBit = %d, .mBit = %d, .dBit = %d, .tBit = %d, .upperVfShadowReg = %uu, "
+                           ".suppressedLowerVf = %uu, .writtenVi = %uu};\n",
+                           int(d.iBit), int(d.eBit), int(d.mBit), int(d.dBit), int(d.tBit), unsigned(d.upperVfShadowReg),
+                           unsigned(d.suppressedLowerVf), unsigned(d.writtenVi));
+            body += format("            if (const A::Result result = A::step<%s>(vu, d, %s, budgetEnd, %zuu, [&]() __attribute__((always_inline)) { %s; },\n",
+                           sequential ? "true" : "false", live[index] ? "true" : "false", code.size(), upperCall(d.upper).c_str());
+            body += format("                    [&]() __attribute__((always_inline)) { A::lower(vu, 0x%08Xu, vuData, dataSize, gs, memory, 0x%08Xu); });\n"
+                           "                result != A::Result::Next)\n                return result;\n",
+                           d.lower, d.upper);
+            if (!sequential && more)
+                body += format("            if (A::pc(vu) != 0x%04xu)\n                return A::Result::Next;\n", pc + 8u);
+            return body + "        }\n";
+        };
+
+        std::vector<std::string> table(pairCount, "nullptr");
+        constexpr uint32_t kMaxSegmentPairs = 64u;
+        for (uint32_t first = 0; first < pairCount; ++first)
+        {
+            if (!leader[first] || reserved(first))
+                continue;
+            uint32_t last = first;
+            while (last + 1u < pairCount && last + 1u - first < kMaxSegmentPairs && !reserved(last + 1u) &&
+                   !leader[last + 1u] && !(last > 0u && redirects(last - 1u)))
+                ++last;
+
+            // A read can only stall on a result issued in the segment less than its latency ago, or on one issued before
+            // the segment that no earlier read in it waited for: every pair takes at least a cycle. The usage emitted for
+            // a pair keeps only those reads, which is all calculatePairReadyCycle looks at.
+            constexpr int32_t kUnknown = -1, kReady = -2;
+            int32_t vfReadyAt[32][4];
+            int32_t viReadyAt[16];
+            int32_t accReadyAt[4];
+            std::fill(&vfReadyAt[0][0], &vfReadyAt[0][0] + 32 * 4, kUnknown);
+            std::fill(viReadyAt, viReadyAt + 16, kUnknown);
+            std::fill(accReadyAt, accReadyAt + 4, kUnknown);
+            const auto mustWait = [](int32_t &readyAt, int32_t index)
+            {
+                const bool wait = readyAt == kUnknown || (readyAt >= 0 && index < readyAt);
+                readyAt = kReady;
+                return wait;
+            };
+            const auto laneWaits = [&](int32_t *readyAt, uint8_t lanes, int32_t index)
+            {
+                uint8_t waits = 0u;
+                for (uint32_t lane = 0; lane < 4u; ++lane)
+                    if ((lanes & (0x8u >> lane)) != 0u && mustWait(readyAt[lane], index))
+                        waits |= static_cast<uint8_t>(0x8u >> lane);
+                return waits;
+            };
+            const auto pruneReads = [&](A::Usage u, int32_t index)
+            {
+                A::Usage pruned = u;
+                pruned.vfReadCount = 0u;
+                pruned.vfRead = {};
+                for (uint32_t read = 0; read < u.vfReadCount; ++read)
+                {
+                    const A::Access access = u.vfRead[read];
+                    if (access.reg == 0u)
+                        continue;
+                    if (const uint8_t lanes = laneWaits(vfReadyAt[access.reg], access.lanes, index); lanes != 0u)
+                        pruned.vfRead[pruned.vfReadCount++] = {access.reg, lanes};
+                }
+                pruned.viRead = 0u;
+                for (uint32_t reg = 1; reg < 16u; ++reg)
+                    if ((u.viRead & (1u << reg)) != 0u && mustWait(viReadyAt[reg], index))
+                        pruned.viRead |= static_cast<uint16_t>(1u << reg);
+                pruned.accRead = laneWaits(accReadyAt, u.accRead, index);
+                return pruned;
+            };
+            const auto noteWrites = [&](const A::Pair &d, int32_t index)
+            {
+                const auto vfWrite = [&](const A::Usage &u)
+                {
+                    const int32_t readyAt = index + int32_t(u.vfLatency != 0u ? u.vfLatency : u.latency);
+                    for (uint32_t lane = 0; lane < 4u; ++lane)
+                        if ((u.vfWrite.lanes & (0x8u >> lane)) != 0u)
+                            vfReadyAt[u.vfWrite.reg][lane] = readyAt;
+                };
+                if (d.lowerUsage.vfWrite.reg != 0u && d.suppressedLowerVf != d.lowerUsage.vfWrite.reg)
+                    vfWrite(d.lowerUsage);
+                if (d.upperUsage.vfWrite.reg != 0u)
+                    vfWrite(d.upperUsage);
+                for (uint32_t reg = 1; reg < 16u; ++reg)
+                    if ((d.lowerUsage.viWrite & (1u << reg)) != 0u)
+                        viReadyAt[reg] = index + int32_t(d.lowerUsage.viLatency != 0u ? d.lowerUsage.viLatency : d.lowerUsage.latency);
+                for (uint32_t lane = 0; lane < 4u; ++lane)
+                    if ((d.upperUsage.accWrite & (0x8u >> lane)) != 0u)
+                        accReadyAt[lane] = index + int32_t(A::kAccLatency);
+            };
+
+            const std::string name = format("s%s_%04x", id.c_str(), first * 8u);
+            out += functionHead(name);
+            for (uint32_t index = first; index <= last; ++index)
+            {
+                const int32_t at = static_cast<int32_t>(index - first);
+                const A::Usage lowerUsage = pruneReads(pairs[index].lowerUsage, at);
+                const A::Usage upperUsage = pruneReads(pairs[index].upperUsage, at);
+                noteWrites(pairs[index], at);
+                out += pairBody(index, lowerUsage, upperUsage, index < last);
+            }
+            out += "        return A::Result::Next;\n    }\n";
+            table[first] = "&" + name;
+        }
+        std::string tableText;
+        for (const std::string &entry : table)
+            tableText += "        " + entry + ",\n";
+        out += format("\n    constexpr PairFn kTable%s[%u] = {\n", id.c_str(), pairCount) + tableText + "    };\n";
+        out += format("\n    __attribute__((no_stack_protector)) A::Result run%s(VU1Interpreter &vu, uint64_t budgetEnd, uint8_t *vuData, "
+                      "uint32_t dataSize, GS &gs, PS2Memory *memory)\n    {\n"
                       "        while (A::running(vu, budgetEnd))\n        {\n"
                       "            const uint32_t pc = A::pc(vu);\n"
-                      "            const PairFn pair = (pc & 7u) == 0u && pc < %uu ? kTable%s[pc >> 3] : nullptr;\n"
-                      "            if (!pair)\n                return A::Result::Next;\n"
-                      "            if (const A::Result result = pair(vu, budgetEnd, vuData, dataSize, gs, memory); result != A::Result::Next)\n"
+                      "            const PairFn segment = (pc & 7u) == 0u && pc < %uu ? kTable%s[pc >> 3] : nullptr;\n"
+                      "            if (!segment || A::controlPending(vu))\n                return A::Result::Next;\n"
+                      "            if (const A::Result result = segment(vu, budgetEnd, vuData, dataSize, gs, memory); result != A::Result::Next)\n"
                       "                return result;\n"
                       "        }\n        return A::Result::Stop;\n    }\n",
                       id.c_str(), static_cast<unsigned>(code.size()), id.c_str());
