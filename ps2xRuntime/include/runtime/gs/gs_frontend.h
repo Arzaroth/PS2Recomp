@@ -167,6 +167,13 @@ public:
 
     uint32_t consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes);
 
+    // Drawing state that GIF packets build up (registers, vertex queue, backend CLUT), for recording a GS stream
+    // mid-game and replaying it (PS2X_GS_RECORD, ps2_gs_replay). Call between packets with no image transfer
+    // in progress.
+    std::vector<uint8_t> saveDrawingState();
+    bool loadDrawingState(const std::vector<uint8_t> &state);
+    GSRasterBackend *rasterBackend() { return m_backend.get(); }
+
     void refreshDisplaySnapshot();
 
     void WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value);

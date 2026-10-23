@@ -1,10 +1,12 @@
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/gs_cpu_backend.h"
+#include "runtime/gs/gs_trace.h"
 #include "runtime/gs/ps2_gs_memory.h"
 #include "ps2_log.h"
 #include "runtime/ps2_memory.h"
 #include "ThreadNaming.h"
 #include <atomic>
+#include <chrono>
 #if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
 #endif
@@ -13,6 +15,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <type_traits>
 #include <cstdlib>
 #include <iostream>
 #include <sstream>
@@ -155,6 +158,52 @@ bool GS::fifoEmpty() const
 {
     std::lock_guard<std::mutex> lock(m_queueMutex);
     return m_queue.empty() && !m_workerBusy;
+}
+
+namespace
+{
+    // PS2X_GS_RECORD=<file> (+ PS2X_GS_RECORD_AT=<sec> from process start, PS2X_GS_RECORD_SECONDS=<sec>, default 10):
+    // records the commands the GS thread processes, with VRAM and the drawing state at the start, for
+    // ps2_gs_replay.
+    struct GsRecorder
+    {
+        FILE *out = nullptr;
+        bool started = false;
+        bool finished = false;
+        double startAt = 0.0;
+        double seconds = 10.0;
+        std::chrono::steady_clock::time_point began{};
+
+        static GsRecorder &instance()
+        {
+            static GsRecorder recorder;
+            return recorder;
+        }
+
+        GsRecorder()
+        {
+            const char *path = std::getenv("PS2X_GS_RECORD");
+            if (!path || !*path)
+            {
+                finished = true;
+                return;
+            }
+            if (const char *at = std::getenv("PS2X_GS_RECORD_AT"))
+                startAt = std::atof(at);
+            if (const char *duration = std::getenv("PS2X_GS_RECORD_SECONDS"))
+                seconds = std::atof(duration);
+            out = std::fopen(path, "wb");
+            if (!out)
+                finished = true;
+        }
+
+        static double sinceProcessStart()
+        {
+            static const auto processStart = std::chrono::steady_clock::now();
+            return std::chrono::duration<double>(std::chrono::steady_clock::now() - processStart).count();
+        }
+    };
+    [[maybe_unused]] const double g_gsRecorderClock = GsRecorder::sinceProcessStart();
 }
 
 bool GS::shouldQueue() const
@@ -365,6 +414,35 @@ void GS::workerLoop()
 
         const uint8_t *data = command.bytes.data();
         const uint32_t size = static_cast<uint32_t>(command.bytes.size());
+        if (GsRecorder &recorder = GsRecorder::instance(); !recorder.finished && !m_isShadow)
+        {
+            const double now = GsRecorder::sinceProcessStart();
+            if (!recorder.started && now >= recorder.startAt && m_backend)
+            {
+                const GSTransferSnapshot transfer = m_backend->GetTransferSnapshot();
+                if (transfer.direction == 3u || transfer.totalPixels == 0u)
+                {
+                    GsTraceHeader header;
+                    m_backend->SnapshotVram(header.vram);
+                    header.state = saveDrawingState();
+                    writeGsTraceHeader(recorder.out, header);
+                    recorder.started = true;
+                    recorder.began = std::chrono::steady_clock::now();
+                    std::fprintf(stderr, "[gs-record] started\n");
+                }
+            }
+            if (recorder.started)
+            {
+                if (std::chrono::duration<double>(std::chrono::steady_clock::now() - recorder.began).count() > recorder.seconds)
+                {
+                    std::fclose(recorder.out);
+                    recorder.finished = true;
+                    std::fprintf(stderr, "[gs-record] done\n");
+                }
+                else
+                    writeGsTraceCommand(recorder.out, static_cast<uint8_t>(command.kind), command.registers, data, size);
+            }
+        }
         for (GS *target : {this, m_shadow.get()})
         {
             if (!target)
@@ -2196,4 +2274,64 @@ void GS::updatePreferredDisplaySourceForDraw(const GSPrimitiveBatch &batch)
         m_preferredDisplayDestFbp = ctx.frame.fbp;
         m_hasPreferredDisplaySource = true;
     }
+}
+
+namespace
+{
+    template <typename T>
+    void appendState(std::vector<uint8_t> &out, const T &value)
+    {
+        static_assert(std::is_trivially_copyable_v<T>);
+        const auto *bytes = reinterpret_cast<const uint8_t *>(&value);
+        out.insert(out.end(), bytes, bytes + sizeof(T));
+    }
+
+    template <typename T>
+    bool readState(const std::vector<uint8_t> &in, size_t &offset, T &value)
+    {
+        static_assert(std::is_trivially_copyable_v<T>);
+        if (offset + sizeof(T) > in.size())
+            return false;
+        std::memcpy(&value, in.data() + offset, sizeof(T));
+        offset += sizeof(T);
+        return true;
+    }
+}
+
+#define PS2X_GS_DRAWING_STATE(X)                                                                                     \
+    X(m_ctx) X(m_prim) X(m_primRegister) X(m_prmodeRegister) X(m_curR) X(m_curG) X(m_curB) X(m_curA) X(m_curQ)      \
+        X(m_curS) X(m_curT) X(m_curU) X(m_curV) X(m_curFog) X(m_fogR) X(m_fogG) X(m_fogB) X(m_prmodecont) X(m_pabe) \
+            X(m_scanmsk) X(m_dimx) X(m_dthe) X(m_colclamp) X(m_texa) X(m_texclut) X(m_bitbltbuf) X(m_trxpos)          \
+                X(m_trxreg) X(m_trxdir) X(m_vtxQueue) X(m_vtxCount) X(m_vtxIndex)
+
+std::vector<uint8_t> GS::saveDrawingState()
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    std::vector<uint8_t> out;
+#define PS2X_SAVE_MEMBER(member) appendState(out, member);
+    PS2X_GS_DRAWING_STATE(PS2X_SAVE_MEMBER)
+#undef PS2X_SAVE_MEMBER
+    std::vector<uint8_t> clut;
+    if (auto *cpu = dynamic_cast<GSCpuBackend *>(m_backend.get()))
+        clut = cpu->SaveClutState();
+    appendState(out, static_cast<uint32_t>(clut.size()));
+    out.insert(out.end(), clut.begin(), clut.end());
+    return out;
+}
+
+bool GS::loadDrawingState(const std::vector<uint8_t> &state)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    size_t offset = 0;
+    bool ok = true;
+#define PS2X_LOAD_MEMBER(member) ok = ok && readState(state, offset, member);
+    PS2X_GS_DRAWING_STATE(PS2X_LOAD_MEMBER)
+#undef PS2X_LOAD_MEMBER
+    uint32_t clutSize = 0;
+    ok = ok && readState(state, offset, clutSize) && offset + clutSize <= state.size();
+    if (!ok)
+        return false;
+    if (auto *cpu = dynamic_cast<GSCpuBackend *>(m_backend.get()))
+        cpu->LoadClutState(state.data() + offset, clutSize);
+    return true;
 }

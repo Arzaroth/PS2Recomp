@@ -53,6 +53,10 @@ public:
     void SnapshotVram(std::vector<uint8_t> &out) const override;
     GSTransferSnapshot GetTransferSnapshot() const override;
 
+    // The current CLUT (GS::saveDrawingState / loadDrawingState); waits for queued drawing.
+    std::vector<uint8_t> SaveClutState();
+    void LoadClutState(const uint8_t *data, size_t size);
+
 private:
     bool m_asyncAllowed = true;
     void ResetUnlocked();

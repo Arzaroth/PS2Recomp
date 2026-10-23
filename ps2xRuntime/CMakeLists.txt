@@ -547,6 +547,14 @@ if(NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
         target_sources(ps2_vu1_replay PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/profiling/sampling_profiler.cpp")
     endif()
     ps2x_stage_ffmpeg_runtime_dlls(ps2_vu1_replay)
+
+    # GS command streams recorded with PS2X_GS_RECORD: rasterizer timing and VRAM checks.
+    add_executable(ps2_gs_replay tools/ps2_gs_replay.cpp)
+    target_link_libraries(ps2_gs_replay PRIVATE ps2_runtime)
+    if(WIN32)
+        target_sources(ps2_gs_replay PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/profiling/sampling_profiler.cpp")
+    endif()
+    ps2x_stage_ffmpeg_runtime_dlls(ps2_gs_replay)
 endif()
 
 if(PS2X_IS_VITA)

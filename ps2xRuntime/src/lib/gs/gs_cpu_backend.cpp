@@ -1591,6 +1591,30 @@ void GSCpuBackend::SnapshotVram(std::vector<uint8_t> &out) const
     std::memcpy(out.data(), m_vram, m_vramSize);
 }
 
+std::vector<uint8_t> GSCpuBackend::SaveClutState()
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    DrainUnlocked();
+    ResolveDeferredClutUnlocked();
+    std::vector<uint8_t> out(sizeof(m_clut) + sizeof(m_clutCbp));
+    std::memcpy(out.data(), m_clut.data(), sizeof(m_clut));
+    std::memcpy(out.data() + sizeof(m_clut), m_clutCbp.data(), sizeof(m_clutCbp));
+    return out;
+}
+
+void GSCpuBackend::LoadClutState(const uint8_t *data, size_t size)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (size != sizeof(m_clut) + sizeof(m_clutCbp))
+        return;
+    DrainUnlocked();
+    std::memcpy(m_clut.data(), data, sizeof(m_clut));
+    std::memcpy(m_clutCbp.data(), data + sizeof(m_clut), sizeof(m_clutCbp));
+    m_clutDeferred = false;
+    m_clutSnapshotStale = true;
+    ++m_clutSerial;
+}
+
 GSTransferSnapshot GSCpuBackend::GetTransferSnapshot() const
 {
     std::lock_guard<std::mutex> lock(m_mutex);
