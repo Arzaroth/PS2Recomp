@@ -11,6 +11,33 @@
 #include <cstring>
 #include <immintrin.h>
 
+inline uint32_t VU1Interpreter::microAddressMask() const
+{
+    return m_unit == Unit::VU1 ? 0x3FFFu : 0x0FFFu;
+}
+
+inline int32_t VU1Interpreter::readBranchVi(uint8_t reg) const
+{
+    if (reg == 0u)
+        return 0;
+    if (m_viBranchBackupValid &&
+        m_viBranchBackupReg == reg)
+    {
+        return m_viBranchBackupValue;
+    }
+    return m_state.vi[reg];
+}
+
+inline void VU1Interpreter::recordViWriteForBranch(uint8_t reg, int32_t oldValue)
+{
+    if (reg == 0u)
+        return;
+    m_viBranchBackupValue = oldValue;
+    m_viBranchBackupReg = reg;
+    m_viBranchBackupValid = true;
+}
+
+
 __attribute__((always_inline)) inline void VU1Interpreter::advanceOneCycle()
 {
     advanceTo(m_cycle + 1u);

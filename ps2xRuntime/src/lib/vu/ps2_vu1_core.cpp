@@ -334,32 +334,6 @@ float VU1Interpreter::normalizeResult(float value, uint32_t &laneFlags) const
     return value;
 }
 
-uint32_t VU1Interpreter::microAddressMask() const
-{
-    return m_unit == Unit::VU1 ? 0x3FFFu : 0x0FFFu;
-}
-
-int32_t VU1Interpreter::readBranchVi(uint8_t reg) const
-{
-    if (reg == 0u)
-        return 0;
-    if (m_viBranchBackupValid &&
-        m_viBranchBackupReg == reg)
-    {
-        return m_viBranchBackupValue;
-    }
-    return m_state.vi[reg];
-}
-
-void VU1Interpreter::recordViWriteForBranch(uint8_t reg, int32_t oldValue)
-{
-    if (reg == 0u)
-        return;
-    m_viBranchBackupValue = oldValue;
-    m_viBranchBackupReg = reg;
-    m_viBranchBackupValid = true;
-}
-
 void VU1Interpreter::applyDest(float *dst, const float *result, uint8_t dest)
 {
     if (dest & 0x8u)

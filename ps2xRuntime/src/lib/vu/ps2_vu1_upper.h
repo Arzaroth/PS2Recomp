@@ -85,12 +85,19 @@ namespace ps2_vu1_upper_ops
 
 namespace ps2_vu1_upper_ops
 {
+    // normalizeVector() on a register.
     inline __m128 normalizeLanes(__m128 value)
     {
-        alignas(16) float lanes[4];
-        _mm_store_ps(lanes, value);
-        normalizeVector(lanes, lanes);
-        return _mm_load_ps(lanes);
+        const __m128i bits = _mm_castps_si128(value);
+        const __m128i exponentMask = _mm_set1_epi32(0x7F800000);
+        const __m128i sign = _mm_and_si128(bits, _mm_set1_epi32(static_cast<int>(0x80000000u)));
+        const __m128i exponent = _mm_and_si128(bits, exponentMask);
+        const __m128i zeroExponent = _mm_cmpeq_epi32(exponent, _mm_setzero_si128());
+        const __m128i maxExponent = _mm_cmpeq_epi32(exponent, exponentMask);
+        __m128i result = _mm_or_si128(_mm_andnot_si128(zeroExponent, bits), _mm_and_si128(zeroExponent, sign));
+        result = _mm_or_si128(_mm_andnot_si128(maxExponent, result),
+                              _mm_and_si128(maxExponent, _mm_or_si128(sign, _mm_set1_epi32(0x7F7FFFFF))));
+        return _mm_castsi128_ps(result);
     }
 
     // vuAdd on four lanes. 1 << shift comes from converting 2^shift, since SSE4 has no variable shift.
