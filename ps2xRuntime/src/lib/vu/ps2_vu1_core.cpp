@@ -1751,7 +1751,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                 ? m_decodedCodeCache[pairIndex]
                 : getDecodedInstructionPairForPc(vuCode, codeSize, memory, m_state.pc);
         m_currentFlagsLive = flagsLiveHere;
-        const StepResult step = stepPair(
+        const StepResult step = stepPair<false>(
             decoded, budgetEnd, codeSize, [this, &decoded]() { (this->*decoded.upperHandler)(decoded.upper); },
             [&]() { execLower(decoded.lower, vuData, dataSize, gs, memory, decoded.upper); });
         if (step == StepResult::Stop)

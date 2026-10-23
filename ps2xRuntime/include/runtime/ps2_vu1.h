@@ -305,8 +305,9 @@ private:
     uint64_t m_externalCodeGeneration = 0;
 
     // upper() and lower() execute the pair's instructions: through decoded's handlers when interpreting,
-    // with the instruction words as constants in compiled microprograms.
-    template <typename Upper, typename Lower>
+    // with the instruction words as constants in compiled microprograms. A Sequential pair is one compiled
+    // code reaches from the pair before it with no branch, E bit or halt pending and that sets none itself.
+    template <bool Sequential, typename Upper, typename Lower>
     StepResult stepPair(const DecodedInstructionPair &decoded, uint64_t budgetEnd, uint32_t codeSize, Upper &&upper,
                         Lower &&lower);
     void run(uint8_t *vuCode, uint32_t codeSize,

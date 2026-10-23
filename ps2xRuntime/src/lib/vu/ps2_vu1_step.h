@@ -224,7 +224,7 @@ __attribute__((always_inline)) inline void VU1Interpreter::markPairWrites(const 
     }
 }
 
-template <typename Upper, typename Lower>
+template <bool Sequential, typename Upper, typename Lower>
 __attribute__((always_inline)) inline VU1Interpreter::StepResult VU1Interpreter::stepPair(const DecodedInstructionPair &decoded,
                                                                                     uint64_t budgetEnd, uint32_t codeSize,
                                                                                     Upper &&upper, Lower &&lower)
@@ -347,6 +347,13 @@ __attribute__((always_inline)) inline VU1Interpreter::StepResult VU1Interpreter:
     m_state.vf[0][3] = 1.0f;
     m_state.vi[0] = 0;
 
+    if constexpr (Sequential)
+    {
+        m_state.pc += 8u;
+        advanceOneCycle();
+        return StepResult::Next;
+    }
+
     uint32_t nextPc = m_state.pc + 8u;
     if (nextPc >= codeSize)
         nextPc = 0u;
@@ -414,12 +421,12 @@ struct Vu1CompiledAccess
     static bool running(const VU1Interpreter &vu, uint64_t budgetEnd) { return vu.m_cycle < budgetEnd && !vu.m_stopRequested; }
     static uint32_t pc(const VU1Interpreter &vu) { return vu.m_state.pc; }
 
-    template <typename Upper, typename Lower>
+    template <bool Sequential, typename Upper, typename Lower>
     __attribute__((always_inline)) static Result step(VU1Interpreter &vu, const Pair &decoded, bool flagsLive, uint64_t budgetEnd,
                                                       uint32_t codeSize, Upper &&upper, Lower &&lower)
     {
         vu.m_currentFlagsLive = flagsLive;
-        return vu.stepPair(decoded, budgetEnd, codeSize, upper, lower);
+        return vu.stepPair<Sequential>(decoded, budgetEnd, codeSize, upper, lower);
     }
     template <Kind K, Operand O, bool ToAcc>
     __attribute__((always_inline)) static void fmac(VU1Interpreter &vu, uint32_t upper)

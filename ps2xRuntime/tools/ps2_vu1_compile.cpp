@@ -136,7 +136,7 @@ int main(int argc, char **argv)
                           ".suppressedLowerVf = %uu, .writtenVi = %uu};\n",
                           int(d.iBit), int(d.eBit), int(d.mBit), int(d.dBit), int(d.tBit), unsigned(d.upperVfShadowReg),
                           unsigned(d.suppressedLowerVf), unsigned(d.writtenVi));
-            out += format("        return A::step(vu, d, %s, budgetEnd, %zuu, [&]() { %s; },\n", live[pc / 8u] ? "true" : "false",
+            out += format("        return A::step<false>(vu, d, %s, budgetEnd, %zuu, [&]() { %s; },\n", live[pc / 8u] ? "true" : "false",
                           code.size(), upperCall(d.upper).c_str());
             out += format("                       [&]() { A::lower(vu, 0x%08Xu, vuData, dataSize, gs, memory, 0x%08Xu); });\n    }\n",
                           d.lower, d.upper);
