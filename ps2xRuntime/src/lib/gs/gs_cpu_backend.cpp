@@ -699,6 +699,17 @@ namespace
         return linear ? floorToInt(sampleV - 0.5f) : static_cast<int>(sampleV);
     }
 
+    // The highest row a bilinear sample can weigh: none below its own when it lies on a texel center.
+    int spriteTexelLastRow(const GSPrimitiveBatch &batch, int y, int unclippedY0, int spanY)
+    {
+        const float v0f = static_cast<float>(batch.vertices[0].v) / 16.0f;
+        const float v1f = static_cast<float>(batch.vertices[1].v) / 16.0f;
+        const float ty = (static_cast<float>(y - unclippedY0) + 0.5f) / static_cast<float>(std::max(spanY, 1));
+        const float texVf = v0f + (v1f - v0f) * ty;
+        const int fixedV = clampInt(static_cast<int>((texVf * 16.0f) + 0.5f), 0, 0xFFFF);
+        return static_cast<int>(std::ceil(static_cast<float>(fixedV) / 16.0f - 0.5f));
+    }
+
     void textureRows(const GSPrimitiveBatch &batch, int &firstRow, int &lastRow)
     {
         const GSDrawState &state = batch.state;
@@ -719,12 +730,22 @@ namespace
             const int a = spriteTexelRow(batch, unclippedY0, unclippedY0, spanY, linear);
             const int b = spriteTexelRow(batch, unclippedY1, unclippedY0, spanY, linear);
             const int low = std::min(a, b);
-            const int high = std::max(a, b) + (linear ? 1 : 0);
+            const int high = linear ? std::max(spriteTexelLastRow(batch, unclippedY0, unclippedY0, spanY),
+                                               spriteTexelLastRow(batch, unclippedY1, unclippedY0, spanY))
+                                    : std::max(a, b);
             const uint8_t wrapV = static_cast<uint8_t>((state.context.clamp >> 2) & 0x3u);
-            if (wrapV < 2u && low >= 0 && high < height)
+            // CLAMP and REGION_CLAMP clamp out-of-range rows; REPEAT and REGION_REPEAT may wrap them.
+            int minRow = 0;
+            int maxRow = height - 1;
+            if (wrapV == 2u)
             {
-                firstRow = low;
-                lastRow = high;
+                minRow = clampInt(static_cast<int>((state.context.clamp >> 24) & 0x3FFu), 0, height - 1);
+                maxRow = clampInt(static_cast<int>((state.context.clamp >> 34) & 0x3FFu), minRow, height - 1);
+            }
+            if (wrapV == 1u || wrapV == 2u || (wrapV == 0u && low >= 0 && high < height))
+            {
+                firstRow = clampInt(low, minRow, maxRow);
+                lastRow = clampInt(high, minRow, maxRow);
             }
             return;
         }
