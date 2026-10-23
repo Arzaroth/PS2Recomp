@@ -495,6 +495,8 @@ void ps2GsResetEvents()
 void PS2Memory::resetEeTimers() noexcept
 {
     m_eeTimers = {};
+    m_eeTimerPendingCycles = 0u;
+    m_eeTimerFlushCycles = 0u;
     // The EE kernel keeps Timer 3 counting H-BLANKs for its alarms; games poll it unconfigured.
     m_eeTimers[3].mode = kEeTimerModeCue | 0x3u;
     m_timerSpinCycles.store(0u, std::memory_order_release);
@@ -507,12 +509,26 @@ uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
         return 0u;
     }
 
-    constexpr uint32_t kGifStat = 0x10003020u;
-    constexpr uint32_t kGifFqcMask = 0x1F000000u;
-    auto gifStatIt = m_ioRegisters.find(kGifStat);
-    if (gifStatIt != m_ioRegisters.end())
-        gifStatIt->second &= ~kGifFqcMask;
+    if (m_gifFqcSet)
+    {
+        constexpr uint32_t kGifStat = 0x10003020u;
+        constexpr uint32_t kGifFqcMask = 0x1F000000u;
+        m_ioRegisters[kGifStat] &= ~kGifFqcMask;
+        m_gifFqcSet = false;
+    }
 
+    m_eeTimerPendingCycles += eeCycles;
+    if (m_eeTimerPendingCycles < m_eeTimerFlushCycles)
+    {
+        return 0u;
+    }
+    return flushEeTimers();
+}
+
+uint32_t PS2Memory::flushEeTimers() noexcept
+{
+    const uint64_t eeCycles = m_eeTimerPendingCycles;
+    m_eeTimerPendingCycles = 0u;
     uint32_t interruptMask = 0u;
     for (size_t index = 0; index < m_eeTimers.size(); ++index)
     {
@@ -573,10 +589,19 @@ uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
             interruptMask |= 1u << index;
         }
     }
+    m_eeTimerFlushCycles = cyclesUntilEeTimerEvent();
     return interruptMask;
 }
 
-uint64_t PS2Memory::cyclesUntilNextEeTimerInterrupt() const noexcept
+uint64_t PS2Memory::cyclesUntilNextEeTimerInterrupt() noexcept
+{
+    // Pending cycles stay below the next event (advanceEeTimers), so this raises nothing.
+    if (m_eeTimerPendingCycles != 0u)
+        flushEeTimers();
+    return cyclesUntilEeTimerEvent();
+}
+
+uint64_t PS2Memory::cyclesUntilEeTimerEvent() const noexcept
 {
     uint64_t nearest = std::numeric_limits<uint64_t>::max();
     for (const EeTimer &timer : m_eeTimers)
@@ -1231,6 +1256,12 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
     uint32_t timerOffset = 0u;
     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
     {
+        flushEeTimers();
+        struct RecomputeFlush
+        {
+            PS2Memory &memory;
+            ~RecomputeFlush() { memory.m_eeTimerFlushCycles = memory.cyclesUntilEeTimerEvent(); }
+        } recompute{*this};
         EeTimer &timer = m_eeTimers[timerIndex];
         switch (timerOffset)
         {
@@ -1800,6 +1831,7 @@ void PS2Memory::processPendingTransfers()
         constexpr uint32_t kGifFqcMask = 0x1F000000u;
         uint32_t &gifStat = m_ioRegisters[kGifStat];
         gifStat = (gifStat & ~kGifFqcMask) | (observedGifQwc << 24u);
+        m_gifFqcSet = true;
     }
 
     for (size_t idx = 0; idx < m_pendingGifTransfers.size(); ++idx)
@@ -2407,6 +2439,7 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
     uint32_t timerOffset = 0u;
     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
     {
+        flushEeTimers();
         EeTimer &timer = m_eeTimers[timerIndex];
         switch (timerOffset)
         {

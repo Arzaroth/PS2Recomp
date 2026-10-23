@@ -333,7 +333,7 @@ public:
     // loop polling a timer faster than it ticks finishes in game time, not in host time.
     uint64_t takeTimerSpinCycles() noexcept { return m_timerSpinCycles.exchange(0u, std::memory_order_acq_rel); }
     uint64_t pendingTimerSpinCycles() const noexcept { return m_timerSpinCycles.load(std::memory_order_acquire); }
-    [[nodiscard]] uint64_t cyclesUntilNextEeTimerInterrupt() const noexcept;
+    [[nodiscard]] uint64_t cyclesUntilNextEeTimerInterrupt() noexcept;
     void resetEeTimers() noexcept;
 
     using GifPacketCallback = std::function<void(const uint8_t *, uint32_t)>;
@@ -477,6 +477,13 @@ public:
     };
 
     std::array<EeTimer, 4> m_eeTimers{};
+    // advanceEeTimers() only accumulates cycles until a timer can raise an interrupt; register
+    // accesses apply them first (flushEeTimers), so counts and flags read as if applied each call.
+    uint64_t m_eeTimerPendingCycles = 0;
+    uint64_t m_eeTimerFlushCycles = 0;
+    bool m_gifFqcSet = false;
+    uint32_t flushEeTimers() noexcept;
+    [[nodiscard]] uint64_t cyclesUntilEeTimerEvent() const noexcept;
     std::atomic<uint64_t> m_timerSpinCycles{0u};
     bool tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr);
     void completeDmacChannel(uint32_t channelBase, uint32_t cause);
