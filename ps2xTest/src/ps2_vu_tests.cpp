@@ -81,6 +81,15 @@ void register_ps2_vu_tests()
 {
     MiniTest::Case("PS2VU0Math", [](TestCase &tc)
     {
+        tc.Run("ResetContext_vf0_is_0001", [](TestCase &t)
+        {
+            const R5900Context ctx{};
+            float vf0[4]{};
+            _mm_storeu_ps(vf0, ctx.vu0_vf[0]);
+            t.IsTrue(vf0[0] == 0.0f && vf0[1] == 0.0f && vf0[2] == 0.0f && vf0[3] == 1.0f,
+                     "a freshly constructed context must see VF00 = (0, 0, 0, 1)");
+        });
+
         tc.Run("MulVector_componentwise", [](TestCase &t)
         {
             VuEnv env;
