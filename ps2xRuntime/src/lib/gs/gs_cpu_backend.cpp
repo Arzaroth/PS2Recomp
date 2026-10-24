@@ -816,6 +816,12 @@ namespace
         return false;
     }
 
+    // Z as the GS's 32 bits, saturating past either end (a bare cast of 2^32 is 0 on x86, 0xFFFFFFFF on arm64).
+    inline uint32_t gsDepthBits(double z)
+    {
+        return static_cast<uint32_t>(std::min(4294967295.0, std::max(0.0, z)));
+    }
+
     // VRAM blocks a primitive can write (whole page rows of its frame and Z buffers) and sample.
     struct PrimitiveBlocks
     {
@@ -1967,7 +1973,7 @@ void GSCpuBackend::DrawWith(const GSPrimitiveBatch &batch, const RasterContext &
         int px = static_cast<int>(v.x) - (ctx.xyoffset.ofx >> 4);
         int py = static_cast<int>(v.y) - (ctx.xyoffset.ofy >> 4);
         if (raster.owns(px, py))
-            WritePixel(*raster.pixel, px, py, static_cast<u32>(v.z), v.r, v.g, v.b, v.a, v.fog);
+            WritePixel(*raster.pixel, px, py, gsDepthBits(v.z), v.r, v.g, v.b, v.a, v.fog);
         break;
     }
     default:
@@ -2526,7 +2532,7 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch, const RasterContext
     float fy0 = v0.y - static_cast<float>(ctx.xyoffset.ofy) / 16.0f;
     float fx1 = v1.x - static_cast<float>(ctx.xyoffset.ofx) / 16.0f;
     float fy1 = v1.y - static_cast<float>(ctx.xyoffset.ofy) / 16.0f;
-    u32 z1 = static_cast<u32>(v1.z);
+    u32 z1 = gsDepthBits(v1.z);
 
     if (fx0 > fx1)
         std::swap(fx0, fx1);
@@ -2780,7 +2786,7 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch, const RasterConte
             }
 
             const uint8_t fog = clampU8(static_cast<int>(v0.fog * w0 + v1.fog * w1 + v2.fog * w2));
-            WritePixel(*raster.pixel, x, y, static_cast<u32>(z + 0.5), r, g, b, a, fog);
+            WritePixel(*raster.pixel, x, y, gsDepthBits(z + 0.5), r, g, b, a, fog);
         }
     }
 }
@@ -2833,7 +2839,7 @@ void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch, const RasterContext &
         double z = (v0.z + (v1.z - v0.z) * t);
         const uint8_t fog = clampU8(static_cast<int>(v0.fog + (v1.fog - v0.fog) * t));
         if (raster.owns(x0, y0))
-            WritePixel(*raster.pixel, x0, y0, static_cast<u32>(z), r, g, b, a, fog);
+            WritePixel(*raster.pixel, x0, y0, gsDepthBits(z), r, g, b, a, fog);
 
         if (x0 == x1 && y0 == y1)
             break;
