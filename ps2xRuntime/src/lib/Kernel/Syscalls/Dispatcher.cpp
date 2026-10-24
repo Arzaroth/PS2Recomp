@@ -303,6 +303,9 @@ namespace ps2_syscalls
         // Both handlers ALREADY exist in Stubs/SIF.cpp and read a0/a1, exactly the
         // syscall convention - only the dispatch branch was missing.
         // Bit 31 of `reg` is the PS2 convention (0x80000000 | SIF register number).
+        case 0x6B: // __NR_sceSifStopDma
+            ps2_stubs::sceSifStopDma(rdram, ctx, runtime);
+            return true;
         case 0x79:
         case static_cast<uint32_t>(-0x79):
             ps2_stubs::sceSifSetReg(rdram, ctx, runtime);
