@@ -1176,6 +1176,37 @@ void register_ps2_runtime_expansion_tests()
                      "a double in a3 is the whole register, and the next one comes from t0");
         });
 
+        tc.Run("vsprintf reads one 64-bit slot per argument of the va_list", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            R5900Context ctx{};
+
+            constexpr uint32_t kDestAddr = 0x00002000u;
+            constexpr uint32_t kFormatAddr = 0x00002100u;
+            constexpr uint32_t kVaListAddr = 0x00002200u;
+            constexpr uint32_t kConfirmAddr = 0x00002300u;
+            constexpr uint32_t kBackAddr = 0x00002310u;
+            constexpr char kFormat[] = "%s %s %d %.1f";
+
+            std::memcpy(rdram.data() + kFormatAddr, kFormat, sizeof(kFormat));
+            std::memcpy(rdram.data() + kConfirmAddr, "Confirm", 8);
+            std::memcpy(rdram.data() + kBackAddr, "Back", 5);
+            const double half = 0.5;
+            uint64_t slots[4] = {kConfirmAddr, kBackAddr, static_cast<uint64_t>(int64_t{-7}), 0u};
+            std::memcpy(&slots[3], &half, sizeof(half));
+            std::memcpy(rdram.data() + kVaListAddr, slots, sizeof(slots));
+            setRegU32(ctx, 4, kDestAddr);
+            setRegU32(ctx, 5, kFormatAddr);
+            setRegU32(ctx, 6, kVaListAddr);
+
+            ps2_stubs::vsprintf(rdram.data(), &ctx, &runtime);
+
+            const std::string rendered(reinterpret_cast<const char *>(rdram.data() + kDestAddr));
+            t.Equals(rendered, std::string("Confirm Back -7 0.5"),
+                     "each argument, pointers and ints included, takes a whole sd-spilled slot");
+        });
+
         tc.Run("multiply-add matrix writes rd only when R5900 requires it", [](TestCase &t)
         {
             R5900Decoder decoder;
