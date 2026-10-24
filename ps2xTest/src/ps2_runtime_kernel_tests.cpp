@@ -1154,6 +1154,17 @@ void register_ps2_runtime_kernel_tests()
                      "iFlushCache should succeed when guest and host memory are coherent");
         });
 
+        tc.Run("0x6B dispatches sceSifStopDma", [](TestCase &t)
+        {
+            // PS2SDK syscallnr.h: __NR_sceSifStopDma 0x6b. God of War II calls it through libkernel.
+            TestEnv env;
+            setRegU32(env.ctx, 2, 0xDEADBEEFu);
+            t.IsTrue(callSyscall(0x6Bu, env.rdram.data(), &env.ctx, &env.runtime),
+                     "0x6B should dispatch sceSifStopDma");
+            t.Equals(getRegS32(env.ctx, 2), 0,
+                     "sceSifStopDma has nothing in flight to stop because SIF DMA completes immediately");
+        });
+
         tc.Run("setup heap and thread invalid ids use documented kernel errors", [](TestCase &t)
         {
             TestEnv env;
