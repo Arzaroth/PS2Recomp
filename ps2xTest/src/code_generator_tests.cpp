@@ -1762,6 +1762,59 @@ void register_code_generator_tests()
             t.IsTrue(ilwr.find("READ32") == std::string::npos, "VILWR must not read EE RAM");
         });
 
+        tc.Run("VU0 macro random ops follow the PS2 R register", [](TestCase &t) {
+            R5900Decoder decoder;
+            CodeGenerator gen({}, {});
+
+            const std::string rnext = gen.translateInstruction(decoder.decodeInstruction(0x1B9580u, 0x4B05043Cu));
+            printGeneratedCode("vrnext.x $vf5, $R", rnext);
+            t.IsTrue(rnext.find("((r >> 4) & 1u) ^ ((r >> 22) & 1u)") != std::string::npos, "VRNEXT must step the PS2 LFSR (bits 4 and 22)");
+            t.IsTrue(rnext.find("| 0x3F800000u") != std::string::npos, "VRNEXT must keep R in [1, 2)");
+            t.IsTrue(rnext.find("ctx->vu0_vf[5] = _mm_blendv_ps(ctx->vu0_vf[5], ctx->vu0_r") != std::string::npos,
+                     "VRNEXT must write the new R to Ft");
+
+            const std::string rinit = gen.translateInstruction(decoder.decodeInstruction(0x1B9570u, 0x4A002C3Eu));
+            t.IsTrue(rinit.find("0x3F800000u | (fs[0] & 0x007FFFFFu)") != std::string::npos, "VRINIT must take the mantissa of Fs.x");
+
+            const std::string rxor = gen.translateInstruction(decoder.decodeInstruction(0x1B9574u, 0x4A00343Fu));
+            t.IsTrue(rxor.find("0x3F800000u | ((r ^ fs[0]) & 0x007FFFFFu)") != std::string::npos, "VRXOR must xor the mantissa into R");
+            t.IsTrue(rxor.find("ctx->vu0_vf[6]") != std::string::npos, "VRXOR must read Fs (rd = vf6)");
+
+            Instruction rget{};
+            rget.rt = 7;
+            rget.vectorInfo.vectorField = 0xF;
+            t.IsTrue(gen.translateVU_VRGET(rget).find("_mm_shuffle_epi32(_mm_castps_si128(ctx->vu0_r), 0)") != std::string::npos,
+                     "VRGET must broadcast R");
+
+            Instruction ctc2{};
+            ctc2.opcode = OPCODE_COP2;
+            ctc2.rs = COP2_CTC2;
+            ctc2.rt = 3;
+            ctc2.rd = VU0_CR_R;
+            t.IsTrue(gen.translateInstruction(ctc2).find("0x3F800000u | (GPR_U32(ctx, 3) & 0x007FFFFFu)") != std::string::npos,
+                     "CTC2 to R must keep only the mantissa");
+        });
+
+        tc.Run("VU0 macro VFTOI saturates and VABS flushes denormals", [](TestCase &t) {
+            CodeGenerator gen({}, {});
+            Instruction inst{};
+            inst.rd = 5;
+            inst.rt = 6;
+            inst.vectorInfo.vectorField = 0xF;
+            const std::string ftoi = gen.translateVU_VFTOI(inst, 15);
+            t.IsTrue(ftoi.find("_mm_cmpnlt_ps(src, _mm_set1_ps(2147483648.0f))") != std::string::npos,
+                     "VFTOI must detect positive overflow");
+            t.IsTrue(ftoi.find("_mm_xor_si128(_mm_cvttps_epi32(src), positiveOverflow)") != std::string::npos,
+                     "VFTOI must turn positive overflow into 0x7FFFFFFF");
+            inst.rt = 0;
+            t.IsTrue(gen.translateVU_VFTOI(inst, 0).find("vu0_vf[0]") == std::string::npos, "VFTOI must not write vf0");
+
+            R5900Decoder decoder;
+            const std::string abs = gen.translateInstruction(decoder.decodeInstruction(0x1000u, 0x4BE629FDu));
+            t.IsTrue(abs.find("_mm_cmpeq_epi32(_mm_and_si128(bits, _mm_set1_epi32(0x7F800000)), _mm_setzero_si128())") != std::string::npos,
+                     "VABS must flush denormal inputs to zero");
+        });
+
         tc.Run("JAL to known function emits call and check", [](TestCase &t) {
             Function func;
             func.name = "jal_test";
