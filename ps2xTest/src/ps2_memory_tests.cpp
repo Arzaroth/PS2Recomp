@@ -627,6 +627,41 @@ void register_ps2_memory_tests()
             t.Equals(sw, 0x00008001u, "zero-extend w");
         });
 
+        tc.Run("VIF UNPACK V2 writes xyxy, V3 takes W from the next element, V4-5 widens to 8 bits", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            std::memset(mem.getVU1Data(), 0xAA, PS2_VU1_DATA_SIZE);
+            auto lanes = [&](uint32_t qw, uint32_t out[4]) { std::memcpy(out, mem.getVU1Data() + qw * 16u, 16u); };
+
+            std::vector<uint8_t> v2;
+            appendU32(v2, makeVifCmd(0x64u, 1u, 0x0000u));
+            appendU32(v2, 11u);
+            appendU32(v2, 22u);
+            mem.processVIF1Data(v2.data(), static_cast<uint32_t>(v2.size()));
+            uint32_t out[4]{};
+            lanes(0u, out);
+            t.IsTrue(out[0] == 11u && out[1] == 22u && out[2] == 11u && out[3] == 22u, "V2-32 should write x, y, x, y");
+
+            std::vector<uint8_t> v3;
+            appendU32(v3, makeVifCmd(0x68u, 2u, 0x0001u));
+            for (uint32_t value : {1u, 2u, 3u, 4u, 5u, 6u})
+                appendU32(v3, value);
+            mem.processVIF1Data(v3.data(), static_cast<uint32_t>(v3.size()));
+            lanes(1u, out);
+            t.IsTrue(out[0] == 1u && out[1] == 2u && out[2] == 3u && out[3] == 4u, "V3-32 should take W from the next element");
+            lanes(2u, out);
+            t.IsTrue(out[0] == 4u && out[1] == 5u && out[2] == 6u, "the next V3-32 vector should start at its own element");
+
+            std::vector<uint8_t> v45;
+            appendU32(v45, makeVifCmd(0x6Fu, 1u, 0x0003u));
+            appendU32(v45, 0x0000FC21u);
+            mem.processVIF1Data(v45.data(), static_cast<uint32_t>(v45.size()));
+            lanes(3u, out);
+            t.IsTrue(out[0] == 0x08u && out[1] == 0x08u && out[2] == 0xF8u && out[3] == 0x80u,
+                     "V4-5 should widen 5:5:5:1 to 8 bits per channel");
+        });
+
         tc.Run("VIF UNPACK bit15 adds TOPS to destination address", [](TestCase &t)
         {
             PS2Memory mem;
