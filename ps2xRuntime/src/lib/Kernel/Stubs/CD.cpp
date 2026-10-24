@@ -267,10 +267,19 @@ namespace ps2_stubs
         }
     }
 
+    // The DVD spins at a constant angular velocity: the rated speed holds at the outer edge of a
+    // layer and drops to 40% near the hub. Seeks cost 30 ms within ~14764 sectors, 100 ms beyond.
     uint64_t cdReadDurationCycles(uint32_t headLbn, uint32_t lbn, uint32_t sectors, uint64_t sectorsPerSecond)
     {
-        const uint64_t seek = lbn == headLbn ? 0u : kEeCyclesPerSecond / 50u;
-        return seek + sectors * kEeCyclesPerSecond / sectorsPerSecond;
+        constexpr uint32_t kFastSeekSectors = 14764u;
+        constexpr uint64_t kDvdLayerSectors = 2295104u;
+        const uint32_t distance = lbn > headLbn ? lbn - headLbn : headLbn - lbn;
+        const uint64_t seek = distance == 0u                 ? 0u
+                              : distance < kFastSeekSectors ? kEeCyclesPerSecond * 30u / 1000u
+                                                            : kEeCyclesPerSecond / 10u;
+        const uint64_t radius = lbn % kDvdLayerSectors;
+        const uint64_t permilleOfRate = 400u + 600u * radius / kDvdLayerSectors;
+        return seek + sectors * kEeCyclesPerSecond * 1000u / (sectorsPerSecond * permilleOfRate);
     }
 
     void sceCdRead(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
