@@ -360,6 +360,55 @@ void register_ps2_runtime_expansion_tests()
             t.IsTrue(pabswCode.find("PS2_PABSW(GPR_VEC(ctx, 5))") != std::string::npos, "PABSW reads rt: " + pabswCode);
         });
 
+        tc.Run("MMI parallel multiplies and divides fill the 128-bit HI and LO", [](TestCase &t)
+        {
+            auto words = [](__m128i v)
+            {
+                std::array<uint32_t, 4> out{};
+                _mm_storeu_si128(reinterpret_cast<__m128i *>(out.data()), v);
+                return out;
+            };
+            R5900Context ctx{};
+
+            const __m128i rd = ps2ParallelWordMultiply(&ctx, _mm_setr_epi32(-3, 99, 0x10000, 99), _mm_setr_epi32(5, 99, 0x10000, 99), Ps2WordMultiply::Signed);
+            t.IsTrue(words(rd) == std::array<uint32_t, 4>{0xFFFFFFF1u, 0xFFFFFFFFu, 0u, 1u}, "PMULTW writes both 64-bit products to rd");
+            t.Equals(ctx.lo, uint64_t{0xFFFFFFFFFFFFFFF1ull}, "PMULTW LO lane 0 is the sign-extended low word");
+            t.Equals(ctx.hi, uint64_t{0xFFFFFFFFFFFFFFFFull}, "PMULTW HI lane 0 is the sign-extended high word");
+            t.Equals(ctx.lo1, uint64_t{0u}, "PMULTW LO lane 1");
+            t.Equals(ctx.hi1, uint64_t{1u}, "PMULTW HI lane 1");
+
+            ps2ParallelWordMultiply(&ctx, _mm_setr_epi32(2, 0, 3, 0), _mm_setr_epi32(7, 0, 4, 0), Ps2WordMultiply::SignedAdd);
+            t.Equals(static_cast<int64_t>(ctx.lo), int64_t{-15 + 14}, "PMADDW accumulates into lane 0");
+            t.Equals(ctx.lo1, uint64_t{0x10000ull * 0x10000ull + 12u} & 0xFFFFFFFFull, "PMADDW accumulates into lane 1");
+            t.Equals(ctx.hi1, uint64_t{1u}, "PMADDW keeps the carry in HI lane 1");
+
+            ctx = R5900Context{};
+            const __m128i products = ps2ParallelHalfMultiply(&ctx, _mm_setr_epi16(1, 2, 3, 4, 5, 6, 7, -8), _mm_setr_epi16(10, 10, 10, 10, 10, 10, 10, 10), Ps2HalfMultiply::Set);
+            t.IsTrue(words(products) == std::array<uint32_t, 4>{10u, 30u, 50u, 70u}, "PMULTH writes products 0, 2, 4, 6 to rd");
+            const Ps2HiLoWords after = ps2LoadHiLo(&ctx);
+            t.IsTrue(after.lo[1] == 20u && after.hi[1] == 40u && after.lo[3] == 60u && after.hi[3] == static_cast<uint32_t>(-80),
+                     "PMULTH puts the odd products in the odd LO and HI words");
+            const __m128i horizontal = ps2ParallelHalfMultiply(&ctx, _mm_setr_epi16(1, 2, 3, 4, 5, 6, 7, 8), _mm_setr_epi16(1, 1, 1, 1, 1, 1, 1, 1), Ps2HalfMultiply::HorizontalAdd);
+            t.IsTrue(words(horizontal) == std::array<uint32_t, 4>{3u, 7u, 11u, 15u}, "PHMADH adds each pair of products");
+
+            ctx = R5900Context{};
+            ps2ParallelDivideWord(&ctx, _mm_setr_epi32(INT32_MIN, 0, 7, 0), _mm_setr_epi32(-1, 0, 0, 0), false);
+            t.Equals(ctx.lo, uint64_t{0xFFFFFFFF80000000ull}, "PDIVW INT_MIN / -1 gives INT_MIN");
+            t.Equals(ctx.hi, uint64_t{0u}, "PDIVW INT_MIN / -1 leaves no remainder");
+            t.Equals(ctx.lo1, uint64_t{0xFFFFFFFFFFFFFFFFull}, "PDIVW by zero of a positive value gives -1");
+            t.Equals(ctx.hi1, uint64_t{7u}, "PDIVW by zero keeps the dividend as remainder");
+
+            ctx.lo = 0x0000000200000001ull;
+            ctx.hi = 0x0000000400000003ull;
+            ctx.lo1 = 0x0000000600000005ull;
+            ctx.hi1 = 0x0000000800000007ull;
+            t.IsTrue(words(ps2Pmfhl(&ctx, 0u)) == std::array<uint32_t, 4>{1u, 3u, 5u, 7u}, "PMFHL.LW takes the low words");
+            t.IsTrue(words(ps2Pmfhl(&ctx, 1u)) == std::array<uint32_t, 4>{2u, 4u, 6u, 8u}, "PMFHL.UW takes the high words");
+            ps2PmthlLw(&ctx, _mm_setr_epi32(11, 12, 13, 14));
+            t.IsTrue(words(ps2Pmfhl(&ctx, 0u)) == std::array<uint32_t, 4>{11u, 12u, 13u, 14u}, "PMTHL.LW writes back what PMFHL.LW reads");
+            t.IsTrue(words(ps2Pmfhl(&ctx, 1u)) == std::array<uint32_t, 4>{2u, 4u, 6u, 8u}, "PMTHL.LW keeps the high words");
+        });
+
         tc.Run("differential decoder/codegen gpr-write contract for MULT and DIV families", [](TestCase &t)
         {
             R5900Decoder decoder;
