@@ -611,10 +611,11 @@ void register_ps2_gs_tests()
             setRegU32(ctx, 5, 0u);
             setRegU32(ctx, 6, 640u);
             setRegU32(ctx, 7, 448u);
+            setRegU32(ctx, 8, kZTest);
+            setRegU32(ctx, 9, 0u);
+            setRegU32(ctx, 10, kEnableClear);
             setRegU32(ctx, 29, kStackAddr);
             std::memset(rdram.data() + kEnvAddr, 0xCD, kDBuffSize);
-            std::memcpy(rdram.data() + kStackAddr + 16u, &kZTest, sizeof(kZTest));
-            std::memcpy(rdram.data() + kStackAddr + 24u, &kEnableClear, sizeof(kEnableClear));
             std::memset(runtime.memory().getGSVRAM(), 0xAB, 16u);
             ps2_stubs::sceGsSetDefDBuffDc(rdram.data(), &ctx, &runtime);
 
