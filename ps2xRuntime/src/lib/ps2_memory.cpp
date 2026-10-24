@@ -1492,7 +1492,10 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     uint32_t asr1 = m_ioRegisters[channelBase + 0x50];
                     uint32_t asp = (chcr >> 4) & 0x3u;
                     const bool tieEnabled = (chcr & (1u << 7)) != 0u;
-                    const int kMaxChainTags = 4096;
+                    // Bounds for a chain that never ends (tags leading back to themselves); a busy frame's display
+                    // list is thousands of tags and megabytes.
+                    const int kMaxChainTags = 1 << 20;
+                    const size_t kMaxChainBytes = size_t{256} << 20;
                     std::vector<uint8_t> chainBuf;
 
                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
@@ -1553,7 +1556,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     int tagsProcessed = 0;
                     uint32_t lastTagUpper = (chcr >> 16) & 0xFFFFu;
 
-                    while (tagsProcessed < kMaxChainTags)
+                    while (tagsProcessed < kMaxChainTags && chainBuf.size() < kMaxChainBytes)
                     {
                         const uint32_t currentTagAddr = tagAddr;
                         const bool tagInSPR = isScratchpad(tagAddr);
