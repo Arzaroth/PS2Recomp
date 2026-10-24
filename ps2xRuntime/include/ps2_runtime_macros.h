@@ -56,6 +56,18 @@ static inline uint64_t Ps2SignExt32ToU64(uint32_t v)
     return (uint64_t)(int64_t)(int32_t)v;
 }
 
+static inline uint64_t Ps2MaddSigned32(uint64_t accumulator, int32_t lhs, int32_t rhs)
+{
+    const int64_t product = static_cast<int64_t>(lhs) * static_cast<int64_t>(rhs);
+    return accumulator + static_cast<uint64_t>(product);
+}
+
+static inline uint64_t Ps2MsubSigned32(uint64_t accumulator, int32_t lhs, int32_t rhs)
+{
+    const int64_t product = static_cast<int64_t>(lhs) * static_cast<int64_t>(rhs);
+    return accumulator - static_cast<uint64_t>(product);
+}
+
 // PLZCW: Count leading bits that match the sign bit, minus 1.
 // For positive values: count leading zeros minus 1 (excludes sign bit).
 // For negative values: count leading ones minus 1 (excludes sign bit).

@@ -64,9 +64,9 @@ namespace ps2recomp
         case MMI_MADD:
             if (rd != 0)
             {
-                return fmt::format("{{ uint64_t acc = Ps2HiLoToU64(ctx->hi, ctx->lo); int64_t prod = (int64_t)GPR_S32(ctx, {}) * (int64_t)GPR_S32(ctx, {}); int64_t result = acc + prod; ctx->lo = Ps2SignExt32ToU64((uint32_t)result); ctx->hi = Ps2SignExt32ToU64((uint32_t)(result >> 32)); SET_GPR_S32(ctx, {}, (int32_t)result); }}", rs, rt, rd);
+                return fmt::format("{{ uint64_t acc = Ps2HiLoToU64(ctx->hi, ctx->lo); uint64_t result = Ps2MaddSigned32(acc, GPR_S32(ctx, {}), GPR_S32(ctx, {})); ctx->lo = Ps2SignExt32ToU64((uint32_t)result); ctx->hi = Ps2SignExt32ToU64((uint32_t)(result >> 32)); SET_GPR_S32(ctx, {}, (int32_t)result); }}", rs, rt, rd);
             }
-            return fmt::format("{{ uint64_t acc = Ps2HiLoToU64(ctx->hi, ctx->lo); int64_t prod = (int64_t)GPR_S32(ctx, {}) * (int64_t)GPR_S32(ctx, {}); int64_t result = acc + prod; ctx->lo = Ps2SignExt32ToU64((uint32_t)result); ctx->hi = Ps2SignExt32ToU64((uint32_t)(result >> 32)); }}", rs, rt);
+            return fmt::format("{{ uint64_t acc = Ps2HiLoToU64(ctx->hi, ctx->lo); uint64_t result = Ps2MaddSigned32(acc, GPR_S32(ctx, {}), GPR_S32(ctx, {})); ctx->lo = Ps2SignExt32ToU64((uint32_t)result); ctx->hi = Ps2SignExt32ToU64((uint32_t)(result >> 32)); }}", rs, rt);
         case MMI_MADDU:
             if (rd != 0)
             {
@@ -76,9 +76,9 @@ namespace ps2recomp
         case MMI_MSUB:
             if (rd != 0)
             {
-                return fmt::format("{{ uint64_t acc = Ps2HiLoToU64(ctx->hi, ctx->lo); int64_t prod = (int64_t)GPR_S32(ctx, {}) * (int64_t)GPR_S32(ctx, {}); int64_t result = acc - prod; ctx->lo = Ps2SignExt32ToU64((uint32_t)result); ctx->hi = Ps2SignExt32ToU64((uint32_t)(result >> 32)); SET_GPR_S32(ctx, {}, (int32_t)result); }}", rs, rt, rd);
+                return fmt::format("{{ uint64_t acc = Ps2HiLoToU64(ctx->hi, ctx->lo); uint64_t result = Ps2MsubSigned32(acc, GPR_S32(ctx, {}), GPR_S32(ctx, {})); ctx->lo = Ps2SignExt32ToU64((uint32_t)result); ctx->hi = Ps2SignExt32ToU64((uint32_t)(result >> 32)); SET_GPR_S32(ctx, {}, (int32_t)result); }}", rs, rt, rd);
             }
-            return fmt::format("{{ uint64_t acc = Ps2HiLoToU64(ctx->hi, ctx->lo); int64_t prod = (int64_t)GPR_S32(ctx, {}) * (int64_t)GPR_S32(ctx, {}); int64_t result = acc - prod; ctx->lo = Ps2SignExt32ToU64((uint32_t)result); ctx->hi = Ps2SignExt32ToU64((uint32_t)(result >> 32)); }}", rs, rt);
+            return fmt::format("{{ uint64_t acc = Ps2HiLoToU64(ctx->hi, ctx->lo); uint64_t result = Ps2MsubSigned32(acc, GPR_S32(ctx, {}), GPR_S32(ctx, {})); ctx->lo = Ps2SignExt32ToU64((uint32_t)result); ctx->hi = Ps2SignExt32ToU64((uint32_t)(result >> 32)); }}", rs, rt);
         case MMI_MSUBU:
             if (rd != 0)
             {
@@ -88,9 +88,9 @@ namespace ps2recomp
         case MMI_MADD1:
             if (rd != 0)
             {
-                return fmt::format("{{ uint64_t acc = Ps2HiLoToU64(ctx->hi1, ctx->lo1); int64_t prod = (int64_t)GPR_S32(ctx, {}) * (int64_t)GPR_S32(ctx, {}); int64_t result = acc + prod; ctx->lo1 = Ps2SignExt32ToU64((uint32_t)result); ctx->hi1 = Ps2SignExt32ToU64((uint32_t)(result >> 32)); SET_GPR_S32(ctx, {}, (int32_t)result); }}", rs, rt, rd);
+                return fmt::format("{{ uint64_t acc = Ps2HiLoToU64(ctx->hi1, ctx->lo1); uint64_t result = Ps2MaddSigned32(acc, GPR_S32(ctx, {}), GPR_S32(ctx, {})); ctx->lo1 = Ps2SignExt32ToU64((uint32_t)result); ctx->hi1 = Ps2SignExt32ToU64((uint32_t)(result >> 32)); SET_GPR_S32(ctx, {}, (int32_t)result); }}", rs, rt, rd);
             }
-            return fmt::format("{{ uint64_t acc = Ps2HiLoToU64(ctx->hi1, ctx->lo1); int64_t prod = (int64_t)GPR_S32(ctx, {}) * (int64_t)GPR_S32(ctx, {}); int64_t result = acc + prod; ctx->lo1 = Ps2SignExt32ToU64((uint32_t)result); ctx->hi1 = Ps2SignExt32ToU64((uint32_t)(result >> 32)); }}", rs, rt);
+            return fmt::format("{{ uint64_t acc = Ps2HiLoToU64(ctx->hi1, ctx->lo1); uint64_t result = Ps2MaddSigned32(acc, GPR_S32(ctx, {}), GPR_S32(ctx, {})); ctx->lo1 = Ps2SignExt32ToU64((uint32_t)result); ctx->hi1 = Ps2SignExt32ToU64((uint32_t)(result >> 32)); }}", rs, rt);
         case MMI_MADDU1:
             if (rd != 0)
             {
