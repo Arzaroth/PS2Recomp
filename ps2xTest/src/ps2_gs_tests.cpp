@@ -1264,6 +1264,58 @@ void register_ps2_gs_tests()
             t.IsTrue(immediate == async, "worker threads should depth-test against the colors drawn before");
         });
 
+        tc.Run("asynchronous rasterization orders samples a region clamp reaches past the texture height", [](TestCase &t)
+        {
+            // Soulcalibur III's shadow pass samples a full-screen buffer as a 32-row texture with REGION_CLAMP rows
+            // 0-255: the sampled rows lie past the texture height, in pages that other workers have just drawn (and the
+            // texture's own rows are not drawn).
+            constexpr uint64_t kFbw = 4u;
+            constexpr uint64_t kSourceFbp = 64u;
+            auto xyz = [](uint32_t x, uint32_t y)
+            {
+                return static_cast<uint64_t>(x << 4) | (static_cast<uint64_t>(y << 4) << 16);
+            };
+            auto draw = [&](std::vector<uint8_t> &vram, bool async)
+            {
+                GSCpuBackend::SetAsyncRasterization(async);
+                GS gs;
+                gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+                gs.writeRegister(GS_REG_SCISSOR_1, (255ull << 16) | (255ull << 48));
+                gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
+                gs.writeRegister(GS_REG_ZBUF_1, 300ull | (1ull << 32));
+                gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
+                for (uint32_t frame = 0u; frame < 8u; ++frame)
+                {
+                    gs.writeRegister(GS_REG_FRAME_1, kSourceFbp | (kFbw << 16) | (static_cast<uint64_t>(GS_PSM_CT32) << 24));
+                    gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_SPRITE));
+                    for (uint32_t band = 4u; band < 16u; ++band)
+                    {
+                        gs.writeRegister(GS_REG_RGBAQ, 0x80000000ull | (((band * 13u + frame * 7u) & 0xFFu) << 8));
+                        gs.writeRegister(GS_REG_XYZ2, xyz(0u, band * 16u));
+                        gs.writeRegister(GS_REG_XYZ2, xyz(256u, band * 16u + 16u));
+                    }
+
+                    gs.writeRegister(GS_REG_FRAME_1, 0ull | (kFbw << 16) | (static_cast<uint64_t>(GS_PSM_CT32) << 24));
+                    gs.writeRegister(GS_REG_TEX0_1, (kSourceFbp * 32ull) | (kFbw << 14) | (static_cast<uint64_t>(GS_PSM_CT32) << 20) |
+                                                        (8ull << 26) | (5ull << 30) | (1ull << 34) | (1ull << 35));
+                    gs.writeRegister(GS_REG_CLAMP_1, 2ull | (2ull << 2) | (255ull << 14) | (255ull << 34));
+                    gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_SPRITE) | (1ull << 4) | (1ull << 8));
+                    gs.writeRegister(GS_REG_UV, 0ull);
+                    gs.writeRegister(GS_REG_XYZ2, xyz(0u, 0u));
+                    gs.writeRegister(GS_REG_UV, (256ull << 4) | ((256ull << 4) << 16));
+                    gs.writeRegister(GS_REG_XYZ2, xyz(256u, 256u));
+                }
+                (void)gs.ReadVram(GS_PSM_CT32, 0u, static_cast<uint32_t>(kFbw), 0u, 0u);
+                GSCpuBackend::SetAsyncRasterization(false);
+            };
+
+            std::vector<uint8_t> immediate(PS2_GS_VRAM_SIZE, 0u);
+            std::vector<uint8_t> async(PS2_GS_VRAM_SIZE, 0u);
+            draw(immediate, false);
+            draw(async, true);
+            t.IsTrue(immediate == async, "worker threads should sample the rows a region clamp reaches after they are drawn");
+        });
+
         tc.Run("FBA forces the framebuffer alpha high bit on CT32 writes", [](TestCase &t)
         {
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
