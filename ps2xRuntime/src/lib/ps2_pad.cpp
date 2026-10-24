@@ -1,5 +1,6 @@
 #include "runtime/ps2_pad.h"
 #include "ps2_host_backend.h"
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -52,6 +53,54 @@ namespace
         return 0u;
     }
 
+    // PS2X_PAD_INPUT=<file>: lines appended to the file while the game runs press their buttons from
+    // then on, one word every 0.35 s; "cross+up" presses both at once.
+    void pollLiveInput(const char *path, double now, std::vector<ScriptedPress> &livePresses)
+    {
+        static double nextPoll = 0.0;
+        static long offset = 0;
+        if (now < nextPoll)
+            return;
+        nextPoll = now + 0.1;
+        FILE *file = std::fopen(path, "rb");
+        if (!file)
+            return;
+        std::fseek(file, 0, SEEK_END);
+        const long size = std::ftell(file);
+        if (size < offset)
+            offset = 0;
+        std::string added(static_cast<size_t>(size - offset), '\0');
+        std::fseek(file, offset, SEEK_SET);
+        added.resize(std::fread(added.data(), 1, added.size(), file));
+        std::fclose(file);
+        const size_t lastLine = added.rfind('\n');
+        if (lastLine == std::string::npos)
+            return;
+        offset += static_cast<long>(lastLine + 1);
+        livePresses.erase(std::remove_if(livePresses.begin(), livePresses.end(),
+                                         [now](const ScriptedPress &press) { return press.at + 0.25 < now; }),
+                          livePresses.end());
+        double at = std::max(now, livePresses.empty() ? now : livePresses.back().at + 0.35);
+        std::string_view rest(added.data(), lastLine);
+        while (!rest.empty())
+        {
+            const size_t end = rest.find_first_of(" ,\n");
+            const std::string_view word = rest.substr(0, end);
+            rest = end == std::string_view::npos ? std::string_view{} : rest.substr(end + 1);
+            uint16_t mask = 0u;
+            for (std::string_view part = word; !part.empty();)
+            {
+                const size_t plus = part.find('+');
+                mask |= scriptedButtonMask(part.substr(0, plus));
+                part = plus == std::string_view::npos ? std::string_view{} : part.substr(plus + 1);
+            }
+            if (mask == 0u)
+                continue;
+            livePresses.push_back({at, mask});
+            at += 0.35;
+        }
+    }
+
     // PS2X_PAD_SCRIPT="8:cross,10.5:start": hold each button for a quarter second at that many
     // seconds after the first pad read.
     uint16_t scriptedButtons()
@@ -75,17 +124,24 @@ namespace
             }
             return parsed;
         }();
-        if (presses.empty())
+        static const char *liveInputPath = std::getenv("PS2X_PAD_INPUT");
+        if (presses.empty() && !liveInputPath)
             return 0u;
 
         static const auto start = std::chrono::steady_clock::now();
         const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        static std::vector<ScriptedPress> livePresses;
+        if (liveInputPath)
+            pollLiveInput(liveInputPath, now, livePresses);
         static uint16_t previous = 0u;
         uint16_t held = 0u;
-        for (const ScriptedPress &press : presses)
+        for (const std::vector<ScriptedPress> *list : {&presses, static_cast<const std::vector<ScriptedPress> *>(&livePresses)})
         {
-            if (now >= press.at && now < press.at + 0.25)
-                held |= press.mask;
+            for (const ScriptedPress &press : *list)
+            {
+                if (now >= press.at && now < press.at + 0.25)
+                    held |= press.mask;
+            }
         }
         if (held != previous)
         {
