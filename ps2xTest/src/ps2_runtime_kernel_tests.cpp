@@ -1233,7 +1233,7 @@ void register_ps2_runtime_kernel_tests()
             setRegU32(env.ctx, 5, K_STATUS_ADDR);
             t.IsTrue(callSyscall(0x30u, env.rdram.data(), &env.ctx, &env.runtime),
                      "ReferThreadStatus syscall should dispatch");
-            t.Equals(getRegS32(env.ctx, 2), KE_OK, "ReferThreadStatus should accept the current-thread id alias");
+            t.IsTrue(getRegS32(env.ctx, 2) > 0, "ReferThreadStatus should accept the current-thread id alias and return its status");
 
             EeThreadStatusAbi status{};
             std::memcpy(&status, env.rdram.data() + K_STATUS_ADDR, sizeof(status));

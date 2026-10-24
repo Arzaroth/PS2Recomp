@@ -359,10 +359,11 @@ namespace ps2_syscalls
             setReturnS32(ctx, KE_UNKNOWN_THID);
             return;
         }
+        // The kernel returns the thread's status; the info structure is optional.
         auto *status = getEeGuestStruct<ee_thread_status_t>(rdram, getRegU32(ctx, 5));
         if (!status)
         {
-            setReturnS32(ctx, KE_ERROR);
+            setReturnS32(ctx, static_cast<int32_t>(rawThreadStatus(thread->status)));
             return;
         }
         *status = {};
@@ -378,7 +379,7 @@ namespace ps2_syscalls
         status->waitType = rawWaitType(thread->wait.reason);
         status->waitId = waitId(*thread);
         status->wakeupCount = thread->wakeupCount;
-        setReturnS32(ctx, KE_OK);
+        setReturnS32(ctx, static_cast<int32_t>(status->status));
     }
 
     void iReferThreadStatus(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
