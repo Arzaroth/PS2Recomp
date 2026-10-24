@@ -1240,6 +1240,31 @@ void register_code_generator_tests()
                      "MOVN must not overwrite the destination upper 64 bits");
         });
 
+        tc.Run("BC2 branches on VU1 running (VPU_STAT VBS1)", [](TestCase &t) {
+            const struct
+            {
+                uint8_t condition;
+                bool onTrue;
+            } cases[] = {{COP2_BC_BCF, false}, {COP2_BC_BCT, true}, {COP2_BC_BCFL, false}, {COP2_BC_BCTL, true}};
+            for (const auto &branchCase : cases)
+            {
+                Function function;
+                function.name = "bc2_condition";
+                function.start = 0x1280u;
+                function.end = 0x128Cu;
+                function.isRecompiled = true;
+                const uint32_t raw = (OPCODE_COP2 << 26) | (COP2_BC << 21) | (uint32_t{branchCase.condition} << 16) | 3u;
+                const Instruction branch = R5900Decoder{}.decodeInstruction(0x1280u, raw, false);
+                CodeGenerator generator({}, {});
+                const std::string generated = generator.generateFunction(
+                    function, {branch, makeAddiu(0x1284u, 9u, 0u, 123u), makeAddiu(0x1288u, 10u, 0u, 77u)}, false);
+                const std::string expected = branchCase.onTrue ? "(ctx->vu0_vpu_stat & 0x100u)" : "!(ctx->vu0_vpu_stat & 0x100u)";
+                t.IsTrue(generated.find("branch_taken_0x1280 = (" + expected + ")") != std::string::npos,
+                         "BC2 should test VPU_STAT VBS1 with the right polarity");
+                t.IsTrue(generated.find("vu0_status") == std::string::npos, "BC2 must not read VU0 status flags");
+            }
+        });
+
         tc.Run("quadword loads and stores mask the low 4 address bits", [](TestCase &t) {
             CodeGenerator gen({}, {});
             const std::string masked = "((ADD32(GPR_U32(ctx, 4), 8)) & ~0xFu)";
