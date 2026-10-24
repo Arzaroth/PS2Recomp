@@ -213,10 +213,8 @@ namespace ps2_stubs
     namespace
     {
         // A drive read takes time: sceCdSync(1) reports the drive busy until the EE cycle the read
-        // would end at (a seek when it does not follow the previous read, then the sectors at the
-        // drive's rate). The data itself is copied when the read is issued.
+        // would end at. The data itself is copied when the read is issued.
         constexpr uint64_t kEeCyclesPerSecond = 294912000u;
-        constexpr uint64_t kCdSeekCycles = kEeCyclesPerSecond / 50u;
         uint64_t g_cdReadEndCycle = 0u;
         uint32_t g_cdNextLbn = 0u;
 
@@ -237,8 +235,7 @@ namespace ps2_stubs
             if (!runtime || rate == 0u)
                 return;
             const uint64_t now = runtime->eeScheduler().currentCycle();
-            const uint64_t seek = lbn == g_cdNextLbn ? 0u : kCdSeekCycles;
-            g_cdReadEndCycle = std::max(g_cdReadEndCycle, now) + seek + sectors * kEeCyclesPerSecond / rate;
+            g_cdReadEndCycle = std::max(g_cdReadEndCycle, now) + cdReadDurationCycles(g_cdNextLbn, lbn, sectors, rate);
             g_cdNextLbn = lbn + sectors;
         }
 
@@ -268,6 +265,12 @@ namespace ps2_stubs
             SET_GPR_U32(&invocation.context, 31, 0u);
             runtime->eeScheduler().queueInvocation(std::move(invocation));
         }
+    }
+
+    uint64_t cdReadDurationCycles(uint32_t headLbn, uint32_t lbn, uint32_t sectors, uint64_t sectorsPerSecond)
+    {
+        const uint64_t seek = lbn == headLbn ? 0u : kEeCyclesPerSecond / 50u;
+        return seek + sectors * kEeCyclesPerSecond / sectorsPerSecond;
     }
 
     void sceCdRead(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
