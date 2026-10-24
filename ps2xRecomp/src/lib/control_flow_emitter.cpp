@@ -438,10 +438,11 @@ namespace ps2recomp
         case OPCODE_COP2:
             if (m_branchInst.rs == COP2_BC)
             {
+                // COP2's condition line is VU1 running: VPU_STAT VBS1.
                 const uint8_t bcCond = static_cast<uint8_t>(m_branchInst.rt);
                 return (bcCond == COP2_BC_BCF || bcCond == COP2_BC_BCFL)
-                           ? "!(ctx->vu0_status & 0x1)"
-                           : "(ctx->vu0_status & 0x1)";
+                           ? "!(ctx->vu0_vpu_stat & 0x100u)"
+                           : "(ctx->vu0_vpu_stat & 0x100u)";
             }
             break;
         default:
