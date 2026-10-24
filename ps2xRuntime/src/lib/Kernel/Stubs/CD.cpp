@@ -414,10 +414,18 @@ namespace ps2_stubs
 
     void sceCdSync(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        // Mode 0 blocks until the read ends; the EE then spends the remaining time waiting.
+        // Mode 0 waits for the read to end. A wait of a field or more blocks the calling thread across those
+        // vblanks, so other threads and interrupts keep running in order meanwhile; the rest is spent waiting.
         if (getRegU32(ctx, 4) == 0u && cdBusy(runtime))
-            runtime->eeScheduler().accountCycles(static_cast<uint32_t>(
-                std::min<uint64_t>(g_cdReadEndCycle - runtime->eeScheduler().currentCycle(), UINT32_MAX)));
+        {
+            EeScheduler &scheduler = runtime->eeScheduler();
+            const uint64_t remaining = g_cdReadEndCycle - scheduler.currentCycle();
+            const EeScheduler::FieldRate rate = cdStreamFieldRate(runtime);
+            const uint64_t fieldCycles = kEeCyclesPerSecond * rate.denominator / rate.numerator;
+            if (remaining >= fieldCycles && scheduler.currentThreadId() != 0)
+                scheduler.waitVSync(scheduler.currentVSyncTick() + remaining / fieldCycles - 1u, 0);
+            scheduler.accountCycles(static_cast<uint32_t>(std::min<uint64_t>(remaining, UINT32_MAX)));
+        }
         setReturnS32(ctx, cdBusy(runtime) ? 1 : 0);
     }
 
