@@ -715,8 +715,21 @@ inline __m128i ps2_psubsw(__m128i a, __m128i b)
 #define PS2_PCEQB(a, b) _mm_cmpeq_epi8((__m128i)(a), (__m128i)(b))
 
 // Packed Absolute (PABS)
-#define PS2_PABSW(a) _mm_abs_epi32((__m128i)(a))
-#define PS2_PABSH(a) _mm_abs_epi16((__m128i)(a))
+// x86 PABS keeps the minimum signed value; the EE saturates it to the maximum.
+inline __m128i ps2_pabsw(__m128i value)
+{
+    const __m128i absolute = _mm_abs_epi32(value);
+    return _mm_add_epi32(absolute, _mm_cmpeq_epi32(absolute, _mm_set1_epi32(INT32_MIN)));
+}
+
+inline __m128i ps2_pabsh(__m128i value)
+{
+    const __m128i absolute = _mm_abs_epi16(value);
+    return _mm_add_epi16(absolute, _mm_cmpeq_epi16(absolute, _mm_set1_epi16(INT16_MIN)));
+}
+
+#define PS2_PABSW(a) ps2_pabsw((__m128i)(a))
+#define PS2_PABSH(a) ps2_pabsh((__m128i)(a))
 #define PS2_PABSB(a) _mm_abs_epi8((__m128i)(a))
 
 // Packed Pack (PPAC) - Packs larger elements into smaller ones
@@ -766,8 +779,19 @@ inline __m128i ps2_ppacb(__m128i rs, __m128i rt)
 #define PS2_PPACB(a, b) ps2_ppacb((__m128i)(a), (__m128i)(b))
 
 // Packed Interleave (PINT)
-#define PS2_PINTH(a, b) _mm_unpacklo_epi16(_mm_shuffle_epi32((__m128i)(b), _MM_SHUFFLE(3, 2, 1, 0)), _mm_shuffle_epi32((__m128i)(a), _MM_SHUFFLE(3, 2, 1, 0)))
-#define PS2_PINTEH(a, b) _mm_unpackhi_epi16(_mm_shuffle_epi32((__m128i)(b), _MM_SHUFFLE(3, 2, 1, 0)), _mm_shuffle_epi32((__m128i)(a), _MM_SHUFFLE(3, 2, 1, 0)))
+inline __m128i ps2_pinth(__m128i rs, __m128i rt)
+{
+    return _mm_unpacklo_epi16(rt, _mm_unpackhi_epi64(rs, rs));
+}
+
+inline __m128i ps2_pinteh(__m128i rs, __m128i rt)
+{
+    const __m128i evenHalfwords = _mm_setr_epi8(0, 1, 4, 5, 8, 9, 12, 13, 0, 1, 4, 5, 8, 9, 12, 13);
+    return _mm_unpacklo_epi16(_mm_shuffle_epi8(rt, evenHalfwords), _mm_shuffle_epi8(rs, evenHalfwords));
+}
+
+#define PS2_PINTH(a, b) ps2_pinth((__m128i)(a), (__m128i)(b))
+#define PS2_PINTEH(a, b) ps2_pinteh((__m128i)(a), (__m128i)(b))
 
 // Packed Multiply-Add (PMADD)
 #define PS2_PMADDW(a, b) _mm_add_epi32(_mm_mullo_epi32(_mm_shuffle_epi32((__m128i)(a), _MM_SHUFFLE(1, 0, 3, 2)), _mm_shuffle_epi32((__m128i)(b), _MM_SHUFFLE(1, 0, 3, 2))), _mm_mullo_epi32(_mm_shuffle_epi32((__m128i)(a), _MM_SHUFFLE(3, 2, 1, 0)), _mm_shuffle_epi32((__m128i)(b), _MM_SHUFFLE(3, 2, 1, 0))))
@@ -973,9 +997,12 @@ inline __m128i ps2_qfsrv(__m128i rs, __m128i rt, uint32_t sa)
 }
 #define PS2_QFSRV(rs, rt, sa) ps2_qfsrv((__m128i)(rs), (__m128i)(rt), (uint32_t)(sa))
 #define PS2_PCPYLD(rs, rt) _mm_unpacklo_epi64(rt, rs)
-#define PS2_PEXEH(rs) _mm_shufflelo_epi16(_mm_shufflehi_epi16(rs, _MM_SHUFFLE(2, 3, 0, 1)), _MM_SHUFFLE(2, 3, 0, 1))
-#define PS2_PEXEW(rs) _mm_shuffle_epi32(rs, _MM_SHUFFLE(2, 3, 0, 1))
-#define PS2_PROT3W(rs) _mm_shuffle_epi32(rs, _MM_SHUFFLE(0, 3, 2, 1))
+#define PS2_PEXEH(rt) _mm_shufflelo_epi16(_mm_shufflehi_epi16((rt), _MM_SHUFFLE(3, 0, 1, 2)), _MM_SHUFFLE(3, 0, 1, 2))
+#define PS2_PREVH(rt) _mm_shufflelo_epi16(_mm_shufflehi_epi16((rt), _MM_SHUFFLE(0, 1, 2, 3)), _MM_SHUFFLE(0, 1, 2, 3))
+#define PS2_PEXEW(rt) _mm_shuffle_epi32((rt), _MM_SHUFFLE(3, 0, 1, 2))
+#define PS2_PROT3W(rt) _mm_shuffle_epi32((rt), _MM_SHUFFLE(3, 0, 2, 1))
+#define PS2_PEXCH(rt) _mm_shufflelo_epi16(_mm_shufflehi_epi16((rt), _MM_SHUFFLE(3, 1, 2, 0)), _MM_SHUFFLE(3, 1, 2, 0))
+#define PS2_PEXCW(rt) _mm_shuffle_epi32((rt), _MM_SHUFFLE(3, 1, 2, 0))
 
 // Additional VU0 operations
 #define PS2_VSQRT(x) sqrtf(x)
