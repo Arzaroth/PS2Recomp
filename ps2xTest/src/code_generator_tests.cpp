@@ -310,6 +310,43 @@ void register_code_generator_tests()
                  "MULT1 should write low product to rd on R5900");
     });
 
+    tc.Run("64-bit scalar arithmetic avoids host signed overflow", [](TestCase &t) {
+        CodeGenerator gen({}, {});
+
+        Instruction dadd{};
+        dadd.opcode = OPCODE_SPECIAL;
+        dadd.function = SPECIAL_DADD;
+        dadd.rs = 2;
+        dadd.rt = 3;
+        dadd.rd = 4;
+        const std::string daddCode = gen.translateInstruction(dadd);
+        t.IsTrue(daddCode.find("ADD64_OV(GPR_U64(ctx, 2), GPR_U64(ctx, 3)") != std::string::npos,
+                 "DADD should use defined unsigned arithmetic with overflow detection");
+
+        Instruction dsub = dadd;
+        dsub.function = SPECIAL_DSUB;
+        const std::string dsubCode = gen.translateInstruction(dsub);
+        t.IsTrue(dsubCode.find("SUB64_OV(GPR_U64(ctx, 2), GPR_U64(ctx, 3)") != std::string::npos,
+                 "DSUB should use defined unsigned arithmetic with overflow detection");
+
+        const Instruction daddi = makeIType(0x1000, OPCODE_DADDI, 5, 6, 0xFFFFu);
+        const std::string daddiCode = gen.translateInstruction(daddi);
+        t.IsTrue(daddiCode.find("ADD64_OV(GPR_U64(ctx, 5)") != std::string::npos,
+                 "DADDI should use defined unsigned arithmetic with overflow detection");
+
+        const Instruction daddiu = makeIType(0x1004, OPCODE_DADDIU, 7, 8, 0xFFFFu);
+        const std::string daddiuCode = gen.translateInstruction(daddiu);
+        t.IsTrue(daddiuCode.find("ADD64(GPR_U64(ctx, 7)") != std::string::npos,
+                 "DADDIU should use defined wrapping unsigned arithmetic");
+
+        t.IsTrue(daddCode.find("int64_t r =") == std::string::npos,
+                 "DADD should not compute a potentially overflowing signed sum");
+        t.IsTrue(dsubCode.find("int64_t r =") == std::string::npos,
+                 "DSUB should not compute a potentially overflowing signed difference");
+        t.IsTrue(daddiCode.find("int64_t src =") == std::string::npos,
+                 "DADDI should not compute a potentially overflowing signed sum");
+    });
+
     tc.Run("constant MMIO store emits direct runtime store", [](TestCase &t) {
         Function func;
         func.name = "mmio_store";
