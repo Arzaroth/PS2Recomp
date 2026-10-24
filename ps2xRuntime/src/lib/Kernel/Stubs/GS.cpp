@@ -791,6 +791,11 @@ namespace ps2_stubs
             }
             uint64_t pmode = makePmode(1, 0, 0, 0, 0, 0x80);
             uint64_t smode2 = (interlace & 0x1) | ((ffmode & 0x1) << 1);
+            // SMODE2 is privileged: no GIF packet address reaches it (0x41/0x42 are SCISSOR_2/ALPHA_1).
+            if (runtime)
+            {
+                runtime->memory().gs().smode2 = smode2;
+            }
             uint64_t dispfb = makeDispFb(0, 10, 0, 0, 0);
             uint64_t display = makeDisplay(0, 0, 0, 0, 639, 447);
             uint64_t bgcolor = 0ULL;
@@ -807,9 +812,9 @@ namespace ps2_stubs
                         q[0] = makeGiftagAplusD(7u);
                         q[1] = 0xEULL;
                         q[2] = pmode;
-                        q[3] = 0x41ULL;
+                        q[3] = 0x7fULL; // NOP
                         q[4] = smode2;
-                        q[5] = 0x42ULL;
+                        q[5] = 0x7fULL; // NOP
                         q[6] = dispfb;
                         q[7] = 0x59ULL;
                         q[8] = display;
