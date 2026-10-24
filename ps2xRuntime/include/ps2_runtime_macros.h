@@ -98,28 +98,60 @@ static inline uint32_t ps2_plzcw32(uint32_t x)
 #define PS2_EXTRACT_EPI64_1(v) Ps2ExtractEpi64((v), 1)
 
 // Basic MIPS arithmetic operations
-#define ADD32(a, b) ((uint32_t)((a) + (b)))
-#define ADD32_OV(rs, rt, result32, overflow)              \
-    do                                                    \
-    {                                                     \
-        int32_t _a = (int32_t)(rs);                       \
-        int32_t _b = (int32_t)(rt);                       \
-        int32_t _r = _a + _b;                             \
-        overflow = (((_a ^ _b) >= 0) && ((_a ^ _r) < 0)); \
-        result32 = (uint32_t)_r;                          \
-    } while (0);
-#define SUB32(a, b) ((uint32_t)((a) - (b)))
-#define SUB32_OV(rs, rt, result32, overflow)             \
-    do                                                   \
-    {                                                    \
-        int32_t _a = (int32_t)(rs);                      \
-        int32_t _b = (int32_t)(rt);                      \
-        int32_t _r = _a - _b;                            \
-        overflow = (((_a ^ _b) < 0) && ((_a ^ _r) < 0)); \
-        result32 = (uint32_t)_r;                         \
-    } while (0);
-#define MUL32(a, b) ((uint32_t)((a) * (b)))
-#define DIV32(a, b) ((uint32_t)((a) / (b)))
+static inline uint32_t Ps2Add32Overflow(uint32_t lhs, uint32_t rhs, bool &overflow)
+{
+    const uint32_t result = lhs + rhs;
+    overflow = ((~(lhs ^ rhs) & (lhs ^ result)) & 0x80000000u) != 0u;
+    return result;
+}
+
+static inline uint32_t Ps2Sub32Overflow(uint32_t lhs, uint32_t rhs, bool &overflow)
+{
+    const uint32_t result = lhs - rhs;
+    overflow = (((lhs ^ rhs) & (lhs ^ result)) & 0x80000000u) != 0u;
+    return result;
+}
+
+static inline uint64_t Ps2Add64Overflow(uint64_t lhs, uint64_t rhs, bool &overflow)
+{
+    const uint64_t result = lhs + rhs;
+    overflow = ((~(lhs ^ rhs) & (lhs ^ result)) & 0x8000000000000000ull) != 0ull;
+    return result;
+}
+
+static inline uint64_t Ps2Sub64Overflow(uint64_t lhs, uint64_t rhs, bool &overflow)
+{
+    const uint64_t result = lhs - rhs;
+    overflow = (((lhs ^ rhs) & (lhs ^ result)) & 0x8000000000000000ull) != 0ull;
+    return result;
+}
+
+#define ADD32(a, b) ((uint32_t)(a) + (uint32_t)(b))
+#define ADD32_OV(rs, rt, result32, overflow)                                     \
+    do                                                                           \
+    {                                                                            \
+        (result32) = Ps2Add32Overflow((uint32_t)(rs), (uint32_t)(rt), overflow); \
+    } while (0)
+#define SUB32(a, b) ((uint32_t)(a) - (uint32_t)(b))
+#define SUB32_OV(rs, rt, result32, overflow)                                     \
+    do                                                                           \
+    {                                                                            \
+        (result32) = Ps2Sub32Overflow((uint32_t)(rs), (uint32_t)(rt), overflow); \
+    } while (0)
+#define ADD64(a, b) ((uint64_t)(a) + (uint64_t)(b))
+#define ADD64_OV(rs, rt, result64, overflow)                                     \
+    do                                                                           \
+    {                                                                            \
+        (result64) = Ps2Add64Overflow((uint64_t)(rs), (uint64_t)(rt), overflow); \
+    } while (0)
+#define SUB64(a, b) ((uint64_t)(a) - (uint64_t)(b))
+#define SUB64_OV(rs, rt, result64, overflow)                                     \
+    do                                                                           \
+    {                                                                            \
+        (result64) = Ps2Sub64Overflow((uint64_t)(rs), (uint64_t)(rt), overflow); \
+    } while (0)
+#define MUL32(a, b) ((uint32_t)(a) * (uint32_t)(b))
+#define DIV32(a, b) ((uint32_t)(a) / (uint32_t)(b))
 #define AND32(a, b) ((uint32_t)((a) & (b)))
 #define OR32(a, b) ((uint32_t)((a) | (b)))
 #define XOR32(a, b) ((uint32_t)((a) ^ (b)))

@@ -230,16 +230,14 @@ namespace ps2recomp
             return genWrite(128, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate), fmt::format("_mm_castps_si128(ctx->vu0_vf[{}])", inst.rt)) + ";";
         case OPCODE_DADDI:
             return fmt::format(
-                "{{ int64_t src = (int64_t)GPR_S64(ctx, {}); "
-                "int64_t imm = (int64_t)(int32_t){}; "
-                "int64_t res = src + imm; "
-                "if (((src ^ imm) >= 0) && ((src ^ res) < 0)) "
-                "    runtime->SignalException(ctx, EXCEPTION_INTEGER_OVERFLOW); "
-                "else SET_GPR_S64(ctx, {}, res); }}",
+                "{{ uint64_t result; bool overflow; "
+                "ADD64_OV(GPR_U64(ctx, {}), (uint64_t)(int64_t)(int32_t){}, result, overflow); "
+                "if (overflow) runtime->SignalException(ctx, EXCEPTION_INTEGER_OVERFLOW); "
+                "else SET_GPR_U64(ctx, {}, result); }}",
                 inst.rs, inst.simmediate, inst.rt);
         case OPCODE_DADDIU:
             return fmt::format(
-                "SET_GPR_S64(ctx, {}, (int64_t)GPR_S64(ctx, {}) + (int64_t)(int32_t){});",
+                "SET_GPR_U64(ctx, {}, ADD64(GPR_U64(ctx, {}), (uint64_t)(int64_t)(int32_t){}));",
                 inst.rt, inst.rs, inst.simmediate);
         case OPCODE_J:
             return fmt::format("// J 0x{:X} - Handled by branch logic", buildAbsoluteJumpTarget(inst.address, inst.target));
