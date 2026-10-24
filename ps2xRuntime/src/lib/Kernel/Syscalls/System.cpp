@@ -429,6 +429,8 @@ namespace ps2_syscalls
             parent.r[2] = completed.r[2];
         };
         scheduler.invokeCurrent(std::move(invocation));
+
+        return true;
     }
 
     static bool tryResolveGuestSyscallMirrorAddr(uint32_t syscallIndex, uint32_t &guestAddr)
