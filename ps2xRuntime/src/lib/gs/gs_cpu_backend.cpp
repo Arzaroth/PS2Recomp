@@ -1992,10 +1992,10 @@ void GSCpuBackend::StartWorkersUnlocked()
 {
     if (m_workerCount != 0u)
         return;
-    // Leave cores for the EE, the render thread and the IOP; at PS2 resolutions more than
-    // 8 stripes buys little.
+    // Leave a core for the EE and one for the GS thread; the render and IOP threads use little. At PS2 resolutions
+    // more than 8 stripes buys little.
     const uint32_t hardware = std::max(1u, std::thread::hardware_concurrency());
-    m_workerCount = std::clamp(hardware > 4u ? hardware - 4u : 1u, 1u, 8u);
+    m_workerCount = std::clamp(hardware > 2u ? hardware - 2u : 1u, 1u, 8u);
     if (const char *threads = std::getenv("PS2X_GS_RASTER_THREADS"); threads && *threads)
         m_workerCount = std::clamp<uint32_t>(static_cast<uint32_t>(std::atoi(threads)), 1u, 16u);
     m_texturePageCaches.resize(m_workerCount + 1u);
