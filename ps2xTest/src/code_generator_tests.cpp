@@ -1207,6 +1207,38 @@ void register_code_generator_tests()
                      "SPECIAL logical ops should not use vector emission");
         });
 
+        tc.Run("MOVZ and MOVN preserve the destination upper 64 bits", [](TestCase &t) {
+            CodeGenerator gen({}, {});
+
+            Instruction movz{};
+            movz.opcode = OPCODE_SPECIAL;
+            movz.function = SPECIAL_MOVZ;
+            movz.rs = 4;
+            movz.rt = 5;
+            movz.rd = 6;
+
+            const std::string movzCode = gen.translateInstruction(movz);
+            t.Equals(movzCode,
+                     std::string("if (GPR_U64(ctx, 5) == 0) SET_GPR_U64(ctx, 6, GPR_U64(ctx, 4));"),
+                     "MOVZ should conditionally copy only the low 64 bits");
+            t.IsTrue(movzCode.find("SET_GPR_VEC") == std::string::npos,
+                     "MOVZ must not overwrite the destination upper 64 bits");
+
+            Instruction movn{};
+            movn.opcode = OPCODE_SPECIAL;
+            movn.function = SPECIAL_MOVN;
+            movn.rs = 7;
+            movn.rt = 8;
+            movn.rd = 9;
+
+            const std::string movnCode = gen.translateInstruction(movn);
+            t.Equals(movnCode,
+                     std::string("if (GPR_U64(ctx, 8) != 0) SET_GPR_U64(ctx, 9, GPR_U64(ctx, 7));"),
+                     "MOVN should conditionally copy only the low 64 bits");
+            t.IsTrue(movnCode.find("SET_GPR_VEC") == std::string::npos,
+                     "MOVN must not overwrite the destination upper 64 bits");
+        });
+
         tc.Run("SC requires matching LL reservation address", [](TestCase &t) {
             CodeGenerator gen({}, {});
 
