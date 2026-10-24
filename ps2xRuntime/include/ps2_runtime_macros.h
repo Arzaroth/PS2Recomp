@@ -845,11 +845,6 @@ inline __m128i ps2_u64_to_epi64_pair(uint64_t value)
     return _mm_set1_epi64x(static_cast<long long>(value));
 }
 
-#define PS2_PMFHL_LW(hi, lo) _mm_unpacklo_epi64(ps2_u64_to_epi64_pair(lo), ps2_u64_to_epi64_pair(hi))
-#define PS2_PMFHL_UW(hi, lo) _mm_unpackhi_epi64(ps2_u64_to_epi64_pair(lo), ps2_u64_to_epi64_pair(hi))
-#define PS2_PMFHL_SLW(hi, lo) _mm_packs_epi32(ps2_u64_to_epi64_pair(lo), ps2_u64_to_epi64_pair(hi))
-#define PS2_PMFHL_LH(hi, lo) _mm_shuffle_epi32(_mm_packs_epi32(ps2_u64_to_epi64_pair(lo), ps2_u64_to_epi64_pair(hi)), _MM_SHUFFLE(3, 1, 2, 0))
-#define PS2_PMFHL_SH(hi, lo) _mm_shufflehi_epi16(_mm_shufflelo_epi16(_mm_packs_epi32(ps2_u64_to_epi64_pair(lo), ps2_u64_to_epi64_pair(hi)), _MM_SHUFFLE(3, 1, 2, 0)), _MM_SHUFFLE(3, 1, 2, 0))
 
 // FPU (COP1) operations
 #define FPU_SET_ACC(ctx, res) (ctx->f_acc = res)
@@ -1072,5 +1067,273 @@ static inline void Ps2SetGprLow64(R5900Context *ctx, int reg, __m128i new_low)
         if (reg_idx != 0)                  \
             ctx_ptr->r[reg_idx] = (val);   \
     } while (0)
+
+
+// Parallel multiplies and divides write the 128-bit HI and LO: words 0-1 are ctx->hi/lo, words 2-3 ctx->hi1/lo1.
+struct Ps2HiLoWords
+{
+    uint32_t lo[4];
+    uint32_t hi[4];
+};
+
+template <typename Ctx>
+inline Ps2HiLoWords ps2LoadHiLo(const Ctx *ctx)
+{
+    return {{static_cast<uint32_t>(ctx->lo), static_cast<uint32_t>(ctx->lo >> 32), static_cast<uint32_t>(ctx->lo1), static_cast<uint32_t>(ctx->lo1 >> 32)},
+            {static_cast<uint32_t>(ctx->hi), static_cast<uint32_t>(ctx->hi >> 32), static_cast<uint32_t>(ctx->hi1), static_cast<uint32_t>(ctx->hi1 >> 32)}};
+}
+
+template <typename Ctx>
+inline void ps2StoreHiLo(Ctx *ctx, const Ps2HiLoWords &w)
+{
+    ctx->lo = w.lo[0] | (static_cast<uint64_t>(w.lo[1]) << 32);
+    ctx->lo1 = w.lo[2] | (static_cast<uint64_t>(w.lo[3]) << 32);
+    ctx->hi = w.hi[0] | (static_cast<uint64_t>(w.hi[1]) << 32);
+    ctx->hi1 = w.hi[2] | (static_cast<uint64_t>(w.hi[3]) << 32);
+}
+
+inline uint64_t ps2Sext32(uint32_t value)
+{
+    return static_cast<uint64_t>(static_cast<int64_t>(static_cast<int32_t>(value)));
+}
+
+// Doubleword lane i of LO/HI gets the sign-extended low and high words of `value`.
+template <typename Ctx>
+inline void ps2SetHiLoLane(Ctx *ctx, int lane, uint64_t value)
+{
+    (lane == 0 ? ctx->lo : ctx->lo1) = ps2Sext32(static_cast<uint32_t>(value));
+    (lane == 0 ? ctx->hi : ctx->hi1) = ps2Sext32(static_cast<uint32_t>(value >> 32));
+}
+
+template <typename Ctx>
+inline uint64_t ps2HiLoLaneAccumulator(const Ctx *ctx, int lane)
+{
+    const uint64_t lo = lane == 0 ? ctx->lo : ctx->lo1;
+    const uint64_t hi = lane == 0 ? ctx->hi : ctx->hi1;
+    return (static_cast<uint64_t>(static_cast<uint32_t>(hi)) << 32) | static_cast<uint32_t>(lo);
+}
+
+enum class Ps2WordMultiply
+{
+    Signed,
+    Unsigned,
+    SignedAdd,
+    SignedSub,
+    UnsignedAdd,
+};
+
+template <typename Ctx>
+inline __m128i ps2ParallelWordMultiply(Ctx *ctx, __m128i rs, __m128i rt, Ps2WordMultiply kind)
+{
+    alignas(16) uint32_t a[4];
+    alignas(16) uint32_t b[4];
+    _mm_store_si128(reinterpret_cast<__m128i *>(a), rs);
+    _mm_store_si128(reinterpret_cast<__m128i *>(b), rt);
+    uint64_t result[2];
+    for (int lane = 0; lane < 2; ++lane)
+    {
+        const uint32_t x = a[lane * 2];
+        const uint32_t y = b[lane * 2];
+        const uint64_t signedProduct = static_cast<uint64_t>(static_cast<int64_t>(static_cast<int32_t>(x)) * static_cast<int32_t>(y));
+        const uint64_t unsignedProduct = static_cast<uint64_t>(x) * y;
+        const uint64_t accumulator = ps2HiLoLaneAccumulator(ctx, lane);
+        switch (kind)
+        {
+        case Ps2WordMultiply::Signed:
+            result[lane] = signedProduct;
+            break;
+        case Ps2WordMultiply::Unsigned:
+            result[lane] = unsignedProduct;
+            break;
+        case Ps2WordMultiply::SignedAdd:
+            result[lane] = accumulator + signedProduct;
+            break;
+        case Ps2WordMultiply::SignedSub:
+            result[lane] = accumulator - signedProduct;
+            break;
+        case Ps2WordMultiply::UnsignedAdd:
+            result[lane] = accumulator + unsignedProduct;
+            break;
+        }
+    }
+    ps2SetHiLoLane(ctx, 0, result[0]);
+    ps2SetHiLoLane(ctx, 1, result[1]);
+    return _mm_set_epi64x(static_cast<int64_t>(result[1]), static_cast<int64_t>(result[0]));
+}
+
+enum class Ps2HalfMultiply
+{
+    Set,
+    Add,
+    Sub,
+    HorizontalAdd,
+    HorizontalSub,
+};
+
+// Halfword products p0-p7 go to LO words 0,1 / HI words 0,1 / LO words 2,3 / HI words 2,3; rd gets LO0, HI0, LO2, HI2.
+template <typename Ctx>
+inline __m128i ps2ParallelHalfMultiply(Ctx *ctx, __m128i rs, __m128i rt, Ps2HalfMultiply kind)
+{
+    alignas(16) int16_t a[8];
+    alignas(16) int16_t b[8];
+    _mm_store_si128(reinterpret_cast<__m128i *>(a), rs);
+    _mm_store_si128(reinterpret_cast<__m128i *>(b), rt);
+    uint32_t p[8];
+    for (int i = 0; i < 8; ++i)
+        p[i] = static_cast<uint32_t>(static_cast<int32_t>(a[i]) * static_cast<int32_t>(b[i]));
+    Ps2HiLoWords w = ps2LoadHiLo(ctx);
+    uint32_t *const slots[8] = {&w.lo[0], &w.lo[1], &w.hi[0], &w.hi[1], &w.lo[2], &w.lo[3], &w.hi[2], &w.hi[3]};
+    for (int pair = 0; pair < 4; ++pair)
+    {
+        const uint32_t even = p[pair * 2];
+        const uint32_t odd = p[pair * 2 + 1];
+        uint32_t &first = *slots[pair * 2];
+        uint32_t &second = *slots[pair * 2 + 1];
+        switch (kind)
+        {
+        case Ps2HalfMultiply::Set:
+            first = even;
+            second = odd;
+            break;
+        case Ps2HalfMultiply::Add:
+            first += even;
+            second += odd;
+            break;
+        case Ps2HalfMultiply::Sub:
+            first -= even;
+            second -= odd;
+            break;
+        case Ps2HalfMultiply::HorizontalAdd:
+            first = odd + even;
+            second = odd;
+            break;
+        case Ps2HalfMultiply::HorizontalSub:
+            first = odd - even;
+            second = ~odd;
+            break;
+        }
+    }
+    ps2StoreHiLo(ctx, w);
+    return _mm_setr_epi32(static_cast<int32_t>(w.lo[0]), static_cast<int32_t>(w.hi[0]), static_cast<int32_t>(w.lo[2]), static_cast<int32_t>(w.hi[2]));
+}
+
+template <typename Ctx>
+inline void ps2ParallelDivideWord(Ctx *ctx, __m128i rs, __m128i rt, bool isUnsigned)
+{
+    alignas(16) uint32_t a[4];
+    alignas(16) uint32_t b[4];
+    _mm_store_si128(reinterpret_cast<__m128i *>(a), rs);
+    _mm_store_si128(reinterpret_cast<__m128i *>(b), rt);
+    for (int lane = 0; lane < 2; ++lane)
+    {
+        const uint32_t x = a[lane * 2];
+        const uint32_t y = b[lane * 2];
+        uint32_t quotient = 0;
+        uint32_t remainder = 0;
+        if (isUnsigned)
+        {
+            quotient = y != 0u ? x / y : 0xFFFFFFFFu;
+            remainder = y != 0u ? x % y : x;
+        }
+        else if (x == 0x80000000u && y == 0xFFFFFFFFu)
+        {
+            quotient = 0x80000000u;
+            remainder = 0u;
+        }
+        else if (y != 0u)
+        {
+            quotient = static_cast<uint32_t>(static_cast<int32_t>(x) / static_cast<int32_t>(y));
+            remainder = static_cast<uint32_t>(static_cast<int32_t>(x) % static_cast<int32_t>(y));
+        }
+        else
+        {
+            quotient = static_cast<int32_t>(x) < 0 ? 1u : 0xFFFFFFFFu;
+            remainder = x;
+        }
+        (lane == 0 ? ctx->lo : ctx->lo1) = ps2Sext32(quotient);
+        (lane == 0 ? ctx->hi : ctx->hi1) = ps2Sext32(remainder);
+    }
+}
+
+// PDIVBW: each word of rs divided by halfword 0 of rt, quotients to the LO words, remainders to the HI words.
+template <typename Ctx>
+inline void ps2ParallelDivideByHalfword(Ctx *ctx, __m128i rs, __m128i rt)
+{
+    alignas(16) uint32_t a[4];
+    _mm_store_si128(reinterpret_cast<__m128i *>(a), rs);
+    const int16_t divisor = static_cast<int16_t>(_mm_extract_epi16(rt, 0));
+    Ps2HiLoWords w = ps2LoadHiLo(ctx);
+    for (int i = 0; i < 4; ++i)
+    {
+        const int32_t x = static_cast<int32_t>(a[i]);
+        if (a[i] == 0x80000000u && divisor == -1)
+        {
+            w.lo[i] = 0x80000000u;
+            w.hi[i] = 0u;
+        }
+        else if (divisor != 0)
+        {
+            w.lo[i] = static_cast<uint32_t>(x / divisor);
+            w.hi[i] = static_cast<uint32_t>(x % divisor);
+        }
+        else
+        {
+            w.lo[i] = x < 0 ? 1u : 0xFFFFFFFFu;
+            w.hi[i] = a[i];
+        }
+    }
+    ps2StoreHiLo(ctx, w);
+}
+
+inline int16_t ps2SaturateToHalf(uint32_t value)
+{
+    const int32_t v = static_cast<int32_t>(value);
+    return static_cast<int16_t>(v > 0x7FFF ? 0x7FFF : (v < -0x8000 ? -0x8000 : v));
+}
+
+template <typename Ctx>
+inline __m128i ps2Pmfhl(const Ctx *ctx, uint32_t mode)
+{
+    const Ps2HiLoWords w = ps2LoadHiLo(ctx);
+    switch (mode)
+    {
+    case 0: // LW
+        return _mm_setr_epi32(static_cast<int32_t>(w.lo[0]), static_cast<int32_t>(w.hi[0]), static_cast<int32_t>(w.lo[2]), static_cast<int32_t>(w.hi[2]));
+    case 1: // UW
+        return _mm_setr_epi32(static_cast<int32_t>(w.lo[1]), static_cast<int32_t>(w.hi[1]), static_cast<int32_t>(w.lo[3]), static_cast<int32_t>(w.hi[3]));
+    case 2: // SLW
+    {
+        int64_t out[2];
+        for (int lane = 0; lane < 2; ++lane)
+        {
+            const int64_t value = static_cast<int64_t>((static_cast<uint64_t>(w.hi[lane * 2]) << 32) | w.lo[lane * 2]);
+            out[lane] = value > INT32_MAX ? INT32_MAX : (value < INT32_MIN ? INT32_MIN : static_cast<int32_t>(w.lo[lane * 2]));
+        }
+        return _mm_set_epi64x(out[1], out[0]);
+    }
+    case 3: // LH
+        return _mm_setr_epi16(static_cast<int16_t>(w.lo[0]), static_cast<int16_t>(w.lo[1]), static_cast<int16_t>(w.hi[0]), static_cast<int16_t>(w.hi[1]),
+                              static_cast<int16_t>(w.lo[2]), static_cast<int16_t>(w.lo[3]), static_cast<int16_t>(w.hi[2]), static_cast<int16_t>(w.hi[3]));
+    case 4: // SH
+        return _mm_setr_epi16(ps2SaturateToHalf(w.lo[0]), ps2SaturateToHalf(w.lo[1]), ps2SaturateToHalf(w.hi[0]), ps2SaturateToHalf(w.hi[1]),
+                              ps2SaturateToHalf(w.lo[2]), ps2SaturateToHalf(w.lo[3]), ps2SaturateToHalf(w.hi[2]), ps2SaturateToHalf(w.hi[3]));
+    default:
+        return _mm_setzero_si128();
+    }
+}
+
+// PMTHL.LW: words 0 and 2 of rs to LO, words 1 and 3 to HI; the other words keep their values.
+template <typename Ctx>
+inline void ps2PmthlLw(Ctx *ctx, __m128i rs)
+{
+    alignas(16) uint32_t a[4];
+    _mm_store_si128(reinterpret_cast<__m128i *>(a), rs);
+    Ps2HiLoWords w = ps2LoadHiLo(ctx);
+    w.lo[0] = a[0];
+    w.hi[0] = a[1];
+    w.lo[2] = a[2];
+    w.hi[2] = a[3];
+    ps2StoreHiLo(ctx, w);
+}
 
 #endif // PS2_RUNTIME_MACROS_H
