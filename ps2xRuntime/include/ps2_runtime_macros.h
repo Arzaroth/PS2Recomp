@@ -355,6 +355,48 @@ inline float ps2_frsqrt(float a, float b)
     return ps2_fall_normal(a, b, r) ? r : ps2_frsqrt_slow(a, b);
 }
 
+// VU DIV/SQRT/RSQRT set the status register's I (invalid) and D (divide by zero) flags and their sticky IS/DS.
+constexpr uint16_t PS2_VU_STATUS_I = 0x0010u;
+constexpr uint16_t PS2_VU_STATUS_D = 0x0020u;
+constexpr uint16_t PS2_VU_STATUS_IS = 0x0400u;
+constexpr uint16_t PS2_VU_STATUS_DS = 0x0800u;
+
+inline bool ps2FloatIsZero(float value)
+{
+    return (std::bit_cast<uint32_t>(value) & PS2_FLOAT_EXP_MASK) == 0u;
+}
+
+inline bool ps2FloatIsNegative(float value)
+{
+    return (std::bit_cast<uint32_t>(value) & PS2_FLOAT_SIGN_MASK) != 0u;
+}
+
+inline float ps2VuDivide(uint16_t &status, float fs, float ft)
+{
+    status &= static_cast<uint16_t>(~(PS2_VU_STATUS_I | PS2_VU_STATUS_D));
+    if (ps2FloatIsZero(ft))
+        status |= ps2FloatIsZero(fs) ? (PS2_VU_STATUS_I | PS2_VU_STATUS_IS) : (PS2_VU_STATUS_D | PS2_VU_STATUS_DS);
+    return ps2_fdiv(fs, ft);
+}
+
+inline float ps2VuSqrt(uint16_t &status, float ft)
+{
+    status &= static_cast<uint16_t>(~(PS2_VU_STATUS_I | PS2_VU_STATUS_D));
+    if (ps2FloatIsNegative(ft) && !ps2FloatIsZero(ft))
+        status |= PS2_VU_STATUS_I | PS2_VU_STATUS_IS;
+    return ps2_fsqrt_slow(ft);
+}
+
+inline float ps2VuRsqrt(uint16_t &status, float fs, float ft)
+{
+    status &= static_cast<uint16_t>(~(PS2_VU_STATUS_I | PS2_VU_STATUS_D));
+    if (ps2FloatIsZero(ft))
+        status |= ps2FloatIsZero(fs) ? (PS2_VU_STATUS_I | PS2_VU_STATUS_IS) : (PS2_VU_STATUS_D | PS2_VU_STATUS_DS);
+    else if (ps2FloatIsNegative(ft))
+        status |= PS2_VU_STATUS_I | PS2_VU_STATUS_IS;
+    return ps2_frsqrt_slow(fs, ft);
+}
+
 enum class Ps2VecOp
 {
     Add,
