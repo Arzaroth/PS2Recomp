@@ -2,6 +2,7 @@
 #include "ps2recomp/code_generator.h"
 #include "ps2recomp/instructions.h"
 #include "ps2recomp/ps2_recompiler.h"
+#include "ps2recomp/r5900_decoder.h"
 #include "ps2recomp/types.h"
 #include <filesystem>
 #include <fstream>
@@ -1581,6 +1582,91 @@ void register_code_generator_tests()
             t.IsTrue(out.find("ctx->vi[14]") != std::string::npos, "S2 VLQI base VI should come from rd");
             t.IsTrue(out.find("ctx->vu0_vf[6]") != std::string::npos, "S2 VLQI destination VF should come from rt");
             t.IsTrue(out.find("ctx->vi[20]") == std::string::npos, "S2 VLQI must not use rs(format) as VI index");
+        });
+
+        tc.Run("VU0 macro VSQI/VLQD matrix stack uses fs/it fields and VU0 data memory", [](TestCase &t) {
+            R5900Decoder decoder;
+            CodeGenerator gen({}, {});
+
+            const Instruction vsqi = decoder.decodeInstruction(0x1B33D0u, 0x4BEF0B7Du);
+            const std::string push = gen.translateInstruction(vsqi);
+            printGeneratedCode("vsqi.xyzw $vf1, ($vi15++)", push);
+            t.IsTrue(push.find("ctx->vu0_vf[1]") != std::string::npos, "VSQI must store Fs (rd = vf1)");
+            t.IsTrue(push.find("ctx->vu0_vf[15]") == std::string::npos, "VSQI must not store vf15");
+            t.IsTrue(push.find("ctx->vi[15] = static_cast<uint16_t>(ctx->vi[15] + 1u)") != std::string::npos,
+                     "VSQI must post-increment It (rt = vi15)");
+            t.IsTrue(push.find("ctx->vi[1]") == std::string::npos, "VSQI must not address memory through vi1");
+            t.IsTrue(push.find("getVU0Data()") != std::string::npos, "VSQI must write VU0 data memory");
+            t.IsTrue(push.find("WRITE128") == std::string::npos && push.find("READ128") == std::string::npos,
+                     "VSQI must not touch EE RAM");
+
+            const Instruction vlqd = decoder.decodeInstruction(0x1B33E8u, 0x4BE47B7Eu);
+            const std::string pop = gen.translateInstruction(vlqd);
+            printGeneratedCode("vlqd.xyzw $vf4, (--$vi15)", pop);
+            t.IsTrue(pop.find("ctx->vi[15] = static_cast<uint16_t>(ctx->vi[15] - 1u)") != std::string::npos,
+                     "VLQD must pre-decrement Is (rd = vi15)");
+            t.IsTrue(pop.find("ctx->vu0_vf[4] = _mm_blendv_ps(ctx->vu0_vf[4]") != std::string::npos,
+                     "VLQD must load into Ft (rt = vf4)");
+            t.IsTrue(pop.find("getVU0Data()") != std::string::npos, "VLQD must read VU0 data memory");
+            t.IsTrue(pop.find("READ128") == std::string::npos, "VLQD must not read EE RAM");
+            t.IsTrue(pop.find("& 0xFFu) << 4") != std::string::npos, "VU0 data memory addresses wrap at 4 KB");
+            t.IsTrue(pop.find("ctx->vi[15] - 1u); __m128 res") != std::string::npos, "VLQD must decrement before loading");
+        });
+
+        tc.Run("VU0 macro VSQD/VLQI and VI ops never write VI0 or VF0", [](TestCase &t) {
+            CodeGenerator gen({}, {});
+            Instruction inst{};
+            inst.vectorInfo.vectorField = 0xF;
+
+            inst.rd = 5;
+            inst.rt = 0;
+            const std::string vsqd = gen.translateVU_VSQD(inst);
+            t.IsTrue(vsqd.find("ctx->vi[0] =") == std::string::npos, "VSQD with It = vi0 must not decrement vi0");
+            t.IsTrue(vsqd.find("ctx->vu0_vf[5]") != std::string::npos, "VSQD must store Fs (rd)");
+
+            inst.rd = 0;
+            inst.rt = 3;
+            const std::string vlqi = gen.translateVU_VLQI(inst);
+            t.IsTrue(vlqi.find("ctx->vi[0] =") == std::string::npos, "VLQI with Is = vi0 must not increment vi0");
+            t.IsTrue(vlqi.find("ctx->vu0_vf[3]") != std::string::npos, "VLQI must load Ft (rt)");
+
+            inst.rd = 2;
+            inst.rt = 0;
+            t.IsTrue(gen.translateVU_VLQI(inst).find("ctx->vu0_vf[0]") == std::string::npos, "VLQI must not write vf0");
+            t.IsTrue(gen.translateVU_VIADDI(inst).find("ctx->vi[0]") == std::string::npos, "VIADDI must not write vi0");
+            t.IsTrue(gen.translateVU_VILWR(inst).find("ctx->vi[0]") == std::string::npos, "VILWR must not write vi0");
+
+            inst.sa = 0;
+            inst.rd = 1;
+            inst.rt = 2;
+            t.IsTrue(gen.translateVU_VIADD(inst).find("ctx->vi[0]") == std::string::npos, "VIADD must not write vi0");
+            t.IsTrue(gen.translateVU_VISUB(inst).find("ctx->vi[0]") == std::string::npos, "VISUB must not write vi0");
+            t.IsTrue(gen.translateVU_VIAND(inst).find("ctx->vi[0]") == std::string::npos, "VIAND must not write vi0");
+            t.IsTrue(gen.translateVU_VIOR(inst).find("ctx->vi[0]") == std::string::npos, "VIOR must not write vi0");
+        });
+
+        tc.Run("VU0 macro VISWR/VILWR address qwords in VU0 data memory per field", [](TestCase &t) {
+            CodeGenerator gen({}, {});
+            Instruction inst{};
+            inst.rd = 7;
+            inst.rt = 9;
+
+            inst.vectorInfo.vectorField = 0x5;
+            const std::string iswr = gen.translateVU_VISWR(inst);
+            t.IsTrue(iswr.find("getVU0Data() + ((static_cast<uint32_t>(ctx->vi[7]) & 0xFFu) << 4)") != std::string::npos,
+                     "VISWR must address qword vi[is] of VU0 data memory");
+            t.IsTrue(iswr.find("const uint32_t value = ctx->vi[9]") != std::string::npos, "VISWR must store vi[it]");
+            t.IsTrue(iswr.find("vu0Mem + 4u") != std::string::npos && iswr.find("vu0Mem + 12u") != std::string::npos,
+                     "VISWR.yw must write the y and w words");
+            t.IsTrue(iswr.find("vu0Mem + 0u") == std::string::npos && iswr.find("vu0Mem + 8u") == std::string::npos,
+                     "VISWR.yw must not write the x and z words");
+            t.IsTrue(iswr.find("WRITE32") == std::string::npos, "VISWR must not touch EE RAM");
+
+            inst.vectorInfo.vectorField = 0x2;
+            const std::string ilwr = gen.translateVU_VILWR(inst);
+            t.IsTrue(ilwr.find("<< 4) + 8u") != std::string::npos, "VILWR.z must read the z word");
+            t.IsTrue(ilwr.find("ctx->vi[9] = value") != std::string::npos, "VILWR must write vi[it]");
+            t.IsTrue(ilwr.find("READ32") == std::string::npos, "VILWR must not read EE RAM");
         });
 
         tc.Run("JAL to known function emits call and check", [](TestCase &t) {
