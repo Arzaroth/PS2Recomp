@@ -2135,6 +2135,86 @@ void register_ps2_gs_tests()
                      "field presentation should still preserve different source content across field rows");
         });
 
+        tc.Run("a packed vertex has all 32 bits of its Z, as the same vertex has by A+D", [](TestCase &t)
+        {
+            // Drawn at a Z one above the depth buffer, tested GREATER and stored, packed and by A+D: both draw every
+            // pixel and leave the same VRAM.
+            constexpr uint32_t kFbp = 150u, kZbp = 170u, kWidth = 64u, kHeight = 32u;
+            constexpr uint64_t kFrame = static_cast<uint64_t>(kFbp) | (1ull << 16) | (static_cast<uint64_t>(GS_PSM_CT32) << 24);
+            constexpr uint64_t kZbuf = static_cast<uint64_t>(kZbp); // Z32, stored
+            constexpr uint64_t kScissor = (static_cast<uint64_t>(kWidth - 1u) << 16) | (static_cast<uint64_t>(kHeight - 1u) << 48);
+            constexpr uint64_t kDepthGreater = (1ull << 16) | (3ull << 17);
+
+            const auto draw = [&](uint32_t z, bool triangle, bool packed)
+            {
+                std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+                for (uint32_t y = 0u; y < kHeight; ++y)
+                    for (uint32_t x = 0u; x < kWidth; ++x)
+                        GSMem::WriteZ32(vram.data(), kZbp * 32u, 1u, x, y, z - 1u);
+                {
+                    GS gs;
+                    gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+                    gs.writeRegister(GS_REG_FRAME_1, kFrame);
+                    gs.writeRegister(GS_REG_ZBUF_1, kZbuf);
+                    gs.writeRegister(GS_REG_SCISSOR_1, kScissor);
+                    gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
+                    gs.writeRegister(GS_REG_TEST_1, kDepthGreater);
+                    gs.writeRegister(GS_REG_PRIM, triangle ? static_cast<uint64_t>(GS_PRIM_TRIANGLE) : static_cast<uint64_t>(GS_PRIM_SPRITE));
+                    gs.writeRegister(GS_REG_RGBAQ, 0x80406020ull);
+                    // The whole frame: a sprite corner to corner, or a triangle that covers it.
+                    const uint32_t corners[3][2] = {{0u, 0u}, {kWidth * 16u, kHeight * 16u}, {0u, 0u}};
+                    const uint32_t points[3][2] = {{0u, 0u}, {kWidth * 32u, 0u}, {0u, kHeight * 32u}};
+                    const uint32_t count = triangle ? 3u : 2u;
+                    if (packed)
+                    {
+                        std::vector<uint8_t> packet;
+                        appendU64(packet, makeGifTag(1u, GIF_FMT_PACKED, static_cast<uint8_t>(count), true));
+                        appendU64(packet, triangle ? 0x5DDull : 0x5Dull); // XYZ3 for all but the last, XYZ2 for it
+                        for (uint32_t i = 0u; i < count; ++i)
+                        {
+                            const uint32_t *at = triangle ? points[i] : corners[i];
+                            appendU64(packet, static_cast<uint64_t>(at[0]) | (static_cast<uint64_t>(at[1]) << 32));
+                            appendU64(packet, static_cast<uint64_t>(z));
+                        }
+                        gs.processGIFPacket(packet.data(), static_cast<uint32_t>(packet.size()));
+                    }
+                    else
+                    {
+                        for (uint32_t i = 0u; i < count; ++i)
+                        {
+                            const uint32_t *at = triangle ? points[i] : corners[i];
+                            gs.writeRegister(i + 1u < count ? GS_REG_XYZ3 : GS_REG_XYZ2,
+                                             static_cast<uint64_t>(at[0]) | (static_cast<uint64_t>(at[1]) << 16) | (static_cast<uint64_t>(z) << 32));
+                        }
+                    }
+                }
+                return vram;
+            };
+
+            for (const uint32_t z : {0xFFFFFFFFu, 0xFFFFFF01u, 0x80000001u, 0x01000001u, 0x00FFFFFFu, 0x00001234u})
+            {
+                for (const bool triangle : {false, true})
+                {
+                    char name[64];
+                    std::snprintf(name, sizeof(name), "%s at Z 0x%08X", triangle ? "a triangle" : "a sprite", z);
+                    const std::vector<uint8_t> byAd = draw(z, triangle, false);
+                    std::vector<uint8_t> packed = draw(z, triangle, true); // (ReadZ32 takes it unqualified)
+                    uint32_t drawn = 0u, depthKept = 0u;
+                    for (uint32_t y = 0u; y < kHeight; ++y)
+                        for (uint32_t x = 0u; x < kWidth; ++x)
+                        {
+                            if (readReferenceFramePSMCT32Pixel(packed, kFbp, 1u, x, y) == 0x80406020u)
+                                ++drawn;
+                            if (GSMem::ReadZ32(packed.data(), kZbp * 32u, 1u, x, y) == z)
+                                ++depthKept;
+                        }
+                    t.Equals(drawn, kWidth * kHeight, std::string(name) + ": drawn everywhere, being one above what the depth buffer held");
+                    t.Equals(depthKept, kWidth * kHeight, std::string(name) + ": and its Z stored to the bit");
+                    t.IsTrue(packed == byAd, std::string(name) + ": the VRAM the same vertices leave by A+D");
+                }
+            }
+        });
+
         tc.Run("GIF PACKED A+D writes DISPFB1 and DISPLAY1 privileged registers", [](TestCase &t)
         {
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
