@@ -2538,6 +2538,19 @@ uint32_t GSCpuBackend::SampleTexture(const TextureSampler &sampler, GSMem::Textu
     const uint32_t c01 = samplePoint(u0, v1);
     const uint32_t c11 = samplePoint(u1, v1);
 
+#if defined(__SSE4_1__)
+    // lerpChannel on the four channels at once (the same integer arithmetic, so the same result).
+    const __m128i zero = _mm_setzero_si128();
+    auto widen = [&](uint32_t c) { return _mm_unpacklo_epi16(_mm_unpacklo_epi8(_mm_cvtsi32_si128(static_cast<int>(c)), zero), zero); };
+    const __m128i p00 = widen(c00), p10 = widen(c10), p01 = widen(c01), p11 = widen(c11);
+    const __m128i vfx = _mm_set1_epi32(fx), vfy = _mm_set1_epi32(fy);
+    const __m128i top = _mm_add_epi32(_mm_slli_epi32(p00, 8), _mm_mullo_epi32(_mm_sub_epi32(p10, p00), vfx));
+    const __m128i bottom = _mm_add_epi32(_mm_slli_epi32(p01, 8), _mm_mullo_epi32(_mm_sub_epi32(p11, p01), vfx));
+    const __m128i blended = _mm_srai_epi32(
+        _mm_add_epi32(_mm_add_epi32(_mm_slli_epi32(top, 8), _mm_mullo_epi32(_mm_sub_epi32(bottom, top), vfy)), _mm_set1_epi32(0x8000)), 16);
+    const __m128i bytes = _mm_packus_epi16(_mm_packus_epi32(blended, zero), zero);
+    return static_cast<uint32_t>(_mm_cvtsi128_si32(bytes));
+#else
     const uint8_t r = lerpChannel(static_cast<uint8_t>(c00 & 0xFFu),
                                   static_cast<uint8_t>(c10 & 0xFFu),
                                   static_cast<uint8_t>(c01 & 0xFFu),
@@ -2563,6 +2576,7 @@ uint32_t GSCpuBackend::SampleTexture(const TextureSampler &sampler, GSMem::Textu
            (static_cast<uint32_t>(g) << 8) |
            (static_cast<uint32_t>(b) << 16) |
            (static_cast<uint32_t>(a) << 24);
+#endif
 }
 
 void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch, const RasterContext &raster)
