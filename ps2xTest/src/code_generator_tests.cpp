@@ -1239,6 +1239,29 @@ void register_code_generator_tests()
                      "MOVN must not overwrite the destination upper 64 bits");
         });
 
+        tc.Run("quadword loads and stores mask the low 4 address bits", [](TestCase &t) {
+            CodeGenerator gen({}, {});
+            const std::string masked = "((ADD32(GPR_U32(ctx, 4), 8)) & ~0xFu)";
+
+            for (const uint32_t opcode : {OPCODE_LQ, OPCODE_SQ, OPCODE_LQC2, OPCODE_SDC2})
+            {
+                Instruction inst{};
+                inst.opcode = opcode;
+                inst.rs = 4;
+                inst.rt = 5;
+                inst.simmediate = 8;
+                const std::string code = gen.translateInstruction(inst);
+                t.IsTrue(code.find(masked) != std::string::npos, "the access should use the aligned address: " + code);
+            }
+
+            Instruction toVf0{};
+            toVf0.opcode = OPCODE_LQC2;
+            toVf0.rs = 4;
+            toVf0.rt = 0;
+            const std::string vf0Code = gen.translateInstruction(toVf0);
+            t.IsTrue(vf0Code.find("vu0_vf[0]") == std::string::npos, "LQC2 should not write VF0: " + vf0Code);
+        });
+
         tc.Run("SC requires matching LL reservation address", [](TestCase &t) {
             CodeGenerator gen({}, {});
 
