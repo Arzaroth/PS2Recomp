@@ -1,4 +1,5 @@
 #include "MiniTest.h"
+#include <array>
 #include "ps2recomp/code_generator.h"
 #include "ps2recomp/instructions.h"
 #include "ps2recomp/r5900_decoder.h"
@@ -321,6 +322,44 @@ void register_ps2_runtime_expansion_tests()
 {
     MiniTest::Case("PS2RuntimeExpansion", [](TestCase &tc)
     {
+        tc.Run("MMI exchanges, interleaves and absolute values follow the EE lane order", [](TestCase &t)
+        {
+            auto halfwords = [](__m128i v)
+            {
+                std::array<uint16_t, 8> out{};
+                _mm_storeu_si128(reinterpret_cast<__m128i *>(out.data()), v);
+                return out;
+            };
+            auto words = [](__m128i v)
+            {
+                std::array<uint32_t, 4> out{};
+                _mm_storeu_si128(reinterpret_cast<__m128i *>(out.data()), v);
+                return out;
+            };
+            const __m128i h = _mm_setr_epi16(0, 1, 2, 3, 4, 5, 6, 7);
+            const __m128i w = _mm_setr_epi32(0, 1, 2, 3);
+
+            t.IsTrue(halfwords(PS2_PEXEH(h)) == std::array<uint16_t, 8>{2, 1, 0, 3, 6, 5, 4, 7}, "PEXEH exchanges halfwords 0 and 2 of each half");
+            t.IsTrue(halfwords(PS2_PEXCH(h)) == std::array<uint16_t, 8>{0, 2, 1, 3, 4, 6, 5, 7}, "PEXCH exchanges halfwords 1 and 2 of each half");
+            t.IsTrue(halfwords(PS2_PREVH(h)) == std::array<uint16_t, 8>{3, 2, 1, 0, 7, 6, 5, 4}, "PREVH reverses each half");
+            t.IsTrue(words(PS2_PEXEW(w)) == std::array<uint32_t, 4>{2, 1, 0, 3}, "PEXEW exchanges words 0 and 2");
+            t.IsTrue(words(PS2_PEXCW(w)) == std::array<uint32_t, 4>{0, 2, 1, 3}, "PEXCW exchanges words 1 and 2");
+            t.IsTrue(words(PS2_PROT3W(w)) == std::array<uint32_t, 4>{1, 2, 0, 3}, "PROT3W rotates the low three words");
+
+            const __m128i rs = _mm_setr_epi16(10, 11, 12, 13, 14, 15, 16, 17);
+            const __m128i rt = _mm_setr_epi16(20, 21, 22, 23, 24, 25, 26, 27);
+            t.IsTrue(halfwords(PS2_PINTH(rs, rt)) == std::array<uint16_t, 8>{20, 14, 21, 15, 22, 16, 23, 17}, "PINTH interleaves rt's low half with rs's high half");
+            t.IsTrue(halfwords(PS2_PINTEH(rs, rt)) == std::array<uint16_t, 8>{20, 10, 22, 12, 24, 14, 26, 16}, "PINTEH interleaves the even halfwords");
+
+            t.IsTrue(words(PS2_PABSW(_mm_setr_epi32(INT32_MIN, -5, 5, 0))) == std::array<uint32_t, 4>{0x7FFFFFFFu, 5u, 5u, 0u}, "PABSW saturates the minimum");
+            t.IsTrue(halfwords(PS2_PABSH(_mm_setr_epi16(INT16_MIN, -3, 3, 0, 0, 0, 0, 0)))[0] == 0x7FFFu, "PABSH saturates the minimum");
+
+            CodeGenerator gen({}, {});
+            const uint32_t raw = (OPCODE_MMI << 26) | (4u << 21) | (5u << 16) | (6u << 11) | (uint32_t{MMI1_PABSW} << 6) | MMI_MMI1;
+            const std::string pabswCode = gen.translateInstruction(R5900Decoder{}.decodeInstruction(0x1000u, raw, false));
+            t.IsTrue(pabswCode.find("PS2_PABSW(GPR_VEC(ctx, 5))") != std::string::npos, "PABSW reads rt: " + pabswCode);
+        });
+
         tc.Run("differential decoder/codegen gpr-write contract for MULT and DIV families", [](TestCase &t)
         {
             R5900Decoder decoder;
