@@ -916,6 +916,7 @@ struct GSCpuBackend::TextureSampler
     const std::array<uint16_t, 512> *clut = nullptr;
     uint64_t clutSerial = 0;                // identifies the CLUT contents
     DecodedTexture *decoded = nullptr;      // worker's decoded copy, when async
+    const uint32_t *palette = nullptr;      // the CLUT as 256 colours after TEXA, for indexed textures
 };
 
 struct GSCpuBackend::RasterContext
@@ -1025,6 +1026,45 @@ struct GSCpuBackend::DecodedTextureCache
 {
     std::vector<DecodedTexture> textures;
     uint64_t clock = 0;
+
+    // Indexed textures' colours, keyed by what LookupCLUT reads: CLUT contents (serial), CLUT format and
+    // offset, the texture format and TEXA. Games switch between a few CLUTs, each reused by many primitives.
+    struct Palette
+    {
+        bool valid = false;
+        uint64_t clutSerial = 0;
+        uint8_t cpsm = 0, csm = 0, csa = 0, psm = 0;
+        uint32_t texa = 0;
+        std::array<uint32_t, 256> colors{};
+    };
+    std::array<Palette, 8> palettes{};
+    uint32_t nextPalette = 0;
+
+    const uint32_t *PaletteFor(GSCpuBackend &backend, const TextureSampler &sampler)
+    {
+        const GSDrawState &state = *sampler.state;
+        const auto &tex = state.context.tex0;
+        const uint32_t texa = static_cast<uint32_t>(state.texa.ta0) | (static_cast<uint32_t>(state.texa.ta1) << 8) |
+                              (static_cast<uint32_t>(state.texa.aem) << 16);
+        for (Palette &palette : palettes)
+        {
+            if (palette.valid && palette.clutSerial == sampler.clutSerial && palette.cpsm == tex.cpsm && palette.csm == tex.csm &&
+                palette.csa == tex.csa && palette.psm == tex.psm && palette.texa == texa)
+                return palette.colors.data();
+        }
+        Palette &palette = palettes[nextPalette];
+        nextPalette = (nextPalette + 1u) % palettes.size();
+        for (uint32_t index = 0; index < 256u; ++index)
+            palette.colors[index] = backend.LookupCLUT(state, *sampler.clut, static_cast<uint8_t>(index), tex.cpsm, tex.csm, tex.csa, tex.psm);
+        palette.valid = true;
+        palette.clutSerial = sampler.clutSerial;
+        palette.cpsm = tex.cpsm;
+        palette.csm = tex.csm;
+        palette.csa = tex.csa;
+        palette.psm = tex.psm;
+        palette.texa = texa;
+        return palette.colors.data();
+    }
 
     // Keeps the buffers: TEXFLUSH is frequent and reallocating them dominated.
     void Invalidate()
@@ -1939,6 +1979,8 @@ void GSCpuBackend::DrawQueued(const QueuedPrimitive &item, uint32_t index)
     const GSDrawState &state = batch.state;
     TextureSampler texture = item.texture;
     texture.state = &state;
+    if (state.prim.tme && (isFourBitIndexedPsm(state.context.tex0.psm) || isEightBitIndexedPsm(state.context.tex0.psm)))
+        texture.palette = m_decodedCaches[index + 1u].PaletteFor(*this, texture);
     if (state.prim.tme && item.area >= kDecodedMinPixels)
         texture.decoded = FindDecodedTexture(m_decodedCaches[index + 1u], texture);
     RasterContext raster{&item.pixel, &texture, &m_texturePageCaches[index + 1u], index, m_workerCount};
@@ -2339,6 +2381,8 @@ uint32_t GSCpuBackend::FetchTexel(const TextureSampler &sampler, GSMem::TextureP
     case GS_PSM_T4:
     case GS_PSM_T4HL:
     case GS_PSM_T4HH:
+        if (sampler.palette)
+            return sampler.palette[static_cast<u8>(out)];
         return LookupCLUT(state, *sampler.clut, static_cast<u8>(out), tex.cpsm, tex.csm, tex.csa, tex.psm);
     }
 
