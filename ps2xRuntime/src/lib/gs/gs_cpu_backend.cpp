@@ -667,10 +667,21 @@ namespace
         return static_cast<int64_t>(x1 - x0 + 1) * static_cast<int64_t>(y1 - y0 + 1);
     }
 
-    // Framebuffer rows a primitive can touch (its bounding box within the scissor).
+    // Framebuffer rows a primitive can touch (its bounding box within the scissor; DrawSprite's exact rows for sprites).
     void primitiveRows(const GSPrimitiveBatch &batch, int &firstRow, int &lastRow)
     {
         const auto &ctx = batch.state.context;
+        if (batch.state.prim.type == GS_PRIM_SPRITE && batch.vertexCount >= 2u)
+        {
+            const float ofyf = static_cast<float>(ctx.xyoffset.ofy) / 16.0f;
+            const float fy0 = std::min(batch.vertices[0].y, batch.vertices[1].y) - ofyf;
+            const float fy1 = std::max(batch.vertices[0].y, batch.vertices[1].y) - ofyf;
+            const int y0 = static_cast<int>(std::ceil(fy0));
+            const int y1 = std::max(y0, static_cast<int>(std::ceil(fy1)) - 1);
+            firstRow = clampInt(y0, ctx.scissor.y0, ctx.scissor.y1);
+            lastRow = clampInt(y1, ctx.scissor.y0, ctx.scissor.y1);
+            return;
+        }
         const float ofy = static_cast<float>(ctx.xyoffset.ofy >> 4);
         const uint32_t count = std::min<uint32_t>(primitiveVertexCount(batch.state.prim.type), batch.vertexCount);
         float minY = batch.vertices[0].y;
