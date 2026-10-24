@@ -1695,5 +1695,21 @@ void register_ps2_runtime_expansion_tests()
             std::memcpy(&directCmd, rdram.data() + kBaseAddr + 12u, sizeof(directCmd));
             t.Equals(directCmd, 0x50000001u, "sceVif1PkCloseDirectCode should store a 1-QW DIRECT length");
         });
+
+        tc.Run("DVD reads seek by distance and transfer faster towards the outer edge", [](TestCase &t)
+        {
+            constexpr uint64_t kEeCyclesPerSecond = 294912000u;
+            constexpr uint64_t kRate = 2700u;
+            constexpr uint32_t kMidLayerLbn = 2295104u / 2u;
+
+            t.Equals(ps2_stubs::cdReadDurationCycles(0u, 0u, 2700u, kRate), kEeCyclesPerSecond * 5u / 2u,
+                     "a contiguous read at the hub runs at 40% of the rated speed");
+            t.Equals(ps2_stubs::cdReadDurationCycles(1000u, 1100u, 0u, kRate), kEeCyclesPerSecond * 30u / 1000u,
+                     "a short seek costs 30 ms");
+            t.Equals(ps2_stubs::cdReadDurationCycles(1000u, 900000u, 0u, kRate), kEeCyclesPerSecond / 10u,
+                     "a long seek costs 100 ms");
+            t.Equals(ps2_stubs::cdReadDurationCycles(kMidLayerLbn, kMidLayerLbn, 7u, 10u), kEeCyclesPerSecond,
+                     "a contiguous read halfway out runs at 70% of the rated speed");
+        });
     });
 }
