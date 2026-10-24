@@ -183,46 +183,20 @@ namespace
         return (csr & ~0xC000ull) | (!drawing && ps2GsFifoEmpty() ? 0x4000ull : 0u);
     }
 
-    // Atomically apply a 32-bit write to one half (off=0 low dword, off=4 high
-    // dword) of the GS CSR register. Bits 0..1 of the low dword (SIGNAL/FINISH) are
-    // write-one-to-clear; everything else is a plain merge. Uses compare_exchange
-    // so the whole read-modify-write is a single atomic step -- this register is
-    // also touched by the vsync worker (FIELD bit) and the GIF (SIGNAL/FINISH) on
-    // other threads, so a load-then-store here would race with them.
+    // CSR bits a guest write changes: SIGNAL, FINISH, HSINT, VSINT and EDWINT are write-one-to-clear. FLUSH and
+    // RESET are actions; NFIELD, FIELD, FIFO, REV, ID and the high dword are read-only. Other threads set bits
+    // (the GS SIGNAL/FINISH, the vblank FIELD), so the clear is one atomic step.
+    constexpr uint64_t kGsCsrW1cMask = 0x1Full;
+
     inline void writeCsrHalf(std::atomic<uint64_t> &csr, uint32_t off, uint32_t value)
     {
-        constexpr uint32_t kW1cMask = 0x3u;
-        uint64_t expected = csr.load();
-        uint64_t desired;
-        do
-        {
-            if (off == 0u)
-            {
-                uint32_t oldLow = static_cast<uint32_t>(expected & 0xFFFFFFFFull);
-                uint32_t mergedLow = (oldLow & kW1cMask) | (value & ~kW1cMask);
-                desired = (expected & 0xFFFFFFFF00000000ull) | static_cast<uint64_t>(mergedLow);
-                desired &= ~static_cast<uint64_t>(value & kW1cMask);
-            }
-            else
-            {
-                uint64_t mask = 0xFFFFFFFFull << (off * 8u);
-                desired = (expected & ~mask) | (static_cast<uint64_t>(value) << (off * 8u));
-            }
-        } while (!csr.compare_exchange_weak(expected, desired));
+        if (off == 0u)
+            csr.fetch_and(~(static_cast<uint64_t>(value) & kGsCsrW1cMask));
     }
 
-    // Same as writeCsrHalf but for a full 64-bit CSR write (bits 0..1 are still
-    // write-one-to-clear against the current value).
     inline void writeCsrFull(std::atomic<uint64_t> &csr, uint64_t value)
     {
-        constexpr uint64_t kW1cMask = 0x3ull;
-        uint64_t expected = csr.load();
-        uint64_t desired;
-        do
-        {
-            desired = (expected & kW1cMask) | (value & ~kW1cMask);
-            desired &= ~(value & kW1cMask);
-        } while (!csr.compare_exchange_weak(expected, desired));
+        csr.fetch_and(~(value & kGsCsrW1cMask));
     }
 
     constexpr std::array<uint32_t, 4> kEeTimerBases = {

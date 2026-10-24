@@ -416,7 +416,7 @@ void register_ps2_gs_tests()
 {
     MiniTest::Case("PS2GS", [](TestCase &tc)
     {
-        tc.Run("GS CSR/IMR support coherent 64-bit and 32-bit access", [](TestCase &t)
+        tc.Run("GS CSR interrupt bits clear on writing 1, IMR is read/write", [](TestCase &t)
         {
             PS2Memory mem;
             t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
@@ -424,17 +424,17 @@ void register_ps2_gs_tests()
             constexpr uint32_t kGsCsr = 0x12001000u;
             constexpr uint32_t kGsImr = 0x12001010u;
 
-            const uint64_t csrPattern = 0xA1B2C3D4E5F64718ull; // CSR.FIFO (bits 14-15) reads 01
-            mem.write64(kGsCsr, csrPattern);
-            t.Equals(mem.read64(kGsCsr), csrPattern, "64-bit CSR read should match prior 64-bit write");
-            t.Equals(mem.read32(kGsCsr), static_cast<uint32_t>(csrPattern & 0xFFFFFFFFull), "CSR low dword read should match");
-            t.Equals(mem.read32(kGsCsr + 4u), static_cast<uint32_t>(csrPattern >> 32), "CSR high dword read should match");
-
-            mem.write32(kGsCsr, 0x11227344u);
-            t.Equals(mem.read64(kGsCsr), 0xA1B2C3D411227344ull, "32-bit low write should preserve CSR high dword");
-
-            mem.write32(kGsCsr + 4u, 0x55667788u);
-            t.Equals(mem.read64(kGsCsr), 0x5566778811227344ull, "32-bit high write should preserve CSR low dword");
+            // SIGNAL, FINISH, HSINT, VSINT and EDWINT raised by the GS, FIELD by the vblank.
+            mem.gs().csr.store(0x201Full);
+            auto csr = [&]() { return mem.read64(kGsCsr) & ~0xC000ull; };
+            mem.write32(kGsCsr, 0x2u);
+            t.Equals(csr(), 0x201Dull, "writing 1 to FINISH should clear only FINISH");
+            mem.write64(kGsCsr, 0xFFFFFFFF00002300ull);
+            t.Equals(csr(), 0x201Dull, "FLUSH, RESET, FIELD and the high dword should not be written");
+            mem.write32(kGsCsr + 4u, 0xFFFFFFFFu);
+            t.Equals(csr(), 0x201Dull, "a high dword write should change nothing");
+            mem.write64(kGsCsr, 0x1Dull);
+            t.Equals(csr(), 0x2000ull, "writing 1 to the other interrupt bits should clear them and keep FIELD");
 
             const uint64_t imrPattern = 0x0123456789ABCDEFull;
             mem.write64(kGsImr, imrPattern);
