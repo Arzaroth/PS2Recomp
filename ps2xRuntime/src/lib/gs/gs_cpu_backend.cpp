@@ -721,12 +721,30 @@ namespace
         return static_cast<int>(std::ceil(static_cast<float>(fixedV) / 16.0f - 0.5f));
     }
 
+    // Rows a texture's wrap mode can reach. The region modes address rows by MINV/MAXV, which can lie past the
+    // texture's height: REGION_CLAMP stays within [MINV, MAXV], REGION_REPEAT within (v & MINV) | MAXV.
+    void textureWrapRows(const GSDrawState &state, int &firstRow, int &lastRow)
+    {
+        const int height = std::max<int>(state.textureHeight, 1);
+        const uint8_t wrapV = static_cast<uint8_t>((state.context.clamp >> 2) & 0x3u);
+        const int minV = static_cast<int>((state.context.clamp >> 24) & 0x3FFu);
+        const int maxV = static_cast<int>((state.context.clamp >> 34) & 0x3FFu);
+        firstRow = 0;
+        lastRow = height - 1;
+        if (wrapV == 2u)
+        {
+            firstRow = minV;
+            lastRow = std::max(minV, maxV);
+        }
+        else if (wrapV == 3u)
+            lastRow = std::max(lastRow, minV | maxV);
+    }
+
     void textureRows(const GSPrimitiveBatch &batch, int &firstRow, int &lastRow)
     {
         const GSDrawState &state = batch.state;
         const int height = std::max<int>(state.textureHeight, 1);
-        firstRow = 0;
-        lastRow = height - 1;
+        textureWrapRows(state, firstRow, lastRow);
         if (state.prim.type == GS_PRIM_SPRITE && state.prim.fst && batch.vertexCount >= 2u)
         {
             // Exact rows instead of the +-2 margin: a full-screen copy starting at row 0 would
@@ -749,10 +767,7 @@ namespace
             int minRow = 0;
             int maxRow = height - 1;
             if (wrapV == 2u)
-            {
-                minRow = clampInt(static_cast<int>((state.context.clamp >> 24) & 0x3FFu), 0, height - 1);
-                maxRow = clampInt(static_cast<int>((state.context.clamp >> 34) & 0x3FFu), minRow, height - 1);
-            }
+                textureWrapRows(state, minRow, maxRow);
             if (wrapV == 1u || wrapV == 2u || (wrapV == 0u && low >= 0 && high < height))
             {
                 firstRow = clampInt(low, minRow, maxRow);
@@ -849,7 +864,7 @@ namespace
         if (blocks.samples)
         {
             textureRows(batch, firstRow, lastRow);
-            blocks.texture = rowBlocks(ctx.tex0.tbp0, ctx.tex0.tbw, ctx.tex0.psm, firstRow, lastRow);
+            blocks.texture = rowBlocks(ctx.tex0.tbp0, ctx.tex0.tbw, ctx.tex0.psm, firstRow, std::min(lastRow, 2047));
         }
         return blocks;
     }
@@ -1898,8 +1913,13 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
     item.writeCount = blocks.writesZ ? 2u : 1u;
     // Workers decode textures by 32x32 tiles, so they may read rows of it the primitive never samples.
     if (blocks.samples)
+    {
+        int wrapFirst = 0;
+        int wrapLast = 0;
+        textureWrapRows(state, wrapFirst, wrapLast);
         item.reads = rowBlocks(ctx.tex0.tbp0, ctx.tex0.tbw, ctx.tex0.psm, 0,
-                               std::min(2047, (1 << std::min<uint32_t>(ctx.tex0.th, 10u)) - 1));
+                               std::min(2047, std::max(wrapLast, (1 << std::min<uint32_t>(ctx.tex0.th, 10u)) - 1)));
+    }
     item.samples = blocks.samples;
     NotePendingRange(m_pendingWrites, blocks.frame);
     NoteBarrierRange(m_pixelWritesSinceBarrier, blocks.frame);
